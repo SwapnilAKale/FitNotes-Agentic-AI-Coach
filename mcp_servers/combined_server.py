@@ -722,15 +722,18 @@ def _get_personal_record_sync(exercise_name: str) -> str:
 
     question = f"What is my PR for {exercise_name}?"
     result = answer_question(question, DB_PATH)
-    return json.dumps(
-        {
-            "exercise": exercise_name,
-            "answer": result.get("answer", ""),
-            "sql": result.get("sql", ""),
-            "rows_returned": len(result.get("rows", [])),
-            "error": result.get("error"),
-        }
-    )
+    rows = result.get("rows", [])
+    out = {
+        "exercise": exercise_name,
+        "answer": result.get("answer", ""),
+        "sql": result.get("sql", ""),
+        "rows_returned": len(rows),
+        "error": result.get("error"),
+    }
+    if rows and rows[0].get("reps") == 1:
+        out["single_rep_warning"] = True
+        out["warning_message"] = "This PR is a single-rep set. Check comments — it may be a failed attempt or form break rather than a true max."
+    return json.dumps(out)
 
 
 async def _get_personal_record(exercise_name: str) -> str:

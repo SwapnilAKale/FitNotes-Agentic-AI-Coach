@@ -147,6 +147,12 @@ Hand Gripper special case:
   that set was typed in lbs. For PR queries, exclude sets with 'Pounds' in comment
   or handle separately.
 
+IMPORTANT FOR EXPLAIN LAYER:
+When generating SQL for kg-native exercises (Deadlift from 2025-12-26,
+Seated Machine Curl (Kg), Machine Wrist Extension, Hand Gripper),
+name weight columns explicitly with _kg suffix: total_kg, weight_kg, pr_kg.
+This signals to the explanation layer to report in kg not lbs.
+
 BAR WEIGHT ADDITION RULES:
 Always use (metric_weight + bar_kg) * 2.2046 for lbs exercises -- never add bar after conversion.
 Always use (metric_weight * 2.2046) + bar_kg for kg exercises -- never convert bar weight.

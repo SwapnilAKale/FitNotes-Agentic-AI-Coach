@@ -97,7 +97,16 @@ async def main() -> None:
                 print(f"\n[Rate limit reached. Reset in {wait_msg if wait_msg else 'some time'}. Type 'exit' to quit or wait and try again.]\n")
                 continue
             except Exception as e:
-                print(f"\n[Error: {e}]\n")
+                error_str = str(e)
+                if "503" in error_str or "UNAVAILABLE" in error_str:
+                    print("\n[Gemini is under high demand right now. Wait a few minutes and try again.]\n")
+                elif "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+                    wait_msg = ""
+                    if "Please try again in" in error_str:
+                        wait_msg = error_str.split("Please try again in")[1].split(".")[0].strip()
+                    print(f"\n[Rate limit reached. Reset in {wait_msg if wait_msg else 'some time'}. Type 'exit' to quit or wait and try again.]\n")
+                else:
+                    print(f"\n[Error: {e}]\n")
                 continue
             except asyncio.CancelledError:
                 print("\nRequest cancelled. Goodbye.")

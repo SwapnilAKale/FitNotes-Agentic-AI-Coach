@@ -3,7 +3,7 @@ import re
 COLLECTION_NAME = "fitness_knowledge"
 EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-RERANKER_THRESHOLD = -5.0
+RERANKER_THRESHOLD = 0.0
 
 
 def _tokenize(text: str) -> list[str]:
