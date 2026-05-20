@@ -1,5 +1,6 @@
 import json
 import os
+from pathlib import Path as _Path
 
 _SCHEMA = """
 ## FitNotes Database Schema
@@ -114,7 +115,7 @@ def build_user_context_prompt(ctx: dict) -> str:
     if not ctx:
         return ""
 
-    return """\
+    prompt = """\
 ## User Data Conventions
 
 UNIT RECOVERY -- HOW FITNOTES STORES DATA:
@@ -174,6 +175,22 @@ SET STRUCTURE:
   dumbbell skull crusher sets at typed 7.5 (stored 3.4kg) commented 'Warmup for elbows',
   Cable Triceps Extension sets commented 'Warmup'\
 """
+
+    quirks_path = _Path("data/user_context.json")
+    if quirks_path.exists():
+        try:
+            quirks_data = json.loads(quirks_path.read_text())
+            quirks = quirks_data.get("exercise_quirks", [])
+            if quirks:
+                lines = ["\n\nEXERCISE-SPECIFIC QUIRKS — apply these when reading or reporting on these exercises:"]
+                for q in quirks:
+                    lines.append(f"\n{q['exercise_name']}:")
+                    lines.append(f"  {q['note']}")
+                prompt += "\n".join(lines)
+        except Exception:
+            pass  # Never block on quirk loading failure
+
+    return prompt
 
 
 def build_schema_prompt() -> str:

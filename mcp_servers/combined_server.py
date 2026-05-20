@@ -1,6 +1,8 @@
+import os
+os.environ.setdefault("HF_HUB_DISABLE_IMPLICIT_TOKEN_WARNING", "1")
+
 import asyncio
 import json
-import os
 import re
 import sys
 
@@ -601,6 +603,69 @@ async def list_tools() -> list[types.Tool]:
                 "required": ["fact_id"],
             },
         ),
+        types.Tool(
+            name="add_exercise_quirk",
+            description=(
+                "Store a plain-English interpretation note for a specific exercise "
+                "that deviates from standard logging conventions in any way — unusual field usage, "
+                "comment notation, form tracking, equipment notes, or anything the user wants "
+                "the agent to know when reading that exercise's data."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "exercise_name": {
+                        "type": "string",
+                        "description": "exact exercise name",
+                    },
+                    "note": {
+                        "type": "string",
+                        "description": "plain English interpretation note — no restrictions on format or content",
+                    },
+                },
+                "required": ["exercise_name", "note"],
+            },
+        ),
+        types.Tool(
+            name="update_exercise_quirk",
+            description="Update the note for an existing exercise quirk. Replaces the old note entirely.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "exercise_name": {
+                        "type": "string",
+                        "description": "exact exercise name",
+                    },
+                    "note": {
+                        "type": "string",
+                        "description": "new plain-English note, replaces the old one entirely",
+                    },
+                },
+                "required": ["exercise_name", "note"],
+            },
+        ),
+        types.Tool(
+            name="delete_exercise_quirk",
+            description="Remove a stored exercise quirk entirely.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "exercise_name": {
+                        "type": "string",
+                        "description": "exact exercise name",
+                    },
+                },
+                "required": ["exercise_name"],
+            },
+        ),
+        types.Tool(
+            name="list_exercise_quirks",
+            description=(
+                "List all stored exercise quirks. Call when the user asks what "
+                "quirks are stored, or before adding a new one to check for duplicates."
+            ),
+            inputSchema={"type": "object", "properties": {}, "required": []},
+        ),
     ]
 
 
@@ -693,10 +758,92 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         result = _recall_memories()
     elif name == "forget_fact":
         result = _forget_fact(arguments)
+    elif name == "add_exercise_quirk":
+        result = _add_exercise_quirk_sync(arguments["exercise_name"], arguments["note"])
+    elif name == "update_exercise_quirk":
+        result = _update_exercise_quirk_sync(arguments["exercise_name"], arguments["note"])
+    elif name == "delete_exercise_quirk":
+        result = _delete_exercise_quirk_sync(arguments["exercise_name"])
+    elif name == "list_exercise_quirks":
+        result = _list_exercise_quirks_sync()
     else:
         result = json.dumps({"error": f"Unknown tool: {name}"})
 
     return [types.TextContent(type="text", text=result)]
+
+
+def _add_exercise_quirk_sync(exercise_name: str, note: str) -> str:
+    from pathlib import Path
+    from datetime import datetime
+
+    path = Path("data/user_context.json")
+    data = json.loads(path.read_text()) if path.exists() else {}
+    quirks = data.get("exercise_quirks", [])
+
+    for q in quirks:
+        if q["exercise_name"].lower() == exercise_name.lower():
+            return json.dumps({
+                "status": "already_exists",
+                "message": f"Quirk for {exercise_name} already exists. Use update_exercise_quirk to modify it.",
+            })
+
+    quirks.append({
+        "exercise_name": exercise_name,
+        "note": note,
+        "added_at": datetime.now().strftime("%Y-%m-%d"),
+    })
+    data["exercise_quirks"] = quirks
+    path.write_text(json.dumps(data, indent=2))
+    return json.dumps({"status": "saved", "exercise": exercise_name})
+
+
+def _update_exercise_quirk_sync(exercise_name: str, note: str) -> str:
+    from pathlib import Path
+    from datetime import datetime
+
+    path = Path("data/user_context.json")
+    data = json.loads(path.read_text()) if path.exists() else {}
+    quirks = data.get("exercise_quirks", [])
+
+    for q in quirks:
+        if q["exercise_name"].lower() == exercise_name.lower():
+            q["note"] = note
+            data["exercise_quirks"] = quirks
+            path.write_text(json.dumps(data, indent=2))
+            return json.dumps({"status": "updated", "exercise": exercise_name})
+
+    return json.dumps({"status": "not_found", "message": f"No quirk found for {exercise_name}. Use add_exercise_quirk to create one."})
+
+
+def _delete_exercise_quirk_sync(exercise_name: str) -> str:
+    from pathlib import Path
+    from datetime import datetime
+
+    path = Path("data/user_context.json")
+    data = json.loads(path.read_text()) if path.exists() else {}
+    quirks = data.get("exercise_quirks", [])
+
+    before = len(quirks)
+    data["exercise_quirks"] = [q for q in quirks if q["exercise_name"].lower() != exercise_name.lower()]
+
+    if len(data["exercise_quirks"]) < before:
+        path.write_text(json.dumps(data, indent=2))
+        return json.dumps({"status": "deleted"})
+    return json.dumps({"status": "not_found"})
+
+
+def _list_exercise_quirks_sync() -> str:
+    from pathlib import Path
+
+    path = Path("data/user_context.json")
+    if not path.exists():
+        return json.dumps({"quirks": [], "message": "No exercise quirks stored yet."})
+
+    data = json.loads(path.read_text())
+    quirks = data.get("exercise_quirks", [])
+    if not quirks:
+        return json.dumps({"quirks": [], "message": "No exercise quirks stored yet."})
+    return json.dumps({"quirks": quirks})
 
 
 def _query_workout_data_sync(question: str) -> str:
@@ -929,6 +1076,18 @@ async def _resolve_exercise_name(user_term: str) -> str:
     return await asyncio.to_thread(_resolve_exercise_name_sync, user_term)
 
 
+_COMMENT_NOTATION_PREFIX = (
+    "COMMENT NOTATION RULES (apply to all exercises): "
+    "1. If a comment contains only a ROM/quality term (e.g. \"Below the neck\", \"Partials\", \"Half\") "
+    "with no numbers before it — the ENTIRE set was performed at that ROM/quality level. "
+    "2. If a comment contains numbers followed by a ROM/quality term (e.g. \"2 3 partials\", "
+    "\"last 2 below the neck\", \"8 9 half\") — only those specific rep numbers were at that "
+    "ROM/quality level. All other reps were at full/normal ROM. "
+    "3. Numbers can appear as: individual digits (\"2 3\"), ranges (\"2-4\"), ordinals "
+    "(\"last 2\", \"first 3\"), or positions (\"8 9\")."
+)
+
+
 def _get_interpretation_note(exercise_name: str) -> str:
     ctx_path = os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "user_context.json")
     try:
@@ -940,18 +1099,20 @@ def _get_interpretation_note(exercise_name: str) -> str:
             if hierarchy:
                 terms = [item.split(" — ")[0].split(" / ")[0].strip() for item in hierarchy]
                 chain = " > ".join(terms)
-                return (
+                exercise_note = (
                     f"{h.get('type', 'Form quality hierarchy')}. "
                     f"Best to worst: {chain}. "
                     "Form errors are explicitly stated — absence of form notes means form was acceptable."
                 )
-            return (
-                f"{h.get('type', 'Form quality tracking')}. "
-                "Form errors are explicitly stated — absence of form notes means form was acceptable."
-            )
+            else:
+                exercise_note = (
+                    f"{h.get('type', 'Form quality tracking')}. "
+                    "Form errors are explicitly stated — absence of form notes means form was acceptable."
+                )
+            return f"{_COMMENT_NOTATION_PREFIX} {exercise_note}"
     except Exception:
         pass
-    return "Comments describe set quality, equipment, and form observations."
+    return f"{_COMMENT_NOTATION_PREFIX} Comments describe set quality, equipment, and form observations."
 
 
 def _read_exercise_comments_sync(

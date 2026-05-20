@@ -1,6 +1,8 @@
+import os
 import re
 
 COLLECTION_NAME = "fitness_knowledge"
+CHROMA_PATH = os.environ.get("CHROMA_DB_PATH", "data/chroma_db")
 EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 RERANKER_THRESHOLD = 0.0
@@ -11,7 +13,7 @@ def _tokenize(text: str) -> list[str]:
 
 
 class FitnessKnowledgeBase:
-    def __init__(self, chroma_path: str = "./data/chroma_db"):
+    def __init__(self, chroma_path: str = CHROMA_PATH):
         self._chroma_path = chroma_path
         self._collection = None
         self._embed_model = None

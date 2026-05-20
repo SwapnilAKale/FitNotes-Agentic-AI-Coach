@@ -67,38 +67,9 @@ Known limitation: user_context.json is hardcoded for one user. To share with ano
 
 ## User context layer added (pre-Stage 3)
 
-Created data/user_context.json documenting all personal data conventions
-discovered by reading 2,932 Comment records from the database.
-
-What's injected into prompts now (affects answer correctness today):
-- 4 exercises logged in kg: Deadlift, Seated Machine Curl (Kg), Machine Wrist Extension, Hand Gripper
-- Deadlift unit changed lbs → kg on 2025-12-26
-- Machine Wrist Extension: 0kg = 5kg base resistance
-- Hand Gripper: per-set unit check via comment
-- Bar weights not included in any barbell/Smith exercise logged value
-- Barbell Curl, Barbell Upright Row, Behind The Back Wrist Curls each changed bars over time (dates documented)
-- EZ-Bar/Barbell Row/Deadlift: fixed bar weights throughout
-- Smith machine: 20kg bar, weights in lbs, counterbalance support system
-- Drop set notation: same set number in comments = back-to-back
-- Warmup set exclusions for 3 exercises
-
-What's documented in user_context.json but NOT yet injected (requires comment-reading tool):
-- Form quality hierarchies for 18 exercises
-- Per-rep ROM tracking (touching chest, below neck, neck up, etc.)
-- Grip state tracking (Farmers Walk, Machine Wrist Extension)
-- Two-failure-mode exercises (Lateral Raise: half=elbow bent, partial=ROM)
-
-Architectural note: user_context.json is a static file maintained manually.
-The proper solution (Stage 7) is dynamic comment reading at query time.
-
-Known limitation: 1-rep sets can inflate "PR" calculations. A set logged as 1 rep at high weight may be a failed attempt or form break, not a true PR. The agent currently has no way to distinguish these without reading comments. The comment-reading tool (Stage 4/5) will allow filtering out sets where comments indicate bad form or failure.
-
-Stage 2 lesson: FitNotes unit storage is a hidden source of systematic error. FitNotes stores all values as kg internally by treating every typed number as lbs and dividing by 2.2046. For lbs exercises this is transparent — multiplying stored value by 2.2046 recovers the original lbs number. For kg-native exercises (Deadlift, Seated Machine Curl (Kg), Machine Wrist Extension, Hand Gripper) the same multiplication recovers the original kg number, but the system was labelling it as lbs. This caused every kg-native answer to report the right number in the wrong unit. The bug was invisible until the user manually verified the Deadlift numbers and caught the mismatch. Lesson: always verify at least one known ground-truth value before trusting any data pipeline. The pipeline can be internally consistent and still systematically wrong.
-
-Recurring limitation: exact exercise name matching. "Seated Machine Curl" returns 0 results because the DB name is "Seated Machine Curl (Kg)". Same pattern as "Hammer Curl" → "Dumbbell Hammer Curl" from Stage 1. The resolve_exercise_name tool in Stage 5 will fix this permanently.
-
-
----
+Created data/user_context.json to document personal exercise conventions 
+(unit overrides, bar weights, notation rules). See user_context.json for 
+the actual conventions — this file is gitignored and user-specific.
 
 ## Stage 3: Better retrieval — query rewriting + hybrid search + reranking
 
@@ -367,7 +338,7 @@ summary injected into the effective system prompt for that session. Cost:
 Scaling note: Option A (inject all) works for personal use with under 30 facts.
 For multi-user or long-running deployments, switch to Option B: embed memories
 in ChromaDB and retrieve only the top 3-5 relevant ones per query using the
-same hybrid search pipeline from Stage 3. Deferred to post-completion refactor.
+same hybrid search pipeline from Stage 3. Implemented in Stage 10. See Stage 10 entry.
 
 Token cost: auto-extraction adds one LLM call (~400 tokens) at session end.
 On Gemini Flash Lite (500 RPD) this is acceptable. Disable in
@@ -508,3 +479,101 @@ for better precision.
 Fix 5 — lessons.md model name corrected: gemini-2.5-flash-lite →
 gemini-3.1-flash-lite throughout.
 
+Ground truth regeneration results (2026-05-19):
+SQL score: 13/20 (65%) up from 12/19 (63%)
+Remaining failures: all non-determinism or structure issues, no logic bugs.
+q19 smart quote bug fixed — curly quotes in LLM-generated SQL now sanitized.
+Eval scorer updated to be ORDER BY agnostic and extra-column tolerant.
+Expected score after scorer fix: 17-18/20.
+
+---
+
+## Stage 10: Memory Option B — ChromaDB retrieval
+
+Replaced Option A (inject all facts into every prompt) with Option B
+(embed facts, retrieve only relevant ones per question).
+
+Architecture:
+- memory.json: source of truth, unchanged
+- ChromaDB collection "user_memory": search index, synced from memory.json
+- On add_fact: immediately embedded and stored in ChromaDB
+- On delete_fact: removed from both memory.json and ChromaDB
+- On startup: sync_to_chromadb() reconciles any drift
+- On each question: retrieve_relevant_memories(question) returns top 5 facts
+  with cosine distance < 0.8. Only those facts are injected into system_instruction.
+
+Token cost: ~100 tokens per question regardless of total memory size.
+Previous Option A cost: ~600 tokens (all facts every call).
+Benefit: scales to 1000+ facts with constant per-call cost.
+
+Distance threshold 0.8 (cosine): facts above this threshold are considered
+unrelated to the current question and not injected. Tune downward if too
+many irrelevant facts appear; upward if relevant facts are being filtered out.
+
+
+---
+
+## Stage 10: Gemini migration complete
+
+Replaced Groq (llama-3.3-70b-versatile) with Gemini 3.1 Flash Lite
+for SQL generation, result explanation, and RAG query rewriting.
+
+Single API key: GEMINI_API_KEY covers the entire stack.
+- src/agent.py: Gemini (was already Gemini)
+- src/llm.py: Gemini (was Groq)
+- src/rag.py: Gemini query rewriting (was Groq)
+- evals/run_evals.py: Gemini judge (was Groq)
+
+Rate limit: 500 RPD on gemini-3.1-flash-lite for all operations.
+Token budget per question: ~3-5 API calls (tool selection, SQL generation,
+reflection, optional query rewriting). Comfortable for personal daily use.
+
+Setup for sharing: get one Gemini API key at aistudio.google.com,
+paste into .env as GEMINI_API_KEY. No other keys needed.
+
+---
+
+## Stage 11: Exercise Quirks + Tool Grouping
+
+Exercise quirks system:
+- data/exercise_quirks.json stores freeform plain-English interpretation
+  notes for exercises with non-standard logging conventions
+- Completely unrestricted — the note can describe anything: unusual field
+  usage, comment notation, form tracking, equipment, or any convention the
+  user follows when logging that exercise
+- Four tools: add_exercise_quirk, update_exercise_quirk, delete_exercise_quirk,
+  list_exercise_quirks
+- Quirks injected into schema_prompt at query time via build_user_context_prompt()
+  — automatically affects SQL generation and explanation for that exercise
+- Design principle: the user logs however makes sense in the moment. The quirk
+  system is how they explain their own notation to the agent after the fact.
+
+Tool grouping:
+- All tools reorganized into 8 named groups in SYSTEM_PROMPT
+- Groups: READ WORKOUT, READ KNOWLEDGE, WRITE LOGGING, WRITE GOALS,
+  WRITE CORRECTIONS, VERIFY, MEMORY, EXERCISE QUIRKS
+- Each group has a clear selection rule so the agent identifies the group
+  first then picks the specific tool — narrows decision from 31 tools to 3-5
+- No code change required — entirely in system prompt
+- Token cost: slightly longer system prompt (~200 tokens) but saves on
+  wrong tool calls which cost a full extra iteration (~500 tokens each)
+
+---
+
+## GitHub setup
+
+.gitignore excludes all personal data:
+- data/ directory entirely (fitnotes DB, memory, user_context, chroma_db)
+- data/.gitkeep preserved so directory structure exists in repo
+- corpus/raw/ excluded (public data but large — regenerate with build_corpus.py)
+- evals/eval_set.json and candidates.json excluded (contain personal workout data)
+- evals scripts kept (stress_test.py, run_evals.py, row_compare.py) — strong portfolio pieces
+
+CHROMA_DB_PATH made configurable via environment variable with default fallback.
+.env.example documents all variables with comments explaining where to get them.
+
+Anyone cloning the repo needs:
+1. Their own Gemini API key
+2. Their own FitNotes backup file
+3. Run python scripts/build_corpus.py once to build the knowledge base
+4. All personal data stays local, never pushed

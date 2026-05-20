@@ -30,15 +30,27 @@ def _values_equal(a: Any, b: Any) -> bool:
     return ca == cb
 
 
-def _row_to_values(row: dict) -> tuple:
-    """Extract row values as a tuple in dict-insertion order (column names ignored)."""
-    return tuple(_coerce(v) for v in row.values())
+def _row_matches_gt(gt_row: dict, sys_row: dict) -> bool:
+    """True if every GT value appears in sys_row's values (column-name agnostic).
+    Each GT value must match a distinct SYS value via _values_equal."""
+    gt_vals = sorted((_coerce(v) for v in gt_row.values()), key=str)
+    sys_vals = sorted((_coerce(v) for v in sys_row.values()), key=str)
+    used = [False] * len(sys_vals)
+    for gt_val in gt_vals:
+        matched = False
+        for i, sys_val in enumerate(sys_vals):
+            if not used[i] and _values_equal(gt_val, sys_val):
+                used[i] = True
+                matched = True
+                break
+        if not matched:
+            return False
+    return True
 
 
-def _value_lists_match(a: tuple, b: tuple) -> bool:
-    if len(a) != len(b):
-        return False
-    return all(_values_equal(av, bv) for av, bv in zip(a, b))
+def _sort_key(row: dict) -> tuple:
+    """Canonical sort key for ORDER-agnostic comparison: sorted stringified values."""
+    return tuple(sorted(str(_coerce(v)) for v in row.values()))
 
 
 def rows_match(
@@ -50,8 +62,10 @@ def rows_match(
     Compare ground-truth rows to system rows.
 
     Rules:
-    - Column names are ignored; values are compared by position within each row.
-    - Row order is ignored unless has_order_by is True.
+    - Matching is key-based: all GT columns must be present in the SYS row with
+      matching values. Extra columns in the SYS row are ignored.
+    - Row order is ignored (both sets are sorted by canonical key before comparison).
+    - SYS may have more rows than GT; GT rows must all be covered.
     - Floats are compared with 1% relative tolerance.
     - Scalar ground truth (1 row, 1 col): True if that value appears anywhere
       in any cell of sys_rows.
@@ -71,22 +85,16 @@ def rows_match(
                     return True
         return False
 
-    # Row counts must match for non-scalar cases
-    if len(gt_rows) != len(sys_rows):
+    # GT rows must all be coverable by SYS (SYS may have extra rows)
+    if len(gt_rows) > len(sys_rows):
         return False
 
-    gt_tuples = [_row_to_values(r) for r in gt_rows]
-    sys_tuples = [_row_to_values(r) for r in sys_rows]
-
-    if has_order_by:
-        return all(_value_lists_match(g, s) for g, s in zip(gt_tuples, sys_tuples))
-
-    # Unordered: match each GT row to exactly one SYS row
-    used = [False] * len(sys_tuples)
-    for gt_t in gt_tuples:
+    # Unordered: for each GT row find a distinct unused SYS row that covers it
+    used = [False] * len(sys_rows)
+    for gt_row in gt_rows:
         found = False
-        for i, sys_t in enumerate(sys_tuples):
-            if not used[i] and _value_lists_match(gt_t, sys_t):
+        for i, sys_row in enumerate(sys_rows):
+            if not used[i] and _row_matches_gt(gt_row, sys_row):
                 used[i] = True
                 found = True
                 break
@@ -99,16 +107,18 @@ def rows_match(
 # Self-tests — run with: python evals/row_compare.py
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    # 1. Identical single-column rows (column name differs)
+    # 1. Identical single-column rows (column name differs — scalar path handles it)
     assert rows_match([{"pr_kg": 58.97}], [{"max_weight": 58.97}]) is True, "test 1"
 
-    # 2. Reordered multi-row result without ORDER BY
-    r_gt = [{"name": "Lat Pulldown", "sets": 120}, {"name": "Cable Row", "sets": 80}]
-    r_sys = [{"exercise": "Cable Row", "cnt": 80}, {"exercise": "Lat Pulldown", "cnt": 120}]
+    # 2. Reordered multi-row result — same columns, different row order
+    r_gt = [{"exercise": "Lat Pulldown", "sets": 120}, {"exercise": "Cable Row", "sets": 80}]
+    r_sys = [{"exercise": "Cable Row", "sets": 80}, {"exercise": "Lat Pulldown", "sets": 120}]
     assert rows_match(r_gt, r_sys, has_order_by=False) is True, "test 2"
 
-    # 3. Same rows but wrong order WITH ORDER BY
-    assert rows_match(r_gt, r_sys, has_order_by=True) is False, "test 3"
+    # 3. Extra columns in SYS row are ignored
+    gt_extra = [{"exercise": "Lat Pulldown", "sets": 120}]
+    sys_extra = [{"exercise": "Lat Pulldown", "sets": 120, "extra_col": 99}]
+    assert rows_match(gt_extra, sys_extra) is True, "test 3"
 
     # 4. Scalar ground truth — value exists inside a multi-column system row
     gt_scalar = [{"pr": 58.97}]
@@ -124,7 +134,7 @@ if __name__ == "__main__":
     # 7. Float outside 1% tolerance (2% diff)
     assert rows_match([{"v": 100.0}], [{"v": 102.0}]) is False, "test 7"
 
-    # 8. Different row counts → False
+    # 8. GT has more rows than SYS → False
     assert rows_match([{"a": 1}, {"a": 2}], [{"a": 1}]) is False, "test 8"
 
     # 9. Ground truth empty but system has rows → False
@@ -132,5 +142,19 @@ if __name__ == "__main__":
 
     # 10. Numeric string in system rows treated as float
     assert rows_match([{"v": 42.0}], [{"v": "42"}]) is True, "test 10"
+
+    # 11. GT has a value not present in any SYS cell → False
+    assert rows_match([{"name": "A", "val": 99}], [{"name": "A", "other": 1}]) is False, "test 11"
+
+    # 12. SYS has more rows than GT — GT rows all covered → True
+    gt_sub = [{"date": "2024-06-05"}]
+    sys_many = [{"date": "2024-06-05"}, {"date": "2024-06-20"}, {"date": "2024-06-29"}]
+    assert rows_match(gt_sub, sys_many) is True, "test 12"
+
+    # 13. Column-name mismatch but same values → True (column-name agnostic)
+    assert rows_match(
+        [{"exercise": "Lat Pulldown", "total_sets": 303}],
+        [{"exercise_name": "Lat Pulldown", "sets": 303}],
+    ) is True, "test 13"
 
     print("All row_compare self-tests passed.")

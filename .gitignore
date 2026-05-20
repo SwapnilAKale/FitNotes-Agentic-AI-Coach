@@ -9,3 +9,18 @@ venv/
 *.egg-info/
 dist/
 .pytest_cache/
+
+# Personal workout data — never push
+data/memory.json
+data/user_context.json
+data/chroma_db/
+corpus/raw/
+personal_lessons.md
+
+# Eval data files (contain personal workout data in ground truth)
+evals/eval_set.json
+evals/candidates.json
+
+# Data directory (populated by user with their own .fitnotes)
+data/
+!data/.gitkeep

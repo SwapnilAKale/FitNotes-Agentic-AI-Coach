@@ -3,6 +3,15 @@ import threading
 from typing import Any
 
 
+def sanitize_sql(sql: str) -> str:
+    """Replace smart/curly quotes with straight quotes to prevent SQL errors."""
+    return (sql
+        .replace('‘', "'").replace('’', "'")  # curly single quotes
+        .replace('“', '"').replace('”', '"')  # curly double quotes
+        .replace('—', '--')  # em dash
+    )
+
+
 def get_connection(db_path: str) -> sqlite3.Connection:
     normalized = db_path.replace("\\", "/")
     uri = f"file:{normalized}?mode=ro"
@@ -45,7 +54,7 @@ def run_query(
     timer = threading.Timer(timeout_seconds, _interrupt)
     try:
         timer.start()
-        cursor = conn.execute(sql)
+        cursor = conn.execute(sanitize_sql(sql))
         rows = cursor.fetchmany(row_limit)
         return [{k: row[k] for k in row.keys()} for row in rows]
     except sqlite3.OperationalError as exc:

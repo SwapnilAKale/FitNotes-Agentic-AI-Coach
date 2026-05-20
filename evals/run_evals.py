@@ -29,7 +29,7 @@ _EVALS_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _PROJECT_ROOT)
 sys.path.insert(0, _EVALS_DIR)
 
-from src.db import get_connection, run_query      # noqa: E402
+from src.db import get_connection, run_query, sanitize_sql  # noqa: E402
 from src.llm import judge_answer                  # noqa: E402
 from src.text_to_sql import answer_question       # noqa: E402
 from row_compare import rows_match                # noqa: E402
@@ -108,7 +108,7 @@ def run_evals() -> None:
             })
             continue
 
-        gt_sql = case["ground_truth_sql"]
+        gt_sql = sanitize_sql(case["ground_truth_sql"])
         gt_answer = case["ground_truth_answer"]
 
         # ── Run system pipeline ───────────────────────────────────────────

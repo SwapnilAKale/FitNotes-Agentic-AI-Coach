@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import re
 import sys
 from contextlib import AsyncExitStack
 from datetime import date as _date
@@ -10,7 +11,7 @@ from google import genai
 from google.genai import types
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-from src.memory import add_fact, format_memory_for_prompt
+from src.memory import add_fact, format_memory_for_prompt, format_relevant_memories_for_prompt
 from src.schema_prompt import build_user_context_prompt, load_user_context
 
 MODEL = "gemini-2.5-flash-lite"
@@ -37,7 +38,67 @@ You are a personal fitness coach assistant with tools for querying workout histo
 REASONING: Write a brief "Thought:" before each tool call explaining why, and after results explaining what you learned. Stop calling tools when you have enough data.
 Important: "Thought:" reasoning is for your internal process only. Never include "Thought:" in your final answer to the user.
 
-TOOL RULES:
+TOOL GROUPS — identify the group first, then pick the specific tool:
+
+📊 READ — WORKOUT DATA:
+  resolve_exercise_name — ALWAYS call first when user mentions any exercise name
+  query_workout_data — flexible queries about workout history
+  get_personal_record — PRs for a specific exercise
+  get_exercise_history — recent sets for an exercise
+  get_weekly_volume — volume by muscle group or time period
+  run_read_only_sql — custom SQL when other read tools don't fit
+  get_exercise_sessions — find sessions by date (for disambiguation)
+  read_exercise_comments — form quality, ROM, drop sets, equipment notes
+
+📚 READ — KNOWLEDGE:
+  search_fitness_knowledge — fitness science, research, general questions
+
+✏️ WRITE — LOGGING NEW DATA:
+  log_workout — log a new workout session (always ask for date if not provided)
+  execute_staged_workout — call immediately after log_workout is confirmed
+  log_bodyweight — log body weight entry
+
+🎯 WRITE — GOALS:
+  set_goal — set a new strength or performance goal
+  execute_staged_goal — call immediately after set_goal is confirmed
+  update_goal — modify target weight, reps, or date of an existing goal
+  execute_staged_goal_update — call immediately after update_goal is confirmed
+  delete_goal — permanently remove a goal
+  execute_staged_goal_delete — call immediately after delete_goal is confirmed
+
+🔧 WRITE — CORRECTIONS:
+  update_workout_set — fix a logged weight or rep count
+  execute_staged_set_update — call immediately after update_workout_set is confirmed
+  delete_workout_set — permanently remove a specific logged set
+  execute_staged_set_delete — call immediately after delete_workout_set is confirmed
+
+✅ VERIFY — always call after any write operation:
+  verify_workout_logged — after execute_staged_workout
+  verify_goal_set — after execute_staged_goal or execute_staged_goal_update
+  verify_set_updated — after execute_staged_set_update
+  verify_set_deleted — after execute_staged_set_delete (verified: false = success)
+
+🧠 MEMORY:
+  remember_fact — store a user preference, personal fact, or training convention
+  recall_memories — retrieve stored facts relevant to a question
+  forget_fact — remove an outdated or incorrect stored fact
+
+⚙️ EXERCISE QUIRKS:
+  add_exercise_quirk — store how to interpret a non-standard exercise
+  update_exercise_quirk — update an existing quirk note
+  delete_exercise_quirk — remove a quirk
+  list_exercise_quirks — show all stored quirks
+
+SELECTION RULES:
+- Question about data → READ — WORKOUT DATA
+- Question about fitness science → READ — KNOWLEDGE
+- User logging a new session → WRITE — LOGGING
+- User managing a goal → WRITE — GOALS
+- User fixing a mistake → WRITE — CORRECTIONS
+- User explaining how they log an exercise → EXERCISE QUIRKS
+- User sharing a personal fact or preference → MEMORY
+- After ANY write → VERIFY immediately
+
 UNIT PREFERENCE:
 Check recall_memories at the start of any question involving weights.
 If no unit_preference fact is stored, ask the user once:
@@ -46,15 +107,9 @@ Store their answer with remember_fact(category="preference", content="User prefe
 After storing, apply their preference to all weight reporting in this and future sessions.
 Only ask once — if unit_preference exists in memory, never ask again.
 
-- resolve_exercise_name — for any specific exercise name the user mentions; NOT for muscle groups (use get_weekly_volume or query_workout_data directly for those).
-- get_exercise_history / get_personal_record / get_weekly_volume / query_workout_data / run_read_only_sql — personal workout data.
-- When get_personal_record returns single_rep_warning: true, immediately call read_exercise_comments for that exercise filtering to the PR date. Check if comments mention failed, bad form, back curled, disgracefully, or injury. If yes, caveat the PR in your answer: "Note: this set had form issues per your training log — it may not reflect your true max." If no concerning comments, report the PR normally.
-- search_fitness_knowledge — training science and principles.
-- read_exercise_comments — form, technique, equipment, drop sets (not just weight/reps). Summarise in ≤3 paragraphs: starting form → progression → current state.
-- get_exercise_sessions — list session dates/stats to help identify a specific session for update/delete.
-- remember_fact: when user tells you something personal, states a preference, mentions an injury, or clarifies a convention. Store it immediately.
-- recall_memories: at the start of personal questions to check stored context.
-- forget_fact: when user says something is no longer true.
+SPECIAL RULES:
+- When get_personal_record returns single_rep_warning: true, immediately call read_exercise_comments for that exercise filtering to the PR date. Check if comments mention failed, bad form, back curled, disgracefully, or injury. If yes, caveat the PR: "Note: this set had form issues per your training log — it may not reflect your true max."
+- read_exercise_comments — summarise in ≤3 paragraphs: starting form → progression → current state.
 - Call at least one tool before answering. Never fabricate data. Report weights exactly as returned.
 - For complex multi-step questions, write a short PLAN before calling tools.
 
@@ -66,8 +121,7 @@ WRITE ACTIONS:
   immediately in the same response turn. The CLI has already handled confirmation.
   Do not add any text asking the user if they want to proceed.
   Do not repeat what is about to be written. Just call execute.
-- After every execute_, call the matching verify_ tool and report the result:
-  verify_workout_logged / verify_goal_set / verify_set_updated / verify_set_deleted
+- After every execute_, call the matching verify_ tool and report the result.
 - For deletes: verify_set_deleted returning verified: true = success (item gone = correct).
 - If "cancelled": true is returned, acknowledge and stop — do not retry.
 - Final answer after any write MUST state one of:
@@ -100,17 +154,18 @@ class AgentSession:
         self._context_messages: list[dict] = []  # pinned user-context pair, prepended to every call
         self.confirmation_handler: callable | None = None
         self._staged_active: bool = False
-        self._effective_system_prompt: str = SYSTEM_PROMPT
+        self._base_system_prompt: str = SYSTEM_PROMPT
 
     async def initialize(self) -> None:
         if self._memory_only:
             self._all_tools = self._build_memory_only_tools()
-            tool_names = [t["function"]["name"] for t in self._all_tools]
 
-            memory_context = format_memory_for_prompt()
-            self._effective_system_prompt = SYSTEM_PROMPT
-            if memory_context:
-                self._effective_system_prompt = SYSTEM_PROMPT + "\n\n" + memory_context
+            self._base_system_prompt = SYSTEM_PROMPT
+            try:
+                from src.memory import sync_to_chromadb
+                sync_to_chromadb()
+            except Exception:
+                pass
 
             self._client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
             self._initialized = True
@@ -168,10 +223,12 @@ class AgentSession:
                 {"role": "assistant", "content": "Understood. I'll apply these data interpretation rules to all queries."},
             ]
 
-        memory_context = format_memory_for_prompt()
-        self._effective_system_prompt = SYSTEM_PROMPT
-        if memory_context:
-            self._effective_system_prompt = SYSTEM_PROMPT + "\n\n" + memory_context
+        self._base_system_prompt = SYSTEM_PROMPT
+        try:
+            from src.memory import sync_to_chromadb
+            sync_to_chromadb()
+        except Exception:
+            pass
 
         self._client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
         self._initialized = True
@@ -438,6 +495,17 @@ class AgentSession:
         max_iterations = 7
         tool_calls_made = 0
 
+        # Build per-question system prompt with relevant memories injected
+        try:
+            memory_context = format_relevant_memories_for_prompt(question)
+            effective_prompt = (
+                self._base_system_prompt + "\n\n" + memory_context
+                if memory_context
+                else self._base_system_prompt
+            )
+        except Exception:
+            effective_prompt = self._base_system_prompt
+
         _execute_tool_names = {"execute_staged_workout", "execute_staged_goal"}
         _base_openai = [t for t in self._all_tools if t["function"]["name"] not in _execute_tool_names]
         _base_gemini_tools = self._build_gemini_tools(_base_openai)
@@ -466,7 +534,7 @@ class AgentSession:
                     model=MODEL,
                     contents=self._convert_messages_to_contents(messages),
                     config=types.GenerateContentConfig(
-                        system_instruction=self._effective_system_prompt,
+                        system_instruction=effective_prompt,
                         tools=active_gemini_tools,
                         tool_config=tool_config,
                         temperature=0.3,
@@ -476,14 +544,8 @@ class AgentSession:
                 )
             except asyncio.CancelledError:
                 raise
-            except Exception as e:
-                print(f"[Error] API call failed: {e}", flush=True)
-                return {
-                    "question": question,
-                    "answer": "I encountered an error processing that request. The query may have been too complex. Try rephrasing.",
-                    "tool_calls_made": tool_calls_made,
-                    "error": str(e),
-                }
+            except Exception:
+                raise  # Let cli.py handle all errors cleanly
 
             # Parse response
             candidate = response.candidates[0]
@@ -515,6 +577,8 @@ class AgentSession:
                 final_answer = combined_text or ""
                 if tool_calls_made >= 2:
                     final_answer = await self._reflect(question, final_answer)
+                # Strip any leading Thought: prefix from final answer
+                final_answer = re.sub(r'^(Thought:?\s*\n?)+', '', final_answer, flags=re.IGNORECASE).strip()
                 self._save_exchange(messages, new_exchange_start)
                 return {
                     "question": question,

@@ -1,248 +1,277 @@
-# FitNotes Coach — Stage 1: Text-to-SQL
+# FitNotes Personal Strength Coach
 
-A minimal pipeline that answers natural-language questions about your FitNotes workout history by generating SQL, running it against your local SQLite database, and returning a plain-English explanation.
+A full-stack agentic AI coaching system built over a personal FitNotes SQLite database. The agent answers natural language questions about workout history, provides fitness science knowledge via RAG, and can log, update, and delete workout data with human-in-the-loop confirmation.
 
-**Two LLM calls per question. No agent loop. No frameworks. Just Python.**
-
----
-
-## What Stage 1 does
-
-```
-Your question
-     │
-     ▼
- generate_sql()  ──►  Groq (kimi-k2-instruct)  ──►  SELECT ...
-     │
-     ▼
- run_query()     ──►  SQLite (read-only)         ──►  [{...}, ...]
-     │
-     ▼
- explain_result() ──► Groq (kimi-k2-instruct)   ──►  "Your PR is 80 kg..."
-```
+Built as a learning project covering the full agentic AI stack from scratch — no LangChain, no LangGraph, no abstractions. Every component is hand-built and understood.
 
 ---
 
-## Requirements
+## What It Does
 
-- Python 3.11+
-- A [Groq API key](https://console.groq.com/) (free tier works)
-- Your `FitNotes_Backup.fitnotes` file exported from the FitNotes Android app
-
----
-
-## Installation
-
-```bash
-cd fitnotes_coach
-
-python -m venv .venv
-# Windows:
-.venv\Scripts\activate
-# macOS/Linux:
-source .venv/bin/activate
-
-pip install -r requirements.txt
-```
+- **Ask anything about your training history** — PRs, volume trends, exercise frequency, progression over time
+- **Get fitness science answers** — backed by a RAG pipeline over 160 PubMed abstracts and Wikipedia articles
+- **Log workouts and goals** — with a two-phase confirmation gate before any data is written
+- **Fix mistakes** — update or delete logged sets with full audit trail
+- **Remember your preferences** — long-term memory persists across sessions via ChromaDB
+- **Handle non-standard exercises** — store plain-English quirks for exercises with unusual logging conventions
 
 ---
 
-## Configuration
+## Tech Stack
 
-```bash
-cp .env.example .env
-```
-
-Edit `.env`:
-
-```
-GROQ_API_KEY=gsk_...your_key_here...
-FITNOTES_DB_PATH=./data/FitNotes_Backup.fitnotes
-```
+| Component | Technology |
+|-----------|-----------|
+| Agent LLM | Gemini 3.1 Flash Lite (500 RPD free tier) |
+| Vector DB | ChromaDB (local persistent) |
+| Embeddings | BAAI/bge-small-en-v1.5 (sentence-transformers, local) |
+| Reranker | cross-encoder/ms-marco-MiniLM-L-6-v2 (local) |
+| Tool Protocol | MCP (Model Context Protocol) |
+| Database | SQLite (.fitnotes) |
+| CLI | Python asyncio with graceful shutdown |
 
 ---
 
-## Drop in your database
-
-Export a backup from FitNotes (app menu → Backup & Restore → Backup to device), then copy the `.fitnotes` file:
+## Project Structure
 
 ```
 fitnotes_coach/
-└── data/
-    └── FitNotes_Backup.fitnotes   ← put it here
+├── data/
+│   ├── FitNotes_Backup.fitnotes      # Your SQLite workout DB
+│   ├── chroma_db/                     # ChromaDB (fitness knowledge + memory)
+│   ├── user_context.json              # Personal data conventions + exercise quirks
+│   └── memory.json                    # Long-term memory store
+├── mcp_servers/
+│   └── combined_server.py             # All 31 MCP tools
+├── src/
+│   ├── agent.py                       # AgentSession, ReAct loop, Gemini client
+│   ├── db.py                          # DB connections + sanitize_sql()
+│   ├── llm.py                         # Gemini SQL generation + explanation
+│   ├── memory.py                      # Memory store + ChromaDB sync
+│   ├── rag.py                         # Hybrid search + reranker
+│   ├── schema_prompt.py               # Schema + user context injection
+│   └── text_to_sql.py                 # Text-to-SQL pipeline
+├── scripts/
+│   ├── build_corpus.py                # PubMed + Wikipedia ingestion
+│   ├── regenerate_ground_truth.py     # Eval ground truth refresh
+│   └── test_memory.py                 # Standalone memory test
+├── evals/
+│   ├── eval_set.json                  # 20 evaluation questions
+│   ├── run_evals.py                   # SQL + LLM-judge scoring
+│   ├── row_compare.py                 # ORDER-BY agnostic comparator
+│   └── stress_test.py                 # 19-test adversarial suite
+└── cli.py                             # Async CLI + confirmation gate
 ```
 
 ---
 
-## Run the CLI
+## Setup
+
+### Prerequisites
+- Python 3.11+
+- A FitNotes backup file (`.fitnotes`) exported from the FitNotes app
+- A Gemini API key (free tier) from [aistudio.google.com](https://aistudio.google.com)
+
+### Installation
+
+```bash
+git clone https://github.com/yourusername/fitnotes-coach
+cd fitnotes-coach
+python -m venv .venv
+.venv\Scripts\activate  # Windows
+# source .venv/bin/activate  # Mac/Linux
+pip install -r requirements.txt
+```
+
+### Configuration
+
+Create a `.env` file in the project root:
+
+```env
+GEMINI_API_KEY=your_gemini_api_key_here
+HF_HUB_DISABLE_IMPLICIT_TOKEN_WARNING=1
+```
+
+### Add your FitNotes database
+
+Export your FitNotes backup:
+- Open FitNotes → Menu → Backup → Export Backup
+- Copy the `.fitnotes` file to `data/FitNotes_Backup.fitnotes`
+
+### Build the fitness knowledge corpus (one-time)
+
+```bash
+python scripts/build_corpus.py
+```
+
+This fetches ~160 PubMed abstracts and Wikipedia articles on strength training, hypertrophy, and fitness science. Takes 2-3 minutes. Only needs to be run once.
+
+### Run
 
 ```bash
 python cli.py
 ```
 
-Example session:
-
-```
-FitNotes Coach — Stage 1 (Text-to-SQL)
-Type a question about your workout history. Type 'exit' or 'quit' to leave.
-
-You: What's my PR for Lat Pulldown?
-
-[SQL]
-SELECT tl.metric_weight AS pr_kg, tl.reps, tl.date
-FROM training_log tl
-JOIN exercise e ON tl.exercise_id = e._id
-WHERE e.name = 'Lat Pulldown' AND tl.is_personal_record = 1
-ORDER BY tl.metric_weight DESC LIMIT 1;
-
-[Answer]
-Your personal record for Lat Pulldown is 80 kg for 8 reps, set on 2024-11-03.
-
-[Rows returned: 1]
+For memory testing without loading all tools:
+```bash
+python cli.py --memory-only
 ```
 
 ---
 
-## Run the eval harness (Stage 1.5)
+## Usage Examples
 
-The eval harness uses two complementary scoring methods — execution-based SQL
-comparison and an LLM-as-judge for natural-language answers — replacing the
-naive substring matching from Stage 1.
+```
+You: What is my deadlift PR?
+→ Your deadlift personal record is 85 kg for 5 reps, achieved on 2026-04-20.
 
-### Step 1 — Populate ground truth (one-time, ~20 minutes)
+You: How many sets of back exercises did I do last month?
+→ You completed 47 sets across 8 back exercises in the last 30 days.
+
+You: What does research say about optimal training frequency for hypertrophy?
+→ [RAG-backed answer citing PubMed abstracts]
+
+You: Log today's workout: flat dumbbell bench press, 3 sets — 50 lbs x 10, 55 lbs x 8, 55 lbs x 6
+→ What date was this workout?
+
+You: yesterday
+→ [Confirmation gate fires — you type yes]
+→ [Execute gate fires — you type yes]
+→ ✅ 3 sets of Flat Dumbbell Bench Press logged for 2026-05-19.
+
+You: I have a new exercise called Dumbbell Hold. Reps stores seconds, weight is lbs.
+→ Understood — I'll interpret Dumbbell Hold sets as hold duration, not rep count.
+```
+
+---
+
+## Tools (31 total)
+
+Organized into 8 groups:
+
+**Read — Workout Data:** `query_workout_data`, `get_personal_record`, `get_exercise_history`, `get_weekly_volume`, `run_read_only_sql`, `get_exercise_sessions`, `read_exercise_comments`, `resolve_exercise_name`
+
+**Read — Knowledge:** `search_fitness_knowledge`
+
+**Write — Logging:** `log_workout`, `execute_staged_workout`, `log_bodyweight`
+
+**Write — Goals:** `set_goal`, `execute_staged_goal`, `update_goal`, `execute_staged_goal_update`, `delete_goal`, `execute_staged_goal_delete`
+
+**Write — Corrections:** `update_workout_set`, `execute_staged_set_update`, `delete_workout_set`, `execute_staged_set_delete`
+
+**Verify:** `verify_workout_logged`, `verify_goal_set`, `verify_set_updated`, `verify_set_deleted`
+
+**Memory:** `remember_fact`, `recall_memories`, `forget_fact`
+
+**Exercise Quirks:** `add_exercise_quirk`, `update_exercise_quirk`, `delete_exercise_quirk`, `list_exercise_quirks`
+
+---
+
+## Architecture
+
+### Agent Loop (ReAct)
+The agent uses a hand-built ReAct loop — no LangChain or LangGraph. Each question goes through: Thought → Tool Selection → Tool Execution → Observation → repeat until answer. Max 7 iterations. A reflection step reviews the answer before returning it.
+
+Building the loop from scratch was intentional — it teaches what frameworks like LangGraph abstract away: context accumulation costs, tool schema sizing, graceful error handling, and why confirmation gates must live outside the agent.
+
+### RAG Pipeline
+Three-stage retrieval: query rewriting (casual English → academic terms) → BM25 + dense hybrid search → cross-encoder reranking (threshold 0.0). A relevance gate filters topically adjacent but irrelevant documents before answer composition.
+
+### Write Operations
+Two-phase pattern: stage (validate + preview) → CLI confirmation gate → execute (DB write) → verify (read-back). The agent cannot bypass the gate. All write connections are separate from read connections at the SQLite level.
+
+### Long-Term Memory (Option B)
+Facts stored in `memory.json` (source of truth, 30 fact cap). ChromaDB `user_memory` collection is the search index. Per-question: embed the question → retrieve top 5 semantically relevant facts (cosine distance < 0.8) → inject only those into `system_instruction`. Token cost stays constant at ~100 tokens regardless of total memory size.
+
+### MCP (Model Context Protocol)
+All tools exposed via a single `combined_server.py` subprocess. Single server avoids Windows IOCP deadlock that occurs with multiple concurrent stdio MCP sessions. Sentence-transformers pre-loaded in main thread before `server.run()` to avoid OpenMP deadlock.
+
+---
+
+## What Each Stage Built
+
+| Stage | What Was Built |
+|-------|---------------|
+| 1 | Text-to-SQL pipeline — natural language → SQL → execute → explain |
+| 1.5 | Eval harness — execution-based SQL scoring + LLM-as-judge |
+| 2 | Naive RAG — PubMed + Wikipedia corpus, ChromaDB, LLM router |
+| 3 | Better retrieval — query rewriting, BM25 hybrid, cross-encoder reranking |
+| 4 | MCP servers + agent loop — replaced hardcoded router with tool-calling agent |
+| 5 | ReAct + new tools — resolve_exercise_name, read_exercise_comments, reflection |
+| 6 | Write actions — two-phase writes with human-in-the-loop confirmation gate |
+| 7 | Long-term memory — ChromaDB-backed per-question retrieval (Option B) |
+| 8 | Stress testing — 19/19 adversarial tests pass |
+| 9 | Polish — unit fixes, 1-rep PR warnings, relevance gate, error handling |
+| 10 | Gemini migration, Memory Option B, ground truth regeneration |
+| 11 | Exercise quirks system, tool grouping |
+
+---
+
+## Key Lessons Learned
+
+**Reasoning models ≠ instruction-following models.** Use reasoning models for reasoning tasks. Use instruction-following models for SQL generation, classification, and format-constrained tasks. Mixing them causes over-thinking on simple tasks.
+
+**Agent initialization is expensive.** Each startup sends the full system prompt + all tool schemas. On free-tier APIs this is 10-20% of your daily budget before asking a single question. Condense system prompts aggressively.
+
+**Silent write failures are worse than noisy confirmations.** A system that fails silently while appearing to succeed corrupts the user's mental model. Always explicitly state whether a write succeeded or failed.
+
+**Context window accumulation is an exponential cost risk.** Each tool result is re-sent on every subsequent API call in the loop. Three questions with large tool results can burn a daily token budget. Prune context aggressively in production agents.
+
+**Wrong ground truth means every downstream eval is wrong.** Ground truth must be in the user's units and schema. A correct pipeline that returns correct data in a different column order will fail evals written for the old schema.
+
+**Build from scratch before using frameworks.** Building the agent loop, confirmation gate, and context management by hand teaches what LangGraph, LangChain, and similar frameworks abstract away. The abstractions make sense once you've hit the problems they solve.
+
+---
+
+## Running the Evals
 
 ```bash
-python evals/build_ground_truth.py
+python evals/run_evals.py        # SQL correctness + answer quality
+python evals/stress_test.py      # 19 adversarial tests
 ```
 
-This interactive script walks through each of the 20 eval cases. For each one
-you paste a hand-written SQL query (ended with `;;;`), inspect the rows it
-returns, and enter a one-sentence plain-English answer. Progress is saved
-atomically after every case; type `exit` at any prompt to quit and resume
-later.
-
-**Do not skip this step.** Cases without ground truth are automatically skipped
-during scoring.
-
-### Step 2 — Score
-
-```bash
-python evals/run_evals.py
-```
-
-Prints a table and a failure report, then saves `evals/results.json`:
-
-```
-id    difficulty  sql_ok   answer_ok  gt_rows        sys_rows     time_ms
-─────────────────────────────────────────────────────────────────────────
-q01   easy        PASS     PASS       1              1            1823
-q02   easy        PASS     FAIL       1              1            1541
-...
-
-Pass rates by difficulty:
-  easy      sql 8/8   answer 7/8
-  medium    sql 6/8   answer 6/8
-  hard      sql 3/4   answer 3/4
-
-Overall (20 run):  sql 17/20 (85%)  answer 16/20 (80%)
-
-────────────────────────────────────────────────────────────────
-FAILURES (3):
-────────────────────────────────────────────────────────────────
-
-q02 [easy]: judge marked incorrect
-  Q: When did I last train Flat Dumbbell Bench Press?
-  Judge: System said 2024-10-15 but ground truth is 2024-11-03.
-```
-
-### How the two scoring methods work
-
-**Execution-based SQL scoring:** Both the hand-written `ground_truth_sql` and
-the system's generated SQL are executed against the real SQLite database. The
-resulting row sets are compared with `evals/row_compare.py`: column names are
-ignored (only values matter), row order is ignored unless the ground-truth SQL
-contains `ORDER BY`, and floats are compared within 1% relative tolerance. A
-ground-truth query that returns a single scalar value is matched if that value
-appears anywhere in the system's result rows.
-
-**LLM-as-judge answer scoring:** The judge receives the original question, the
-hand-written `ground_truth_answer`, and the system's natural-language answer.
-It is instructed to mark the system correct if the core facts match, allowing
-for differences in phrasing, unit (kg vs lbs — with conversion), rounding
-within 1%, and additional commentary. It marks the system incorrect if a
-numeric value differs by more than 1%, the wrong exercise or date is reported,
-or a key fact is missing. Temperature is set to 0 for determinism.
-
-### Verify row-comparison logic
-
-```bash
-python evals/row_compare.py
-```
-
-Runs 10 built-in assertion tests covering identical rows, reordered rows,
-scalar matching, float tolerance, and edge cases. No test framework required.
+Current scores:
+- SQL eval: 15/20 (75%) — remaining failures are column-name non-determinism
+- Stress test: 19/19 (100%)
+- Answer judge: 8/8 (100%) where judge quota was available
 
 ---
 
----
+## Future Work
 
-## Project structure
+### Near-term (planned)
 
-```
-fitnotes_coach/
-├── data/
-│   └── FitNotes_Backup.fitnotes   # you provide this
-├── src/
-│   ├── db.py                      # read-only SQLite connection, schema introspection, query runner
-│   ├── llm.py                     # Groq client — generate_sql(), explain_result(), judge_answer()
-│   ├── schema_prompt.py           # curated schema description fed to the LLM
-│   └── text_to_sql.py             # the full pipeline: question → SQL → rows → answer
-├── evals/
-│   ├── eval_set.json              # 20 test questions with ground_truth_sql / ground_truth_answer
-│   ├── build_ground_truth.py      # one-time interactive helper to populate ground truth
-│   ├── row_compare.py             # row-set comparison logic + self-tests
-│   ├── run_evals.py               # execution-based + LLM-judge eval harness
-│   └── results.json               # output from last eval run
-├── cli.py                         # interactive REPL
-├── .env.example
-├── .gitignore
-├── requirements.txt
-└── README.md
-```
+**Streaming responses** — Gemini supports `generate_content_stream()`. Currently the agent thinks for 3-5 seconds then dumps the full answer. Streaming shows words appearing as the model generates — dramatically better UX. Teaches async streaming patterns and SSE (Server-Sent Events) for the web UI.
+
+**FastAPI + Web UI** — Wrap `AgentSession` in FastAPI endpoints. Add a simple chat interface in HTML/JS with file upload for `.fitnotes` backups. Turns this into a real shareable product accessible from any browser including mobile. No Python installation needed for users. Teaches REST API design, WebSockets, and basic web deployment.
+
+**Write-ahead log + DB merge** — Currently agent-written workout data (logged via `log_workout`) lives in the SQLite DB. When the user exports a fresh FitNotes backup and uploads it, those agent-written sets would be overwritten. Fix: log every agent write to `agent_writes.json`. On new DB upload, replay the write log onto the new file before replacing the old one. Teaches transaction logging, SQLite conflict resolution, and data integrity across two sources.
+
+### Learning extensions
+
+**LangGraph** — Rebuild the agent loop using LangGraph's state machine framework. The current hand-built ReAct loop in `agent.py` does exactly what LangGraph provides — but explicitly, without abstractions. Rebuilding in LangGraph will make the framework's design decisions immediately obvious: why nodes, why edges, why checkpointers. The right order was always: build from scratch first, then use the framework.
+
+**Multi-Agent Systems** — Split the single agent into specialized agents: a query agent for read questions, a coach agent for trend analysis and advice, a logging agent for write operations. Agents communicate via a shared message bus. Teaches agent orchestration, message passing, and how to avoid the context accumulation problems that plague single large agents.
+
+**Agent Memory with Knowledge Graphs** — Replace the flat `memory.json` fact store with a graph database (NetworkX locally, Neo4j for production). Store relationships between facts: "trained chest → leads to → shoulder fatigue → affects → overhead press performance." The agent can reason over connections, not just isolated facts. Teaches graph data modeling and relationship-aware retrieval.
+
+**Computer Use for corpus updates** — Automate `build_corpus.py` by having the agent call the PubMed API directly (no browser needed — PubMed has a free API). The agent searches for new papers on a topic, fetches abstracts, embeds them, and adds them to ChromaDB. Scheduled weekly. The credibility problem is already solved — PubMed only indexes peer-reviewed literature. Teaches API-driven automation and scheduled agent tasks.
 
 ---
 
-## Known limitations of the eval harness
+## Notes for Interviewers
 
-- **LLM judge is not infallible.** The judge can misread unit conversions,
-  accept wrong answers that sound plausible, or reject correct answers that
-  use unexpected phrasing. Treat judge scores as a signal, not ground truth.
+This project deliberately avoids high-level frameworks (LangChain, LangGraph, LlamaIndex) to demonstrate understanding of the underlying components:
 
-- **Ground truth is only as good as the hand-written SQL.** If your reference
-  SQL is wrong (wrong filter, off-by-one date, wrong join), every future run
-  will score against a bad baseline. Review the SQL carefully before accepting
-  it in `build_ground_truth.py`.
+- The ReAct agent loop, context management, and tool selection are hand-built in `src/agent.py`
+- The RAG pipeline (query rewriting, BM25, dense retrieval, cross-encoder reranking) is built from components in `src/rag.py`
+- The MCP server protocol is implemented directly using the `mcp` Python SDK
+- The confirmation gate for write operations is an explicit CLI-level intercept, not a framework feature
+- Long-term memory uses ChromaDB for semantic retrieval — same vector search used for the knowledge base
 
-- **20 questions is a small sample.** The eval set covers common patterns but
-  cannot represent every query type or edge case in your workout history. A
-  passing score does not guarantee correctness on unseen questions.
-
-- **Calibration is not tested.** The harness checks whether the system gives
-  the right answer when one exists, but does not test whether the system
-  appropriately says "I don't know" or "no data found" for questions that have
-  no answer in the database.
+Every architectural decision has a documented reason in `lessons.md` including what went wrong when the first approach was tried.
 
 ---
 
-## Intentionally missing (future stages)
+## License
 
-| Feature | Stage |
-|---|---|
-| MCP server (expose tools to Claude Desktop / other agents) | Stage 2 |
-| RAG / semantic search over exercise notes | Stage 3 |
-| Agent loop with multi-step reasoning and tool use | Stage 3 |
-| Write operations (log a set, update a goal) | Stage 4 |
-| Conversation memory across turns | Stage 3 |
-| Streaming responses | Stage 2+ |
-
-Stage 1 is deliberately minimal so failure modes are easy to see — if the SQL is wrong, you see it printed; if the LLM hallucinates a table name, the query error surfaces immediately.
+MIT
