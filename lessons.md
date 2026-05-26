@@ -577,3 +577,334 @@ Anyone cloning the repo needs:
 2. Their own FitNotes backup file
 3. Run python scripts/build_corpus.py once to build the knowledge base
 4. All personal data stays local, never pushed
+
+---
+
+## Post-Stage 11: Web UI + Production Fixes
+
+### FastAPI Web Server
+
+Wrapped AgentSession in FastAPI endpoints. Two uvicorn processes:
+- Port 8000: API server (chat, upload, status, history, reload-db)
+- Port 3000: Static file server (frontend HTML/JS)
+
+Background initialization pattern: server starts immediately on both ports,
+AgentSession.initialize() runs as asyncio.create_task() after startup.
+Frontend polls /status every 1 second until agent_ready: true.
+This means the browser can open instantly — no waiting in the terminal.
+
+Key endpoints:
+- POST /chat — main agent query endpoint
+- POST /upload — accepts .fitnotes file, saves, triggers background reinitialize
+- GET /status — returns {ready: bool, message: str} — never blocks
+- GET /history — returns conversation history for session restore
+- POST /reload-db — fingerprint check + background reinitialize
+
+Frontend standalone server (frontend/server.py):
+The frontend is served by a separate lightweight uvicorn process on port 3000,
+intentionally designed to run independently from the main server.py on port 8000.
+
+Two run modes:
+- Full stack: python server.py (project root) — starts both ports, agent
+  initializes in background, browser opens automatically via webbrowser.open()
+- UI only: python server.py (from frontend/) — starts port 3000 only,
+  no agent initialization cost
+
+The standalone mode enables fast UI iteration — testing upload flows,
+layout changes, and error messages without waiting for MCP server
+initialization or burning Gemini quota.
+
+### Smart /reload-db
+
+Problem: /reload-db ran session.initialize() synchronously inside an HTTP request
+handler. MCP initialization takes 5-10 seconds — uvicorn's request timeout cancelled
+it, returning 500.
+
+Fix: background task pattern. /reload-db sets agent_ready = False, fires
+asyncio.create_task(_reinitialize_session()), returns {status: "reloading"} immediately.
+Frontend re-enters waitForReady() polling loop. No timeout possible.
+
+File fingerprint check (size + mtime) prevents unnecessary reinitialization when
+the same DB file is uploaded twice. Returns "Database unchanged" instantly.
+
+### PR query MAX() SQLite bug
+
+Problem: get_personal_record used MAX() in GROUP BY:
+  SELECT e.name, MAX(tl.metric_weight * 2.2046), tl.reps, tl.date ...
+  GROUP BY e.name
+
+SQLite's behavior: MAX() correctly finds the max weight, but tl.reps and tl.date
+come from an ARBITRARY row — not necessarily the row with the max weight.
+Result: correct weight (100 lbs) but wrong reps (4) and wrong date (2026-03-19)
+when the actual best set was 7 reps on 2026-05-20.
+
+Fix: subquery approach:
+  WHERE tl.metric_weight = (SELECT MAX(...) WHERE exercise = :name)
+  ORDER BY tl.reps DESC, tl.date DESC LIMIT 1
+
+This correctly fetches the actual row with the max weight, then picks the
+highest-rep version if tied, then most recent date if still tied.
+
+Lesson: SQLite allows bare columns in GROUP BY queries (columns not in aggregate
+functions) but returns arbitrary values for them. This is valid SQL but produces
+non-deterministic results. Always use subqueries or window functions when you need
+the full row corresponding to an aggregate value.
+
+### Tool schema compression
+
+Compressed all 31 tool descriptions from verbose paragraphs (~150 tokens each)
+to single-line signatures (~20 tokens each). Format: name(params) -> {return} — purpose.
+
+Result: ~30-40% reduction in per-call token overhead.
+Agent behavior unchanged — tool grouping in SYSTEM_PROMPT already guides selection.
+Verbose descriptions were written to fight early tool selection errors; with proper
+grouping they became unnecessary.
+
+### Rate limit UX — why auto-retry causes infinite loops
+
+Initial implementation: on rate limit, countdown then auto-retry the question.
+Problem: RPM (per-minute) limits reset every 60 seconds but auto-retry fired
+after 12-15 seconds. Each retry counted as another request, hitting the limit again,
+triggering another countdown, creating an infinite loop.
+
+Fix: remove auto-retry entirely. Countdown shows wait time, disables send button,
+re-enables it when countdown reaches 0. User retries manually on a clean minute window.
+
+Lesson: auto-retry makes sense for transient errors (network glitch, 503 overload).
+It makes things worse for rate limits because each retry consumes quota. The right
+UX for rate limits is: show the wait, disable input, re-enable when safe.
+
+Daily quota exhaustion (hours-long wait) is handled separately — shows static
+"Daily quota reached. Resets in Xh Ym" with no countdown or auto-retry.
+
+### Infinite reasoning loop fix
+
+Problem: agent hit max_iterations but the final answer contained raw Thought:
+reasoning text repeated dozens of times (the agent was spinning internally).
+
+Root cause: when max_iterations is reached, the response parts contained reasoning
+text that wasn't properly stripped before returning as the final answer.
+
+Fix: regex strip of Thought: prefixes before returning final answer. Deduplication
+of repeated lines. Hard fallback message if stripping leaves empty string.
+
+### Token optimization — what works on free tier
+
+Gemini Context Caching API: requires minimum 32,768 tokens in cached content.
+System prompt + 31 tool schemas = ~3,000-5,000 tokens. Below minimum — caching
+not available on free tier. Falls back silently.
+
+What actually reduces token burning:
+1. Keep server running — one initialization per day instead of per session
+2. Background init — no tokens burned until first /chat request
+3. Tool schema compression — 30-40% per-call reduction
+4. Smart reload-db — no reinitialization when DB unchanged
+5. System_instruction parameter — prompt not counted in conversation context
+
+What doesn't work on free tier: prompt caching (token minimum), semantic answer
+caching (wrong answers get cached for the session duration).
+
+## User Article Upload
+
+Users can add their own PDF fitness articles to the RAG knowledge
+base via the "+ Add Article (PDF)" button in the sidebar.
+
+Pipeline:
+PDF upload → text extraction (pypdf) → heuristic article detection
+→ paragraph chunking (200 words/chunk) → embedding
+(BAAI/bge-small-en-v1.5) → stored in ChromaDB user_articles collection
+→ PDF saved to data/user_articles/ for future rebuilding
+
+Article detection is heuristic-based (no LLM call, zero tokens):
+- Minimum 300 words
+- At least 2 structural markers: abstract, introduction, methods,
+  results, conclusion, discussion, references
+
+Design decisions:
+- Heuristic check only: user chose the article themselves so no
+  credibility check needed. Heuristic only prevents accidentally
+  uploading a non-article PDF.
+- Separate ChromaDB collection (user_articles): keeps user content
+  separate from corpus, allows future deletion without touching corpus.
+  Searched alongside main corpus during RAG retrieval — reranker
+  treats chunks identically.
+- PDF saved to data/user_articles/: allows rebuilding ChromaDB
+  collection from saved files if needed.
+- Re-uploading same filename replaces previous version.
+- Only text-based PDFs supported — scanned/image PDFs rejected
+  with clear error message.
+
+---
+
+## Post-Stage 11: Web UI, Streaming, and Production Fixes
+
+### Simulated streaming vs true streaming
+
+Implemented streaming using `generate_content_stream()` in `_run_stream_collect()`.
+What was built is NOT true streaming — it collects all chunks first, runs reflection
+on the full answer, then prints words one at a time using re.findall().
+The user still waits 3-5 seconds in silence. Words then appear fast.
+
+True streaming was not implemented because of the streaming-reflection tension:
+reflection needs the complete answer before it can review it. If you stream tokens
+to the user as they arrive, you cannot run reflection first. Solving this requires
+either skipping reflection (reduces quality) or restructuring the loop significantly.
+
+The simulated streaming introduced a bug: `_run_stream_collect` hit null content
+chunks from Gemini (`chunk.candidates[0].content` returning None on safety filter
+or empty chunks). The agent skipped tool calls on null chunks and returned early
+with "I wasn't able to form a clear answer."
+
+Fix: replaced `_run_stream_collect` entirely with `_run_collect` — a standard
+`generate_content()` call that returns `(combined_text, fc_parts)` in the same
+format. Simpler code, same UX, no streaming bugs.
+
+Lesson: simulated streaming is the worst of both worlds — adds complexity with
+none of the UX benefit. Implement true streaming properly or don't implement it.
+
+### EventSource vs fetch + ReadableStream
+
+Web streaming uses `fetch` with `ReadableStream`, not `EventSource`.
+EventSource only supports GET requests. `/chat` is POST (needs message body).
+This is a common gotcha — EventSource is simpler but can't send request bodies.
+
+### FastAPI web server architecture
+
+Two uvicorn processes:
+- Port 8000: API server (`server.py` in project root)
+- Port 3000: Static frontend server (`frontend/server.py`)
+
+`frontend/server.py` designed intentionally as a standalone server:
+- Runs independently from the main server
+- Enables fast UI iteration without agent initialization cost
+
+Background initialization: `asyncio.create_task(_initialize_in_background())`
+fires after lifespan starts. Server serves requests immediately. Frontend polls
+`/status` every 1 second until `agent_ready: True`. Banner shows during wait.
+After 3 consecutive failures, frontend switches to frontend-only mode automatically.
+
+### LangGraph — deliberate decision not to use
+
+LangGraph was considered before building the FastAPI web UI. Decision: add
+features that give something real first, then refactor the foundation.
+
+Migrating to LangGraph at that point was pure refactoring — zero new capability,
+high risk of breaking 19/19 stress tests, delays having something usable.
+
+The right order: build from scratch (done) → add real features (web UI, streaming,
+article upload) → then use LangGraph knowing exactly what it abstracts. LangGraph
+remains a planned learning extension.
+
+### get_personal_record self-healing
+
+Added internal name resolution at the start of `_get_personal_record_sync`.
+Tool calls `_resolve_exercise_name_sync` first — if name doesn't match exactly,
+resolves it before querying. Returns clean "not found" message instead of crashing.
+
+Key bug found: `_resolve_exercise_name_sync` returns key `resolved_name` but
+`_get_personal_record_sync` was checking for key `match` — always evaluating
+to None. Fix: change to `resolved_data.get("resolved_name")`.
+
+Lesson: when one tool calls another internally, verify the exact key names in
+the return schema. Mismatched keys evaluate silently to None.
+
+### NoneType crash in agent call_tool
+
+`result.content` returned None from MCP when a tool raised an unhandled exception.
+`for item in result.content` threw `TypeError: 'NoneType' object is not iterable`.
+
+Two fixes:
+1. `src/agent.py` — null check: `if result is None or result.content is None: return error`
+2. `mcp_servers/combined_server.py` — entire dispatch block wrapped in try/except,
+   any tool exception returns clean error JSON instead of propagating to MCP framework
+
+The real crash was in `_run_stream_collect` (now removed) — null content chunk
+from Gemini caused the agent to exit the tool loop early after 1 tool call.
+
+### Tool schema compression
+
+Compressed all 31 tool descriptions from verbose paragraphs (~150 tokens each)
+to single-line signatures (~20 tokens each).
+Format: `name(params) -> {return} — purpose`
+Result: 30-40% reduction in per-call token overhead.
+No code changes — only description strings in combined_server.py list_tools().
+
+### Smart /reload-db and upload fingerprinting
+
+Initial mtime fingerprint approach failed — OS updates mtime on every write,
+even if content is identical. Fix: MD5 content hash of file bytes.
+Same content always produces same hash regardless of when file was written.
+
+Two fingerprint variables:
+- `_last_db_fingerprint` — current DB hash (updated after reload)
+- `_last_uploaded_fingerprint` — original upload hash (before agent writes)
+
+Upload compares against `_last_uploaded_fingerprint` so uploading the same
+base export doesn't reinitialize even if agent has written new sets to the DB.
+
+Planned (implement with write-ahead log): when user uploads same base file after
+agent writes, fingerprint matches → skip reinitialize → write-ahead log replays
+agent writes onto new file. Zero tokens burned for no-op uploads.
+
+### Upload integrity validation
+
+Three-stage validation before replacing DB:
+1. SQLite PRAGMA integrity_check — rejects corrupted files
+2. Required tables check — training_log and exercise must exist
+3. Row count comparison — warns if new file has fewer sets than current DB
+
+UX:
+- Errors (corrupted, wrong file) → 400 response, red toast, upload blocked
+- Warnings (fewer rows) → modal with "Upload Anyway" / "Cancel" buttons
+- Clean upload → proceeds, triggers background reinitialize
+
+Validates in temp file before overwriting current DB — upload failure never
+corrupts the live database.
+
+### User PDF article upload (expanded)
+
+Two-stage heuristic (no LLM, zero tokens):
+Stage 1 — Structural: at least 2 of: abstract, introduction, methods,
+  results, conclusion, discussion, references (≥300 words)
+Stage 2 — Topic relevance: at least 3 fitness-specific compound terms from
+  a 60-keyword list (exercise, resistance training, hypertrophy, cortisol, etc.)
+
+Generic academic words removed from keyword list (performance, stress, motivation)
+because they appear in any professional document. Use compound terms instead
+(strength training, exercise physiology, dietary protein).
+
+Minimum matched keywords raised from 2 to 3 after list became more specific —
+higher specificity means each match is more meaningful, so the bar can go up.
+
+### Debug mode
+
+`python server.py --debug` enables verbose terminal logging:
+- `[DEBUG] Question:` before each chat
+- `[DEBUG] → Tool call:` for every MCP tool invocation
+- `[DEBUG] ← Tool result:` for every tool response
+- `[DEBUG] Result:` with full answer dict
+- Full traceback on exceptions
+
+`traceback.print_exc()` in combined_server.py dispatcher always fires on tool
+crashes (not gated on DEBUG) — MCP subprocess stderr is the only way to see
+crashes inside tools.
+
+Lesson: always have a debug mode before spending time guessing where crashes
+occur. The NoneType crash took many sessions to find without it. With --debug,
+it was identified in one run.
+
+### UI redesign — Claude-style layout (planned)
+
+Target layout: no sidebar, thin header bar, full-width centered chat, input bar
+at bottom with paperclip attachment icon for uploads.
+
+Paperclip opens a small floating menu:
+- Upload Backup (.fitnotes)
+- Add Article (PDF)
+
+Closes on click-outside. Enter sends, Shift+Enter adds newline. Textarea
+auto-resizes up to 8 lines.
+
+Lesson: sidebar layout with two lonely buttons at the bottom looks out of place
+for a chat application. Moving uploads into the input bar (like Claude, ChatGPT)
+is the standard pattern that users already understand.

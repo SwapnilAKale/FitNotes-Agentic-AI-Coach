@@ -14,6 +14,8 @@ Built as a learning project covering the full agentic AI stack from scratch — 
 - **Fix mistakes** — update or delete logged sets with full audit trail
 - **Remember your preferences** — long-term memory persists across sessions via ChromaDB
 - **Handle non-standard exercises** — store plain-English quirks for exercises with unusual logging conventions
+- **Upload fitness research articles** — add PDF papers to the RAG knowledge base directly from the UI
+- **Upload FitNotes backups** — replace the workout database with integrity and row count validation
 
 ---
 
@@ -28,6 +30,8 @@ Built as a learning project covering the full agentic AI stack from scratch — 
 | Tool Protocol | MCP (Model Context Protocol) |
 | Database | SQLite (.fitnotes) |
 | CLI | Python asyncio with graceful shutdown |
+| Web Server | FastAPI + uvicorn (two processes: port 8000 API, port 3000 frontend) |
+| Frontend | HTML/CSS/JavaScript (vanilla, Tailwind CDN) |
 
 ---
 
@@ -59,6 +63,10 @@ fitnotes_coach/
 │   ├── run_evals.py                   # SQL + LLM-judge scoring
 │   ├── row_compare.py                 # ORDER-BY agnostic comparator
 │   └── stress_test.py                 # 19-test adversarial suite
+├── server.py                          # FastAPI web server — run this to start everything
+├── frontend/
+│   ├── server.py                      # Standalone frontend server (UI-only testing)
+│   └── index.html                     # Chat UI — no sidebar, paperclip upload in input bar
 └── cli.py                             # Async CLI + confirmation gate
 ```
 
@@ -115,6 +123,23 @@ For memory testing without loading all tools:
 ```bash
 python cli.py --memory-only
 ```
+
+### Run the Web Interface (recommended)
+
+```bash
+python server.py
+```
+
+Starts both the API server (port 8000) and frontend (port 3000), opens browser automatically.
+
+### Run frontend only (UI testing without agent)
+
+```bash
+cd frontend
+python server.py
+```
+
+Starts only port 3000. Use this for testing upload flows, layout changes, and UI features without burning Gemini quota or waiting for MCP initialization.
 
 ---
 
@@ -242,7 +267,9 @@ Current scores:
 
 **Streaming responses** — Gemini supports `generate_content_stream()`. Currently the agent thinks for 3-5 seconds then dumps the full answer. Streaming shows words appearing as the model generates — dramatically better UX. Teaches async streaming patterns and SSE (Server-Sent Events) for the web UI.
 
-**FastAPI + Web UI** — Wrap `AgentSession` in FastAPI endpoints. Add a simple chat interface in HTML/JS with file upload for `.fitnotes` backups. Turns this into a real shareable product accessible from any browser including mobile. No Python installation needed for users. Teaches REST API design, WebSockets, and basic web deployment.
+**FastAPI + Web UI** ✅ Complete — FastAPI server with chat UI, `.fitnotes` file upload
+with integrity validation, PDF article upload to RAG knowledge base, background
+initialization, rate limit UX, and `--debug` mode. Run with `python server.py`.
 
 **Write-ahead log + DB merge** — Currently agent-written workout data (logged via `log_workout`) lives in the SQLite DB. When the user exports a fresh FitNotes backup and uploads it, those agent-written sets would be overwritten. Fix: log every agent write to `agent_writes.json`. On new DB upload, replay the write log onto the new file before replacing the old one. Teaches transaction logging, SQLite conflict resolution, and data integrity across two sources.
 
@@ -275,3 +302,5 @@ Every architectural decision has a documented reason in `lessons.md` including w
 ## License
 
 MIT
+
+

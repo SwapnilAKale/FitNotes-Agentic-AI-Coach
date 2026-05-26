@@ -68,6 +68,13 @@ One row per set performed. This is the primary table.
 6. Join `training_log` → `exercise` → `Category` when filtering by muscle group name.
 7. Exercise names are case-sensitive and match exactly (e.g., `'Lat Pulldown'`, `'Flat Dumbbell Bench Press'`).
 
+### CRITICAL RULES
+- Never use SELECT * on training_log. Always explicitly select columns.
+- Always convert metric_weight to the display unit inside SQL:
+  - For lbs exercises: `(tl.metric_weight * 2.2046) AS weight_lbs`
+  - For kg-native exercises (Deadlift from 2025-12-26, Seated Machine Curl (Kg), Machine Wrist Extension, Hand Gripper): `(tl.metric_weight * 2.2046) AS weight_kg`
+- Never return raw metric_weight values to the user — always convert and label.
+
 IMPORTANT: All primary key and foreign key columns in this database use an underscore prefix.
 Always write: exercise._id, Category._id, training_log._id, exercise.category_id.
 Never write e.id or c.id — those columns do not exist and will silently return no results.

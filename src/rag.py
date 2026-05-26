@@ -5,11 +5,22 @@ COLLECTION_NAME = "fitness_knowledge"
 CHROMA_PATH = os.environ.get("CHROMA_DB_PATH", "data/chroma_db")
 EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-RERANKER_THRESHOLD = 0.0
+RERANKER_THRESHOLD = 0.5
 
 
 def _tokenize(text: str) -> list[str]:
     return re.split(r"[\s\W]+", text.lower())
+
+
+def _get_user_articles_collection(chroma_path: str = CHROMA_PATH):
+    """Returns user_articles ChromaDB collection or None if empty/missing."""
+    try:
+        import chromadb
+        client = chromadb.PersistentClient(path=chroma_path)
+        col = client.get_collection("user_articles")
+        return col if col.count() > 0 else None
+    except Exception:
+        return None
 
 
 class FitnessKnowledgeBase:
@@ -163,6 +174,33 @@ class FitnessKnowledgeBase:
 
         n_candidates = min(20, total_docs)
         candidates = self._hybrid_search(technical_query, n_candidates=n_candidates)
+
+        try:
+            user_col = _get_user_articles_collection(self._chroma_path)
+            if user_col:
+                query_embedding = self._embed_model.encode(technical_query).tolist()
+                user_results = user_col.query(
+                    query_embeddings=[query_embedding],
+                    n_results=min(5, user_col.count()),
+                    include=["documents", "metadatas", "distances"],
+                )
+                if user_results["documents"][0]:
+                    for doc, meta in zip(
+                        user_results["documents"][0],
+                        user_results["metadatas"][0],
+                    ):
+                        candidates.append({
+                            "text": doc,
+                            "title": meta.get("filename", "User article"),
+                            "url": "",
+                            "source": "user_article",
+                            "year": "",
+                            "topic": "",
+                            "rrf_score": 0.0,
+                        })
+        except Exception:
+            pass
+
         return self._rerank(technical_query, candidates, n_results=n_results)
 
     def format_context(self, results: list[dict]) -> str:

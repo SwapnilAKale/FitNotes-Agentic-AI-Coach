@@ -24,3 +24,5 @@ evals/candidates.json
 # Data directory (populated by user with their own .fitnotes)
 data/
 !data/.gitkeep
+data/user_articles/
+!data/user_articles/.gitkeep

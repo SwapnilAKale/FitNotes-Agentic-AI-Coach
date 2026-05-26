@@ -38,11 +38,7 @@ async def list_tools() -> list[types.Tool]:
     return [
         types.Tool(
             name="query_workout_data",
-            description=(
-                "Answer a natural-language question about the user's personal workout history "
-                "using the FitNotes database. Use for questions about PRs, exercise history, volume, "
-                "workout dates, sets, reps, progress over time. Returns SQL used, rows, and a natural-language answer."
-            ),
+            description="query(question) -> {answer, rows} — flexible natural language workout history query",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -56,10 +52,7 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="get_personal_record",
-            description=(
-                "Get the personal record (PR) for a specific exercise. Returns the heaviest "
-                "weight ever lifted, reps, and date. Handles unit conversion and bar weight automatically."
-            ),
+            description="get_personal_record(exercise_name) -> {weight, reps, date} — heaviest set ever for an exercise",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -73,10 +66,7 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="get_exercise_history",
-            description=(
-                "Get recent training history for a specific exercise. "
-                "Shows sets, weights, reps, and dates for the last N days."
-            ),
+            description="get_exercise_history(exercise_name, days) -> [{date, weight, reps}] — recent sets for an exercise",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -93,10 +83,7 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="get_weekly_volume",
-            description=(
-                "Get total training volume (sets and load) broken down by muscle group "
-                "for the last N days. Useful for assessing training balance and overtraining risk."
-            ),
+            description="get_weekly_volume(muscle_group, weeks) -> [{week, sets, volume}] — volume over time by muscle group",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -109,12 +96,7 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="run_read_only_sql",
-            description=(
-                "Run a custom read-only SQL query against the FitNotes database. "
-                "Use only for questions that the other tools cannot answer. "
-                "RESTRICTIONS: SELECT only. Max 100 rows. "
-                "Allowed tables: training_log, exercise, Category, Comment. Timeout: 5 seconds."
-            ),
+            description="run_read_only_sql(query) -> {rows} — execute custom SQL for novel queries",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -127,13 +109,27 @@ async def list_tools() -> list[types.Tool]:
             },
         ),
         types.Tool(
+            name="list_user_articles",
+            description="list_user_articles() -> {articles} — list PDF articles user has added to knowledge base",
+            inputSchema={"type": "object", "properties": {}, "required": []},
+        ),
+        types.Tool(
+            name="delete_user_article",
+            description="delete_user_article(filename) -> {deleted, chunks_deleted} — remove a PDF article from the knowledge base by filename",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "filename": {
+                        "type": "string",
+                        "description": "exact filename of the article to delete (e.g. 'fphys-16-1611468.pdf')",
+                    }
+                },
+                "required": ["filename"],
+            },
+        ),
+        types.Tool(
             name="search_fitness_knowledge",
-            description=(
-                "Search the fitness knowledge base for research-backed information about "
-                "training principles, hypertrophy, recovery, nutrition, and exercise science. "
-                "Uses hybrid retrieval (BM25 + semantic) and reranking for accuracy. "
-                "Returns titles, sources, and relevant text from PubMed abstracts and Wikipedia."
-            ),
+            description="search_fitness_knowledge(query) -> {answer, sources} — RAG search over fitness science corpus",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -150,13 +146,7 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="resolve_exercise_name",
-            description=(
-                "Resolves a colloquial or partial exercise name to the exact name stored "
-                "in the FitNotes database. Use this BEFORE calling any other database tool when the "
-                "user's exercise name might not match exactly. Examples: 'hammer curl' → 'Dumbbell Hammer Curl', "
-                "'skull crusher' → 'dumbbell skull crusher', 'seated machine curl' → 'Seated Machine Curl (Kg)'. "
-                "If multiple candidates are returned, present them to the user and ask for clarification."
-            ),
+            description="resolve_exercise_name(user_term) -> {name} — fuzzy match user's exercise name to DB name. Always call first.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -170,13 +160,7 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="read_exercise_comments",
-            description=(
-                "Read the user's personal notes and comments for a specific exercise. "
-                "Comments contain per-set form quality, ROM notes, drop set markers, equipment changes, "
-                "unit declarations, and training observations. Use this to understand form progression, "
-                "identify drop sets, check equipment used on a specific date, or answer questions about "
-                "training quality rather than just weight/reps."
-            ),
+            description="read_exercise_comments(exercise_name) -> [{set, comment}] + interpretation_note — form and notation notes",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -201,12 +185,7 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="log_workout",
-            description=(
-                "Log one or more sets for an exercise to the training log. "
-                "IMPORTANT: This tool stages the write and requires user confirmation before executing. "
-                "Always call resolve_exercise_name first to verify the exact exercise name. "
-                "Use today's date unless the user specifies otherwise."
-            ),
+            description="log_workout(exercise_name, date, sets) -> {staged, summary} — stage new workout entry",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -237,19 +216,12 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="execute_staged_workout",
-            description=(
-                "Executes the previously staged workout log after user confirmation. "
-                "Only call this after the user has explicitly confirmed the staged write."
-            ),
+            description="execute_staged_workout() -> {success} — write staged workout to DB",
             inputSchema={"type": "object", "properties": {}, "required": []},
         ),
         types.Tool(
             name="set_goal",
-            description=(
-                "Set a training goal for a specific exercise. "
-                "Stages the write and requires user confirmation. "
-                "Always call resolve_exercise_name first to verify the exact exercise name."
-            ),
+            description="set_goal(exercise_name, target_weight, target_reps, target_date, unit) -> {staged} — stage new goal",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -274,18 +246,12 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="execute_staged_goal",
-            description=(
-                "Executes the previously staged goal after user confirmation. "
-                "Only call this after the user has explicitly confirmed the staged write."
-            ),
+            description="execute_staged_goal() -> {success} — write staged goal to DB",
             inputSchema={"type": "object", "properties": {}, "required": []},
         ),
         types.Tool(
             name="log_bodyweight",
-            description=(
-                "Log today's body weight and optional body fat percentage. "
-                "This tool writes directly to the database after CLI confirmation — no separate execute call needed."
-            ),
+            description="log_bodyweight(date, weight, unit) -> {success} — log body weight entry",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -304,12 +270,7 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="verify_workout_logged",
-            description=(
-                "Verifies that a workout was actually saved to the database by checking "
-                "for the specific sets on a specific date. Call this immediately after "
-                "execute_staged_workout to confirm the write succeeded. "
-                "Only checks the exact date and exercise — does not scan all data."
-            ),
+            description="verify_workout_logged(exercise_name, date, expected_sets) -> {verified, sets} — confirm workout write",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -331,11 +292,7 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="verify_goal_set",
-            description=(
-                "Verifies that a goal was actually saved to the database. "
-                "Call immediately after execute_staged_goal. "
-                "Only checks the specific exercise and target date."
-            ),
+            description="verify_goal_set(exercise_name, target_date) -> {verified} — confirm goal write",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -353,11 +310,7 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="update_goal",
-            description=(
-                "Update an existing goal's target weight, reps, or date. "
-                "Stages the update and requires confirmation. Shows before → after. "
-                "If current_target_date is omitted, looks up all goals and auto-selects if only one exists."
-            ),
+            description="update_goal(exercise_name, current_target_date, ...) -> {staged} — stage goal modification",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -376,16 +329,12 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="execute_staged_goal_update",
-            description="Executes the staged goal update. Only call after user confirms.",
+            description="execute_staged_goal_update() -> {success} — write goal update to DB",
             inputSchema={"type": "object", "properties": {}, "required": []},
         ),
         types.Tool(
             name="delete_goal",
-            description=(
-                "Permanently deletes a goal from the database. "
-                "DESTRUCTIVE — cannot be undone. Requires extra confirmation. "
-                "If target_date is omitted, looks up all goals and auto-selects if only one exists."
-            ),
+            description="delete_goal(exercise_name, target_date) -> {staged} — stage goal deletion",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -400,16 +349,12 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="execute_staged_goal_delete",
-            description="Permanently deletes the staged goal. Only call after user confirms.",
+            description="execute_staged_goal_delete() -> {success} — permanently delete goal from DB",
             inputSchema={"type": "object", "properties": {}, "required": []},
         ),
         types.Tool(
             name="update_workout_set",
-            description=(
-                "Correct a logged set — fix wrong weight or rep count. "
-                "Stages the update and requires confirmation. Shows before → after. "
-                "If date is omitted, returns 3 disambiguation options to help identify the session."
-            ),
+            description="update_workout_set(exercise_name, date, old_weight, old_reps, new_weight, new_reps, unit) -> {staged}",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -429,16 +374,12 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="execute_staged_set_update",
-            description="Executes the staged workout set update. Only call after user confirms.",
+            description="execute_staged_set_update() -> {success} — write set correction to DB",
             inputSchema={"type": "object", "properties": {}, "required": []},
         ),
         types.Tool(
             name="delete_workout_set",
-            description=(
-                "Permanently removes a specific set from training history. "
-                "DESTRUCTIVE — corrupts historical records if misused. Extra confirmation required. "
-                "If date is omitted, returns 3 disambiguation options to help identify the session."
-            ),
+            description="delete_workout_set(exercise_name, date, weight, reps, unit) -> {staged} — stage set deletion",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -456,15 +397,12 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="execute_staged_set_delete",
-            description="Permanently deletes the staged workout set. Only call after user confirms.",
+            description="execute_staged_set_delete() -> {success} — permanently delete set from DB",
             inputSchema={"type": "object", "properties": {}, "required": []},
         ),
         types.Tool(
             name="verify_set_updated",
-            description=(
-                "Verifies a workout set was correctly updated by checking the new values "
-                "exist on the given date. Call after execute_staged_set_update."
-            ),
+            description="verify_set_updated(exercise_name, date, expected_weight, expected_reps, unit) -> {verified}",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -482,10 +420,7 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="verify_set_deleted",
-            description=(
-                "Verifies a workout set was deleted by confirming it no longer exists. "
-                "Call after execute_staged_set_delete. verified: true means deletion succeeded."
-            ),
+            description="verify_set_deleted(exercise_name, date, weight, reps, unit) -> {verified: true = deleted}",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -503,13 +438,7 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="get_exercise_sessions",
-            description=(
-                "Get a list of dates and basic stats for an exercise, used for disambiguation "
-                "when the user is not sure which session to update or delete. "
-                "Supports three modes: recent (last N sessions), approximate (within ±7 days "
-                "of a given date), and range (between two dates). "
-                "Returns session summaries only — call update/delete with the specific date once identified."
-            ),
+            description="get_exercise_sessions(exercise_name, mode, ...) -> [{date, sets, max_weight}] — find sessions by date",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -544,11 +473,7 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="remember_fact",
-            description=(
-                "Store a fact about the user for future sessions. Call when the user "
-                "tells you something personal, states a preference, mentions an injury, reveals a "
-                "training pattern, or clarifies a data convention not in user_context.json."
-            ),
+            description="remember_fact(category, content) -> {saved} — store user fact for future sessions",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -577,10 +502,7 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="recall_memories",
-            description=(
-                "Retrieve all facts stored about the user from previous sessions. "
-                "Call at the start of personal questions to check if relevant context exists."
-            ),
+            description="recall_memories() -> {facts} — retrieve all stored user facts",
             inputSchema={
                 "type": "object",
                 "properties": {},
@@ -588,10 +510,7 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="forget_fact",
-            description=(
-                "Delete a stored memory by its ID. Use when the user says something "
-                "is outdated or asks you to forget it. First call recall_memories to get the ID."
-            ),
+            description="forget_fact(fact_id) -> {deleted} — remove a stored fact",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -605,12 +524,7 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="add_exercise_quirk",
-            description=(
-                "Store a plain-English interpretation note for a specific exercise "
-                "that deviates from standard logging conventions in any way — unusual field usage, "
-                "comment notation, form tracking, equipment notes, or anything the user wants "
-                "the agent to know when reading that exercise's data."
-            ),
+            description="add_exercise_quirk(exercise_name, note) -> {saved} — store plain-English interpretation note",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -628,7 +542,7 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="update_exercise_quirk",
-            description="Update the note for an existing exercise quirk. Replaces the old note entirely.",
+            description="update_exercise_quirk(exercise_name, note) -> {updated} — update existing quirk",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -646,7 +560,7 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="delete_exercise_quirk",
-            description="Remove a stored exercise quirk entirely.",
+            description="delete_exercise_quirk(exercise_name) -> {deleted} — remove a quirk",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -660,10 +574,7 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="list_exercise_quirks",
-            description=(
-                "List all stored exercise quirks. Call when the user asks what "
-                "quirks are stored, or before adding a new one to check for duplicates."
-            ),
+            description="list_exercise_quirks() -> {quirks} — list all stored quirks",
             inputSchema={"type": "object", "properties": {}, "required": []},
         ),
     ]
@@ -671,103 +582,112 @@ async def list_tools() -> list[types.Tool]:
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
-    if name == "query_workout_data":
-        result = await _query_workout_data(arguments["question"])
-    elif name == "get_personal_record":
-        result = await _get_personal_record(arguments["exercise_name"])
-    elif name == "get_exercise_history":
-        result = await _get_exercise_history(
-            arguments["exercise_name"],
-            int(arguments.get("days", 30)),
-        )
-    elif name == "get_weekly_volume":
-        result = await _get_weekly_volume(int(arguments.get("days", 30)))
-    elif name == "run_read_only_sql":
-        result = await _run_read_only_sql(arguments["sql"])
-    elif name == "search_fitness_knowledge":
-        query = arguments["query"]
-        n_results = min(int(arguments.get("n_results", 5)), 10)
-        result = await _search_fitness_knowledge(query, n_results)
-    elif name == "resolve_exercise_name":
-        result = await _resolve_exercise_name(arguments["user_term"])
-    elif name == "read_exercise_comments":
-        result = await _read_exercise_comments(
-            arguments["exercise_name"],
-            arguments.get("date_from"),
-            arguments.get("date_to"),
-            int(arguments.get("limit", 15)),  # default 15, hard cap 15
-        )
-    elif name == "log_workout":
-        result = await _log_workout(arguments)
-    elif name == "execute_staged_workout":
-        result = await _execute_staged_workout()
-    elif name == "set_goal":
-        result = await _set_goal(arguments)
-    elif name == "execute_staged_goal":
-        result = await _execute_staged_goal()
-    elif name == "log_bodyweight":
-        result = await _log_bodyweight(arguments)
-    elif name == "verify_workout_logged":
-        result = await _verify_workout_logged(
-            arguments["exercise_name"],
-            arguments["date"],
-            int(arguments["expected_sets"]),
-        )
-    elif name == "verify_goal_set":
-        result = await _verify_goal_set(
-            arguments["exercise_name"],
-            arguments["target_date"],
-        )
-    elif name == "update_goal":
-        result = await _update_goal(arguments)
-    elif name == "execute_staged_goal_update":
-        result = await _execute_staged_goal_update()
-    elif name == "delete_goal":
-        result = await _delete_goal(arguments)
-    elif name == "execute_staged_goal_delete":
-        result = await _execute_staged_goal_delete()
-    elif name == "update_workout_set":
-        result = await _update_workout_set(arguments)
-    elif name == "execute_staged_set_update":
-        result = await _execute_staged_set_update()
-    elif name == "delete_workout_set":
-        result = await _delete_workout_set(arguments)
-    elif name == "execute_staged_set_delete":
-        result = await _execute_staged_set_delete()
-    elif name == "verify_set_updated":
-        result = await _verify_set_updated(
-            arguments["exercise_name"],
-            arguments["date"],
-            float(arguments["expected_weight"]),
-            int(arguments["expected_reps"]),
-            arguments["unit"],
-        )
-    elif name == "verify_set_deleted":
-        result = await _verify_set_deleted(
-            arguments["exercise_name"],
-            arguments["date"],
-            float(arguments["weight"]),
-            int(arguments["reps"]),
-            arguments["unit"],
-        )
-    elif name == "get_exercise_sessions":
-        result = await _get_exercise_sessions(arguments)
-    elif name == "remember_fact":
-        result = _remember_fact(arguments)
-    elif name == "recall_memories":
-        result = _recall_memories()
-    elif name == "forget_fact":
-        result = _forget_fact(arguments)
-    elif name == "add_exercise_quirk":
-        result = _add_exercise_quirk_sync(arguments["exercise_name"], arguments["note"])
-    elif name == "update_exercise_quirk":
-        result = _update_exercise_quirk_sync(arguments["exercise_name"], arguments["note"])
-    elif name == "delete_exercise_quirk":
-        result = _delete_exercise_quirk_sync(arguments["exercise_name"])
-    elif name == "list_exercise_quirks":
-        result = _list_exercise_quirks_sync()
-    else:
-        result = json.dumps({"error": f"Unknown tool: {name}"})
+    try:
+        if name == "query_workout_data":
+            result = await _query_workout_data(arguments["question"])
+        elif name == "get_personal_record":
+            result = await _get_personal_record(arguments["exercise_name"])
+        elif name == "get_exercise_history":
+            result = await _get_exercise_history(
+                arguments["exercise_name"],
+                int(arguments.get("days", 30)),
+            )
+        elif name == "get_weekly_volume":
+            result = await _get_weekly_volume(int(arguments.get("days", 30)))
+        elif name == "run_read_only_sql":
+            result = await _run_read_only_sql(arguments["sql"])
+        elif name == "search_fitness_knowledge":
+            query = arguments["query"]
+            n_results = min(int(arguments.get("n_results", 5)), 10)
+            result = await _search_fitness_knowledge(query, n_results)
+        elif name == "resolve_exercise_name":
+            result = await _resolve_exercise_name(arguments["user_term"])
+        elif name == "read_exercise_comments":
+            result = await _read_exercise_comments(
+                arguments["exercise_name"],
+                arguments.get("date_from"),
+                arguments.get("date_to"),
+                int(arguments.get("limit", 15)),  # default 15, hard cap 15
+            )
+        elif name == "log_workout":
+            result = await _log_workout(arguments)
+        elif name == "execute_staged_workout":
+            result = await _execute_staged_workout()
+        elif name == "set_goal":
+            result = await _set_goal(arguments)
+        elif name == "execute_staged_goal":
+            result = await _execute_staged_goal()
+        elif name == "log_bodyweight":
+            result = await _log_bodyweight(arguments)
+        elif name == "verify_workout_logged":
+            result = await _verify_workout_logged(
+                arguments["exercise_name"],
+                arguments["date"],
+                int(arguments["expected_sets"]),
+            )
+        elif name == "verify_goal_set":
+            result = await _verify_goal_set(
+                arguments["exercise_name"],
+                arguments["target_date"],
+            )
+        elif name == "update_goal":
+            result = await _update_goal(arguments)
+        elif name == "execute_staged_goal_update":
+            result = await _execute_staged_goal_update()
+        elif name == "delete_goal":
+            result = await _delete_goal(arguments)
+        elif name == "execute_staged_goal_delete":
+            result = await _execute_staged_goal_delete()
+        elif name == "update_workout_set":
+            result = await _update_workout_set(arguments)
+        elif name == "execute_staged_set_update":
+            result = await _execute_staged_set_update()
+        elif name == "delete_workout_set":
+            result = await _delete_workout_set(arguments)
+        elif name == "execute_staged_set_delete":
+            result = await _execute_staged_set_delete()
+        elif name == "verify_set_updated":
+            result = await _verify_set_updated(
+                arguments["exercise_name"],
+                arguments["date"],
+                float(arguments["expected_weight"]),
+                int(arguments["expected_reps"]),
+                arguments["unit"],
+            )
+        elif name == "verify_set_deleted":
+            result = await _verify_set_deleted(
+                arguments["exercise_name"],
+                arguments["date"],
+                float(arguments["weight"]),
+                int(arguments["reps"]),
+                arguments["unit"],
+            )
+        elif name == "get_exercise_sessions":
+            result = await _get_exercise_sessions(arguments)
+        elif name == "remember_fact":
+            result = _remember_fact(arguments)
+        elif name == "recall_memories":
+            result = _recall_memories()
+        elif name == "forget_fact":
+            result = _forget_fact(arguments)
+        elif name == "add_exercise_quirk":
+            result = _add_exercise_quirk_sync(arguments["exercise_name"], arguments["note"])
+        elif name == "update_exercise_quirk":
+            result = _update_exercise_quirk_sync(arguments["exercise_name"], arguments["note"])
+        elif name == "delete_exercise_quirk":
+            result = _delete_exercise_quirk_sync(arguments["exercise_name"])
+        elif name == "list_exercise_quirks":
+            result = _list_exercise_quirks_sync()
+        elif name == "list_user_articles":
+            result = _list_user_articles_sync()
+        elif name == "delete_user_article":
+            result = await _delete_user_article(arguments["filename"])
+        else:
+            result = json.dumps({"error": f"Unknown tool: {name}"})
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        result = json.dumps({"error": str(e), "found": False, "message": f"Tool error: {str(e)}"})
 
     return [types.TextContent(type="text", text=result)]
 
@@ -864,20 +784,146 @@ async def _query_workout_data(question: str) -> str:
     return await asyncio.to_thread(_query_workout_data_sync, question)
 
 
-def _get_personal_record_sync(exercise_name: str) -> str:
-    from src.text_to_sql import answer_question
+KG_NATIVE = {"Deadlift", "Seated Machine Curl (Kg)", "Machine Wrist Extension", "Hand Gripper"}
 
-    question = f"What is my PR for {exercise_name}?"
-    result = answer_question(question, DB_PATH)
-    rows = result.get("rows", [])
+BAR_EXERCISE_NOTES = {
+    "Deadlift": "Weights shown are plate weights only (kg). Add 20kg bar for total weight.",
+    "Barbell Row": "Weights shown are plate weights only (lbs). Add 44.09 lbs bar for total weight.",
+    "Barbell Curl": "Weights shown are plate weights only (lbs). Bar weight varies by date — see user_context.",
+    "Barbell Upright Row": "Weights shown are plate weights only (lbs). Bar weight varies by date — see user_context.",
+    "Behind The Back Wrist Curls": "Weights shown are plate weights only (lbs). Bar weight varies by date — see user_context.",
+    "EZ-Bar Curl": "Weights shown are plate weights only (lbs). Add 22.05 lbs bar for total weight.",
+    "Reverse Zig Zag Barbell Curls": "Weights shown are plate weights only (lbs). Add 22.05 lbs bar for total weight.",
+}
+
+
+def _get_bar_weight(exercise_name: str, date_str: str, unit: str) -> float:
+    """Return bar weight in the given unit for a given exercise and date. Returns 0 if no bar applies."""
+    from datetime import date
+
+    try:
+        pr_date = date.fromisoformat(date_str)
+    except Exception:
+        return 0.0
+
+    if unit == "kg":
+        if exercise_name == "Deadlift":
+            return 20.0
+        return 0.0
+
+    if exercise_name == "Barbell Row":
+        return 44.09
+    if exercise_name in ("EZ-Bar Curl", "Reverse Zig Zag Barbell Curls"):
+        return 22.05
+
+    if exercise_name == "Barbell Curl":
+        if pr_date <= date(2024, 9, 23):
+            return 22.05
+        elif pr_date <= date(2025, 10, 30):
+            return 27.56
+        else:
+            return 33.07
+
+    if exercise_name == "Barbell Upright Row":
+        if pr_date <= date(2025, 1, 20):
+            return 22.05
+        elif pr_date <= date(2025, 8, 4):
+            return 27.56
+        else:
+            return 33.07
+
+    if exercise_name == "Behind The Back Wrist Curls":
+        if pr_date <= date(2024, 11, 21):
+            return 22.05
+        elif pr_date <= date(2025, 7, 18):
+            return 27.56
+        else:
+            return 33.07
+
+    return 0.0
+
+
+def _get_personal_record_sync(exercise_name: str) -> str:
+    resolved = _resolve_exercise_name_sync(exercise_name)
+    resolved_data = json.loads(resolved)
+    if resolved_data.get("resolved_name"):
+        exercise_name = resolved_data["resolved_name"]
+    elif resolved_data.get("candidates"):
+        return json.dumps({
+            "found": False,
+            "message": f"Ambiguous exercise name '{exercise_name}'. Did you mean: {', '.join(resolved_data['candidates'])}?",
+        })
+    else:
+        return json.dumps({
+            "found": False,
+            "message": f"Exercise '{exercise_name}' not found in database.",
+        })
+
+    sql = """
+        SELECT e.name,
+               tl.metric_weight * 2.2046 AS typed_value,
+               tl.reps,
+               tl.date
+        FROM training_log tl
+        JOIN exercise e ON e._id = tl.exercise_id
+        WHERE e.name = :exercise_name
+          AND tl.metric_weight = (
+              SELECT MAX(tl2.metric_weight)
+              FROM training_log tl2
+              JOIN exercise e2 ON e2._id = tl2.exercise_id
+              WHERE e2.name = :exercise_name
+          )
+        ORDER BY tl.reps DESC, tl.date DESC
+        LIMIT 1
+    """
+
+    def _execute():
+        import sqlite3
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        try:
+            return [dict(r) for r in conn.execute(sql, {"exercise_name": exercise_name}).fetchall()]
+        finally:
+            conn.close()
+
+    rows = _execute()
+    if not rows:
+        return json.dumps({
+            "found": False,
+            "message": f"No sets found for '{exercise_name}'.",
+        })
+
+    row = rows[0]
+    raw_date = row.get("date", "")
+    unit = "kg" if exercise_name in KG_NATIVE else "lbs"
+    bar_value = _get_bar_weight(exercise_name, raw_date, unit)
+
+    from datetime import datetime
+    try:
+        row["date"] = datetime.strptime(raw_date, "%Y-%m-%d").strftime("%d/%m/%y")
+    except (ValueError, KeyError):
+        pass
+
+    if exercise_name in KG_NATIVE:
+        plates_kg = round(row["typed_value"], 2)
+        row["weight_kg"] = round(plates_kg + bar_value, 2)
+        if bar_value > 0:
+            row["weight_note"] = f"plates: {plates_kg} kg + bar: {bar_value} kg"
+        del row["typed_value"]
+    else:
+        plates_lbs = round(row["typed_value"], 2)
+        row["weight_lbs"] = round(plates_lbs + bar_value, 2)
+        if bar_value > 0:
+            row["weight_note"] = f"plates: {plates_lbs} lbs + bar: {bar_value} lbs"
+        del row["typed_value"]
+
     out = {
         "exercise": exercise_name,
-        "answer": result.get("answer", ""),
-        "sql": result.get("sql", ""),
-        "rows_returned": len(rows),
-        "error": result.get("error"),
+        "rows": [row],
+        "rows_returned": 1,
+        "error": None,
     }
-    if rows and rows[0].get("reps") == 1:
+    if row.get("reps") == 1:
         out["single_rep_warning"] = True
         out["warning_message"] = "This PR is a single-rep set. Check comments — it may be a failed attempt or form break rather than a true max."
     return json.dumps(out)
@@ -964,14 +1010,55 @@ async def _run_read_only_sql(sql: str) -> str:
     if disallowed:
         return json.dumps({"error": f"Rejected: references disallowed tables: {sorted(disallowed)}"})
 
-    from src.db import get_connection, run_query
+    def _execute():
+        import sqlite3
+        from src.db import run_query
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        try:
+            return run_query(conn, sql, 100, 5)
+        finally:
+            conn.close()
 
     try:
-        conn = get_connection(DB_PATH)
-        rows = await asyncio.to_thread(run_query, conn, sql, 100, 5)
+        rows = await asyncio.to_thread(_execute)
         return json.dumps({"rows": rows, "rows_returned": len(rows)})
     except Exception as exc:
         return json.dumps({"error": str(exc)})
+
+
+def _get_article_boundary_chunks(collection, filename: str) -> list[dict]:
+    """Get first and last chunks of an article by chunk_index metadata."""
+    try:
+        all_chunks = collection.get(
+            where={"filename": filename},
+            include=["documents", "metadatas"]
+        )
+        if not all_chunks["ids"]:
+            return []
+
+        chunks = sorted(
+            zip(all_chunks["ids"], all_chunks["documents"], all_chunks["metadatas"]),
+            key=lambda x: x[2].get("chunk_index", 0)
+        )
+
+        boundary_indices = [0]  # always include first
+        if len(chunks) > 1:
+            # Add last 3 chunks to capture conclusion even if last is references
+            for i in range(max(1, len(chunks) - 3), len(chunks)):
+                boundary_indices.append(i)
+
+        boundary_chunks = []
+        for i in boundary_indices:
+            boundary_chunks.append({
+                "id": chunks[i][0],
+                "text": chunks[i][1],
+                "metadata": chunks[i][2]
+            })
+
+        return boundary_chunks
+    except Exception:
+        return []
 
 
 def _search_fitness_knowledge_sync(query: str, n_results: int = 5) -> str:
@@ -990,21 +1077,124 @@ def _search_fitness_knowledge_sync(query: str, n_results: int = 5) -> str:
             {"found": False, "message": "No relevant research found for this query."}
         )
 
+    # Add first/last chunks for any user article appearing in results
+    user_article_filenames = set(
+        doc.get("metadata", {}).get("filename") or doc.get("title")
+        for doc in results
+        if doc.get("source") == "user_article"
+        or doc.get("metadata", {}).get("source_type") == "user_article"
+    )
+
+    existing_ids = set(doc.get("id", "") for doc in results)
+
+    try:
+        import chromadb
+        chroma_path = os.environ.get("CHROMA_DB_PATH", "data/chroma_db")
+        client = chromadb.PersistentClient(path=chroma_path)
+        user_col = client.get_collection("user_articles")
+
+        for filename in user_article_filenames:
+            if filename:
+                boundary = _get_article_boundary_chunks(user_col, filename)
+                for chunk in boundary:
+                    results.append({
+                        "title": filename,
+                        "source": "user_article",
+                        "year": "",
+                        "url": "",
+                        "text": chunk["text"]
+                    })
+                    existing_ids.add(chunk["id"])
+    except Exception:
+        pass  # Never block on this
+
     docs = [
         {
             "title": doc.get("title", ""),
             "source": doc.get("source", ""),
             "year": doc.get("year", ""),
             "url": doc.get("url", ""),
-            "text": doc.get("text", ""),
+            "text": doc["text"][:6000] if len(doc.get("text", "")) > 6000 else doc.get("text", ""),
         }
         for doc in results
     ]
-    return json.dumps({"found": True, "documents": docs})
+    result = {"found": True, "documents": docs}
+    if user_article_filenames:
+        result["user_article_found"] = True
+        result["instruction"] = (
+            "USER ARTICLE FOUND — Per RESEARCH ACCURACY RULE: "
+            "Lead with the study conclusion from the user_article documents above. "
+            "Do NOT answer from general fitness knowledge if the article directly answers the question."
+        )
+    else:
+        has_pubmed = any(
+            d.get("source") in ("pubmed", "wikipedia")
+            for d in results
+        )
+        result["user_article_found"] = False
+        if has_pubmed:
+            result["instruction"] = (
+                "NO USER ARTICLE — Results are from PubMed/Wikipedia (auto-fetched, not user-uploaded). "
+                "You may answer from these results but MUST prefix your response with: "
+                "'Note: No study in your personal knowledge base covers this topic. "
+                "The following is based on general research literature.' "
+                "Cite the specific study title and year if available."
+            )
+        else:
+            result["instruction"] = (
+                "NO STUDIES FOUND — No user article or PubMed result directly answers this. "
+                "If you answer, you MUST begin with: "
+                "'Note: No study in your knowledge base covers this topic. "
+                "The following is based on general fitness knowledge.' "
+                "Never present general knowledge as if it were from a study."
+            )
+    return json.dumps(result)
 
 
 async def _search_fitness_knowledge(query: str, n_results: int = 5) -> str:
     return await asyncio.to_thread(_search_fitness_knowledge_sync, query, n_results)
+
+
+def _list_user_articles_sync() -> str:
+    try:
+        import chromadb
+        from collections import Counter
+        chroma_path = os.environ.get("CHROMA_DB_PATH", "data/chroma_db")
+        client = chromadb.PersistentClient(path=chroma_path)
+        collection = client.get_collection("user_articles")
+        results = collection.get(include=["metadatas"])
+        filenames = Counter(m["filename"] for m in results["metadatas"])
+        articles = [{"filename": f, "chunks": c} for f, c in filenames.items()]
+        return json.dumps({
+            "articles": articles,
+            "total": len(articles),
+            "message": f"{len(articles)} article(s) in knowledge base.",
+        })
+    except Exception:
+        return json.dumps({
+            "articles": [],
+            "total": 0,
+            "message": "No user articles in knowledge base yet.",
+        })
+
+
+def _delete_user_article_sync(filename: str) -> str:
+    try:
+        import chromadb
+        chroma_path = os.environ.get("CHROMA_DB_PATH", "data/chroma_db")
+        client = chromadb.PersistentClient(path=chroma_path)
+        collection = client.get_collection("user_articles")
+        results = collection.get(where={"filename": filename}, include=["metadatas"])
+        if not results["ids"]:
+            return json.dumps({"deleted": False, "message": f"Article not found: {filename}"})
+        collection.delete(ids=results["ids"])
+        return json.dumps({"deleted": True, "filename": filename, "chunks_deleted": len(results["ids"])})
+    except Exception as exc:
+        return json.dumps({"error": str(exc)})
+
+
+async def _delete_user_article(filename: str) -> str:
+    return await asyncio.to_thread(_delete_user_article_sync, filename)
 
 
 def _resolve_exercise_name_sync(user_term: str) -> str:
@@ -2021,12 +2211,15 @@ def _get_exercise_sessions_sync(arguments: dict) -> str:
     if mode == "recent":
         sessions = sessions[:limit]
 
-    return json.dumps({
+    out = {
         "exercise": exercise_name,
         "mode": mode,
         "sessions": sessions,
         "count": len(sessions),
-    })
+    }
+    if exercise_name in BAR_EXERCISE_NOTES:
+        out["bar_weight_note"] = BAR_EXERCISE_NOTES[exercise_name]
+    return json.dumps(out)
 
 
 async def _get_exercise_sessions(arguments: dict) -> str:
