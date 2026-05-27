@@ -178,7 +178,7 @@ function setBusy(b) {
 }
 
 // ── Message rendering ─────────────────────────────────────────────────────────
-function addMsg(role, html) {
+function addMsg(role, html, time) {
   const inner = chatInner();
   const wrap = document.createElement('div');
   const col = document.createElement('div');
@@ -186,7 +186,7 @@ function addMsg(role, html) {
   const bubble = document.createElement('div');
   const ts = document.createElement('div');
   ts.className = 'text-xs text-gray-500 mt-1';
-  ts.textContent = nowTime();
+  ts.textContent = time || nowTime();
 
   if (role === 'user') {
     wrap.className = 'flex justify-end mb-3';
@@ -205,7 +205,7 @@ function addMsg(role, html) {
     av.textContent = 'FC';
     col.className = 'flex flex-col max-w-xl';
     bubble.className = 'bubble-agent rounded-2xl rounded-tl-sm px-4 py-2.5 text-gray-100 text-sm';
-    bubble.innerHTML = html;
+    bubble.innerHTML = html.replace(/\n/g, '<br>');
     ts.className += ' text-left';
     col.appendChild(bubble);
     col.appendChild(ts);
@@ -328,7 +328,13 @@ function handleRateLimitError(retryAfterSeconds) {
 // ── History restore ───────────────────────────────────────────────────────────
 function restoreHistory(history) {
   chatInner().innerHTML = '';
-  history.forEach(m => addMsg(m.role === 'user' ? 'user' : 'agent', esc(m.text)));
+  history.forEach(m => {
+    const role = m.role === 'user' ? 'user' : 'agent';
+    const time = m.timestamp
+      ? new Date(m.timestamp).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})
+      : null;
+    addMsg(role, esc(m.text), time);
+  });
 }
 
 // ── Init / ready polling ──────────────────────────────────────────────────────
