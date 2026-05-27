@@ -53,7 +53,9 @@ fitnotes_coach/
 │   ├── memory.py                      # Memory store + ChromaDB sync
 │   ├── rag.py                         # Hybrid search + reranker
 │   ├── schema_prompt.py               # Schema + user context injection
-│   └── text_to_sql.py                 # Text-to-SQL pipeline
+│   ├── text_to_sql.py                 # Text-to-SQL pipeline
+│   ├── answer.py                      # ⚠️ Dead code — Stage 2-3 legacy, replaced by MCP agent loop
+│   └── router.py                      # ⚠️ Dead code — Stage 2-3 legacy, replaced by MCP agent loop
 ├── scripts/
 │   ├── build_corpus.py                # PubMed + Wikipedia ingestion
 │   ├── regenerate_ground_truth.py     # Eval ground truth refresh
@@ -207,6 +209,9 @@ Two-phase pattern: stage (validate + preview) → CLI confirmation gate → exec
 ### Long-Term Memory (Option B)
 Facts stored in `memory.json` (source of truth, 30 fact cap). ChromaDB `user_memory` collection is the search index. Per-question: embed the question → retrieve top 5 semantically relevant facts (cosine distance < 0.8) → inject only those into `system_instruction`. Token cost stays constant at ~100 tokens regardless of total memory size.
 
+### User Article Upload
+PDF articles uploaded through the UI are stored in `data/user_articles/` and chunked into ChromaDB using section-aware splitting (splits on academic section headers first, then paragraph word-count within each section). Article lifecycle is self-healing: `list_user_articles` auto-syncs ChromaDB and disk on every call. Files on disk not in ChromaDB are auto-ingested. Chunks in ChromaDB with no file on disk are auto-removed. The two stores are always consistent after any list call.
+
 ### MCP (Model Context Protocol)
 All tools exposed via a single `combined_server.py` subprocess. Single server avoids Windows IOCP deadlock that occurs with multiple concurrent stdio MCP sessions. Sentence-transformers pre-loaded in main thread before `server.run()` to avoid OpenMP deadlock.
 
@@ -272,6 +277,23 @@ with integrity validation, PDF article upload to RAG knowledge base, background
 initialization, rate limit UX, and `--debug` mode. Run with `python server.py`.
 
 **Write-ahead log + DB merge** — Currently agent-written workout data (logged via `log_workout`) lives in the SQLite DB. When the user exports a fresh FitNotes backup and uploads it, those agent-written sets would be overwritten. Fix: log every agent write to `agent_writes.json`. On new DB upload, replay the write log onto the new file before replacing the old one. Teaches transaction logging, SQLite conflict resolution, and data integrity across two sources.
+
+### Analytical AI Coaching (prerequisites required)
+
+The agent currently handles lookup queries well (PRs, recent workouts, volume
+stats). Analytical questions — plateau detection, overtraining signals,
+progression rate analysis — require additional groundwork before they can be
+trusted:
+
+- Memory auto-extraction rewrite: store insights, not conversation transcripts
+- Schema prompt analytical patterns: teach the agent what aggregate queries are possible
+- Context pruning: 5-month history queries return hundreds of rows that must not
+  accumulate across API calls
+- Reflection step update: verify the agent looked at enough data, not just unit correctness
+- Gemini thinking budget > 0: complex multi-step reasoning benefits from thinking tokens
+
+Enable only after simple lookups are fully verified — analytical answers cannot
+be cross-checked against the raw data the way PR lookups can.
 
 ### Learning extensions
 

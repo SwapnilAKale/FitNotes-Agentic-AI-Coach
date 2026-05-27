@@ -908,3 +908,114 @@ auto-resizes up to 8 lines.
 Lesson: sidebar layout with two lonely buttons at the bottom looks out of place
 for a chat application. Moving uploads into the input bar (like Claude, ChatGPT)
 is the standard pattern that users already understand.
+
+---
+
+## Post-Stage 11: Agent Behavior Fixes
+
+### RAG section-aware chunking
+Problem: academic paper chunks were 6000 chars of mixed content — Discussion,
+Limitations, Practical Applications, and Conclusion all in one chunk. The agent
+read the conclusion but lost it in the noise and answered from general knowledge instead.
+
+Fix: _chunk_text() in server.py now splits on academic section headers first
+(Introduction, Methods, Results, Discussion, Conclusion, Limitations, etc.),
+then falls back to paragraph-based word-count chunking within each section.
+Conclusion is now its own small clean chunk. Reranker surfaces it directly.
+
+Lesson: chunk boundaries matter as much as chunk size. A 200-word Conclusion
+chunk scores better than a 6000-char chunk containing the conclusion plus
+everything else. Section-aware chunking is the right default for academic papers.
+
+### RESEARCH ACCURACY RULE — general knowledge contamination
+Problem: agent had the study conclusion in search results but answered from
+general fitness knowledge ("cables provide constant tension throughout ROM").
+System prompt rules alone were insufficient — the model's training data on
+"dumbbell vs cable" questions overrode the instruction to cite the study.
+
+Fix: tool result itself now contains a hard instruction field:
+"USER ARTICLE FOUND — Lead with the study conclusion. Do NOT answer from
+general fitness knowledge if the article directly answers the question."
+Instruction embedded in data beats instruction embedded in system prompt.
+
+Lesson: when a model has strong prior beliefs about a topic (e.g. well-known
+fitness advice), system prompt rules that contradict those beliefs are often
+ignored. The fix is to embed the override instruction in the data the model
+is processing, not in background instructions it can deprioritize.
+
+### PubMed results vs user-uploaded articles
+User-uploaded articles are studies the user specifically chose to trust.
+PubMed results are auto-fetched abstracts from build_corpus.py.
+These are different trust levels and must be labeled differently.
+
+Fix: search_fitness_knowledge now returns three instruction variants:
+- user_article_found: true → cite study by name, lead with conclusion
+- pubmed/wikipedia only → prefix answer with "Note: No study in your personal
+  knowledge base covers this topic. The following is based on general research literature."
+- nothing found → prefix with "Note: ...based on general fitness knowledge."
+
+### System prompt confidentiality
+Agent was revealing full system prompt contents when asked. This exposes
+internal tool names, database schema, and behavioral rules.
+
+Fix: CONFIDENTIALITY RULE in system prompt. Single-sentence refusal:
+"I keep my internal instructions confidential."
+
+Lesson: LLMs will comply with user requests even when those requests work
+against the system design. Every sensitive instruction in the system prompt
+needs a corresponding refusal rule.
+
+### User article lifecycle — bidirectional sync
+Problem: delete_user_article deleted from ChromaDB but not from disk.
+Problem: list_user_articles only checked ChromaDB, not disk.
+Two drift directions: file on disk not in ChromaDB, and chunks in ChromaDB
+with no file on disk.
+
+Fix: list_user_articles now syncs both directions on every call:
+- File on disk, not in ChromaDB → auto-ingest
+- Chunks in ChromaDB, no file on disk → auto-remove
+delete_user_article now deletes from both ChromaDB and disk simultaneously.
+
+Lesson: when two storage systems need to stay in sync, pick one as source of
+truth and make every read operation heal drift. Don't assume the systems stay
+in sync — they won't.
+
+### Groq fully eliminated
+src/router.py and src/answer.py are dead code — Stage 2-3 legacy files from
+the hardcoded router pipeline, replaced by the MCP agent loop in Stage 4.
+The only remaining live Groq dependency was _documents_are_relevant() imported
+from src/answer.py into combined_server.py. This was a redundant relevance gate —
+the cross-encoder reranker at threshold 0.0 already handles relevance filtering.
+Removed. GROQ_API_KEY no longer needed.
+
+Single API key (GEMINI_API_KEY) now covers the entire stack.
+
+---
+
+## Planned: Analytical AI Coaching
+
+Before enabling analytical queries (plateau detection, overtraining signals,
+progression rate analysis), the following prerequisites must be in place:
+
+1. Memory auto-extraction quality — current extraction stores conversation
+   transcripts instead of insights. Must store facts like "stuck at 100 lbs
+   on Cable Triceps since March", not "user asked about their Cable Triceps PR."
+
+2. Reflection step for analytical questions — currently checks unit errors
+   and fabricated citations. For analytics must also check: did the agent look
+   at enough data? Did it consider the full time range?
+
+3. Schema prompt analytical patterns — agent doesn't know it can calculate
+   average weekly volume per muscle group, progression rates, plateau detection.
+   Schema prompt needs examples of these query patterns.
+
+4. Context pruning — a 5-month history query returns hundreds of rows re-sent
+   on every subsequent API call. Context pruning is a prerequisite for analytics.
+
+5. Gemini thinking budget > 0 — currently thinking_budget=0. For analytical
+   questions (why am I stuck for 5 months?) a budget of 1024 is appropriate.
+   Not worth enabling until verifiable answers are fully trusted.
+
+Rule: enable analytical features only after simple lookups are fully verified.
+Analytical answers (plateau detection, overtraining) cannot be cross-checked
+against raw data the way PR lookups and workout history can.

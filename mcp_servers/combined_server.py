@@ -1062,17 +1062,10 @@ def _get_article_boundary_chunks(collection, filename: str) -> list[dict]:
 
 
 def _search_fitness_knowledge_sync(query: str, n_results: int = 5) -> str:
-    from src.answer import _documents_are_relevant
-
     kb = _get_kb()
     results = kb.retrieve(query, n_results)
 
     if not results:
-        return json.dumps(
-            {"found": False, "message": "No relevant research found for this query."}
-        )
-
-    if not _documents_are_relevant(query, results):
         return json.dumps(
             {"found": False, "message": "No relevant research found for this query."}
         )
@@ -1084,8 +1077,6 @@ def _search_fitness_knowledge_sync(query: str, n_results: int = 5) -> str:
         if doc.get("source") == "user_article"
         or doc.get("metadata", {}).get("source_type") == "user_article"
     )
-
-    existing_ids = set(doc.get("id", "") for doc in results)
 
     try:
         import chromadb
@@ -1104,7 +1095,6 @@ def _search_fitness_knowledge_sync(query: str, n_results: int = 5) -> str:
                         "url": "",
                         "text": chunk["text"]
                     })
-                    existing_ids.add(chunk["id"])
     except Exception:
         pass  # Never block on this
 
@@ -1155,40 +1145,198 @@ async def _search_fitness_knowledge(query: str, n_results: int = 5) -> str:
     return await asyncio.to_thread(_search_fitness_knowledge_sync, query, n_results)
 
 
+def _ingest_pdf_from_disk(filepath, filename: str, collection) -> int:
+    """Extract text from a PDF on disk and ingest it into the user_articles collection.
+    Returns the number of chunks added, or 0 on failure."""
+    try:
+        import re as _re
+        import fitz
+        from src.memory import _get_embed_model
+
+        doc = fitz.open(str(filepath))
+        text = "\n\n".join(page.get_text() for page in doc)
+        doc.close()
+        if not text.strip():
+            return 0
+
+        # Section-aware chunking (mirrors server.py _chunk_text)
+        import re
+        SECTION_HEADERS = re.compile(
+            r'\n(?='
+            r'Abstract|Introduction|Background|Methods?|Materials?|'
+            r'Results?|Discussion|Conclusions?|Limitations?|'
+            r'Practical [Aa]pplications?|Data [Aa]vailability|'
+            r'Ethics|Funding|Acknowledgm|References?|'
+            r'Author [Cc]ontributions?|Conflict|Supplementary'
+            r')',
+            re.MULTILINE
+        )
+        sections = [s.strip() for s in SECTION_HEADERS.split(text) if s.strip()]
+        chunks = []
+        for section in sections:
+            words = section.split()
+            if len(words) <= 200:
+                if len(words) >= 20:
+                    chunks.append(section)
+            else:
+                paragraphs = [p.strip() for p in section.split('\n\n') if p.strip()]
+                current: list[str] = []
+                count = 0
+                for para in paragraphs:
+                    pw = len(para.split())
+                    if count + pw > 200 and current:
+                        t = ' '.join(current)
+                        if len(t.split()) >= 20:
+                            chunks.append(t)
+                        current = [para]
+                        count = pw
+                    else:
+                        current.append(para)
+                        count += pw
+                if current:
+                    t = ' '.join(current)
+                    if len(t.split()) >= 20:
+                        chunks.append(t)
+
+        if not chunks:
+            return 0
+
+        model = _get_embed_model()
+        embeddings = model.encode(chunks).tolist()
+
+        # Clear any stale chunks for this filename first
+        try:
+            existing = collection.get(where={"filename": filename})
+            if existing["ids"]:
+                collection.delete(ids=existing["ids"])
+        except Exception:
+            pass
+
+        base_id = _re.sub(r'[^a-zA-Z0-9_-]', '_', filename.replace('.pdf', ''))
+        ids = [f"{base_id}_chunk_{i}" for i in range(len(chunks))]
+        collection.add(
+            documents=chunks,
+            embeddings=embeddings,
+            ids=ids,
+            metadatas=[{"filename": filename, "chunk_index": i, "source_type": "user_article"}
+                       for i in range(len(chunks))],
+        )
+        return len(chunks)
+    except Exception:
+        return 0
+
+
 def _list_user_articles_sync() -> str:
     try:
         import chromadb
+        from pathlib import Path
         from collections import Counter
+
         chroma_path = os.environ.get("CHROMA_DB_PATH", "data/chroma_db")
         client = chromadb.PersistentClient(path=chroma_path)
-        collection = client.get_collection("user_articles")
-        results = collection.get(include=["metadatas"])
-        filenames = Counter(m["filename"] for m in results["metadatas"])
+        try:
+            collection = client.get_collection("user_articles")
+        except Exception:
+            collection = client.create_collection("user_articles")
+
+        # --- Disk state ---
+        articles_dir = Path("data/user_articles")
+        disk_files = {p.name for p in articles_dir.glob("*.pdf")} if articles_dir.exists() else set()
+
+        # --- ChromaDB state ---
+        all_meta = collection.get(include=["metadatas"])
+        chroma_filenames = set(m["filename"] for m in all_meta["metadatas"])
+
+        auto_ingested = []
+        auto_removed = []
+
+        # Files on disk but missing from ChromaDB → ingest
+        for fname in disk_files - chroma_filenames:
+            n = _ingest_pdf_from_disk(articles_dir / fname, fname, collection)
+            if n > 0:
+                auto_ingested.append({"filename": fname, "chunks_added": n})
+
+        # Filenames in ChromaDB but no file on disk → remove
+        for fname in chroma_filenames - disk_files:
+            stale = collection.get(where={"filename": fname}, include=["metadatas"])
+            if stale["ids"]:
+                collection.delete(ids=stale["ids"])
+                auto_removed.append(fname)
+
+        # Final clean state
+        final_meta = collection.get(include=["metadatas"])
+        filenames = Counter(m["filename"] for m in final_meta["metadatas"])
         articles = [{"filename": f, "chunks": c} for f, c in filenames.items()]
+
         return json.dumps({
             "articles": articles,
             "total": len(articles),
+            "auto_ingested": auto_ingested,
+            "auto_removed": auto_removed,
             "message": f"{len(articles)} article(s) in knowledge base.",
         })
-    except Exception:
+    except Exception as exc:
         return json.dumps({
             "articles": [],
             "total": 0,
-            "message": "No user articles in knowledge base yet.",
+            "message": f"Error listing articles: {exc}",
         })
 
 
 def _delete_user_article_sync(filename: str) -> str:
     try:
         import chromadb
+        from pathlib import Path
         chroma_path = os.environ.get("CHROMA_DB_PATH", "data/chroma_db")
         client = chromadb.PersistentClient(path=chroma_path)
         collection = client.get_collection("user_articles")
-        results = collection.get(where={"filename": filename}, include=["metadatas"])
-        if not results["ids"]:
-            return json.dumps({"deleted": False, "message": f"Article not found: {filename}"})
-        collection.delete(ids=results["ids"])
-        return json.dumps({"deleted": True, "filename": filename, "chunks_deleted": len(results["ids"])})
+
+        # Try exact filename match first
+        all_results = collection.get(include=["metadatas"])
+        all_filenames = list({m["filename"] for m in all_results["metadatas"]})
+
+        matched_filename = None
+        if filename in all_filenames:
+            matched_filename = filename
+        else:
+            # Case-insensitive substring match against filename
+            needle = filename.lower()
+            matches = [f for f in all_filenames if needle in f.lower()]
+            if len(matches) == 1:
+                matched_filename = matches[0]
+            elif len(matches) > 1:
+                return json.dumps({
+                    "deleted": False,
+                    "message": f"Ambiguous match for '{filename}'. Matching files: {matches}. "
+                               "Please provide the exact filename.",
+                })
+
+        if matched_filename is None:
+            return json.dumps({
+                "deleted": False,
+                "message": f"Article not found: '{filename}'. "
+                           f"Available articles: {all_filenames}",
+            })
+
+        # Delete from ChromaDB
+        chunk_results = collection.get(
+            where={"filename": matched_filename}, include=["metadatas"]
+        )
+        collection.delete(ids=chunk_results["ids"])
+
+        # Delete physical file from disk (best-effort)
+        disk_path = Path("data/user_articles") / matched_filename
+        disk_deleted = False
+        if disk_path.exists():
+            disk_path.unlink()
+            disk_deleted = True
+
+        return json.dumps({
+            "deleted": True,
+            "filename": matched_filename,
+            "chunks_deleted": len(chunk_results["ids"]),
+            "disk_file_deleted": disk_deleted,
+        })
     except Exception as exc:
         return json.dumps({"error": str(exc)})
 
