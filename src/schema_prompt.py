@@ -106,6 +106,41 @@ WHERE e.name = 'Flat Dumbbell Bench Press'
 GROUP BY tl.date
 ORDER BY tl.date DESC
 LIMIT 20;
+
+### ANALYTICAL CAPABILITY — run_read_only_sql can answer any question about
+training history. The agent should construct queries appropriate to the
+specific question asked rather than following a fixed template.
+
+Available data:
+- training_log: date, exercise_id, metric_weight (stored kg, multiply by
+  2.2046 to recover typed value), reps, is_personal_record
+- exercise: _id, name, category_id
+- Category: _id, name (muscle groups: Chest, Back, Shoulders, Arms, Legs, etc.)
+- Comment: owner_id (= training_log._id), comment (user notes per set)
+
+Correct column names (always use these):
+- training_log: _id, exercise_id, date, metric_weight, reps, is_personal_record
+- exercise: _id, name, category_id
+- Category: _id, name
+- Comment: _id, owner_id, comment, date
+
+Join pattern (always use this):
+JOIN exercise ON training_log.exercise_id = exercise._id
+JOIN Category ON exercise.category_id = Category._id
+
+Never use: exercise_name, id (without underscore), exercise.id
+
+Useful SQL building blocks:
+- strftime('%W-%Y', date) — group by week
+- strftime('%m-%Y', date) — group by month
+- MAX(metric_weight) over date — track weight progression
+- SUM(metric_weight * 2.2046 * reps) — total volume
+- COUNT(DISTINCT date) — training frequency
+- GROUP BY date, exercise — per-session breakdown
+
+The agent should think: "What does the user actually want to know?" and
+construct the appropriate query. A question like "am I making progress on
+bench?" calls for a different query than "which muscle group do I train most?"
 """
 
 

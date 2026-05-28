@@ -1019,3 +1019,64 @@ progression rate analysis), the following prerequisites must be in place:
 Rule: enable analytical features only after simple lookups are fully verified.
 Analytical answers (plateau detection, overtraining) cannot be cross-checked
 against raw data the way PR lookups and workout history can.
+
+---
+
+## Session 6: Exercise Session Display Overhaul & Agent Fixes
+
+### Move all math to the tool level
+The agent applying unit conversions and quirk offsets non-deterministically
+caused weeks of inconsistent answers. The agent was sometimes applying
+×2.2046 conversion, sometimes applying quirk offsets on top, sometimes both.
+Fix: get_exercise_sessions now returns final human-readable values with unit
+already applied and numeric_offset already added. The agent just displays them.
+Never let the agent do arithmetic on workout data — it will be inconsistent.
+
+### Remove ambiguous data from tool results
+Having both raw sets and display_sets in the tool result gave the agent a
+choice — it picked the wrong one half the time. Removing the raw sets field
+entirely eliminated the inconsistency immediately. When you want the agent to
+do something specific, remove the option to do something else.
+
+### Comment matching requires structured pre-processing at the tool level
+Asking the agent to correlate session_comments with sets using reps/weight
+matching failed repeatedly across many attempts. Prompting the agent harder
+did not fix it. The fix: pre-process at the tool level — match comments to
+sets, group drop sets, format into display_sets strings. Agent output is
+then deterministic because there's nothing left to decide.
+
+### display_sets architecture
+The correct pattern for structured workout data:
+1. Tool builds display_sets: pre-matched comments, drop sets grouped with →,
+   set numbers prepended, warmup labeled, all weights pre-converted.
+2. Agent receives ready-to-display strings and copies them verbatim.
+3. Reflection step verifies → symbol not replaced with words, comments
+   not stripped, strings not paraphrased.
+This pattern should be used for any structured data that requires consistent
+formatting — move formatting decisions to the tool, not the agent.
+
+### resolve_exercise_name 5-tier matching
+Old 3-tier matcher failed on compound words, typos, and plurals. Rebuilt:
+- Tier 0: space-normalized exact match — handles ALL compound words
+  ('skullcrusher' → 'skull crusher') without a predefined list
+- Tier 1-2: exact + partial LIKE (unchanged)
+- Tier 3: plural/singular expansion — 'extensions' tries 'extension'
+- Tier 4: difflib.SequenceMatcher ≥ 0.75 — handles typos
+Key lesson: a general solution (space normalization, edit distance) is better
+than a specific solution (COMPOUND_SPLITS dict) — it handles cases you
+haven't thought of yet.
+
+### Unit sources of truth must never be duplicated
+A memory fact 'User prefers weights in kg for Deadlift, lbs for others'
+conflicted with user_context.json which defines KG_NATIVE exercises precisely.
+Two sources of truth for the same fact will diverge. Fix: delete the memory
+fact, add a UNIT RULE to system prompt that explicitly names user_context.json
+as the sole authoritative source. Never store unit preferences in memory.
+
+### Data-level instructions beat system prompt rules
+When the model has strong training priors (e.g. 'cables provide constant
+tension' for lateral raise questions), system prompt rules that contradict
+those priors are consistently overridden. The only reliable fix is to embed
+the override instruction in the tool result data itself — it's processed as
+fresh in-context information rather than background instructions competing
+with training priors.

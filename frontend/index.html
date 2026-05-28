@@ -11,7 +11,7 @@
     #chat::-webkit-scrollbar { width: 6px; }
     #chat::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
     .bubble-user { background: #1d4ed8; }
-    .bubble-agent { background: #1e293b; }
+    .bubble-agent { background: #1e293b; white-space: pre-wrap; }
     .bubble-error { background: #7f1d1d; color: #fca5a5; }
     #attach-menu {
       display: none;
@@ -205,7 +205,7 @@ function addMsg(role, html, time) {
     av.textContent = 'FC';
     col.className = 'flex flex-col max-w-xl';
     bubble.className = 'bubble-agent rounded-2xl rounded-tl-sm px-4 py-2.5 text-gray-100 text-sm';
-    bubble.innerHTML = html.replace(/\n/g, '<br>');
+    bubble.innerHTML = html;
     ts.className += ' text-left';
     col.appendChild(bubble);
     col.appendChild(ts);
@@ -459,7 +459,12 @@ document.getElementById('db-input').addEventListener('change', async (e) => {
     const data = await res.json();
     if (data.status === 'reloading') {
       showToast('Database uploaded. Reconnecting...');
-      waitForReady();
+      waitForReady().then(() => {
+        if (data.new_exercises && data.new_exercises.length > 0) {
+          const list = data.new_exercises.join(', ');
+          addMsg('agent', esc(`New exercises detected: ${list}. Would you like to add any quirks for how these should be interpreted?`));
+        }
+      });
     } else if (data.status === 'ok') {
       showToast('Database already up to date.');
     } else if (data.status === 'warning') {

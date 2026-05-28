@@ -11,6 +11,12 @@ MODEL = "gemini-3.1-flash-lite"
 _client = None
 
 _SQL_SYSTEM = (
+    "CRITICAL SQL RULES FOR THIS DATABASE:\n"
+    "- Primary key column is ALWAYS `_id` (with underscore), never `id`\n"
+    "- Join exercise with: JOIN exercise ON training_log.exercise_id = exercise._id\n"
+    "- Join Category with: JOIN Category ON exercise.category_id = Category._id\n"
+    "- There is NO column called `exercise_name` or `weight` — use `metric_weight`\n"
+    "- These rules override any default SQL conventions you know\n\n"
     "You are a SQL expert for a SQLite fitness database. "
     "Given a natural-language question and a schema description, output ONLY a raw SQL SELECT query. "
     "No markdown fences. No explanations. No comments. No prose. "

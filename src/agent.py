@@ -55,6 +55,39 @@ goals, body_weight. There is no 'workouts', 'workout_sets', or
 'exercises' table. Never guess table names — use run_read_only_sql
 only with these exact table names.
 
+SQL COLUMN RULES: When writing SQL for run_read_only_sql:
+- Always use metric_weight (never weight or metric_weight_kg)
+- Always use exercise._id (never exercise.id)
+- Always join with: JOIN exercise ON training_log.exercise_id = exercise._id
+- Always join with: JOIN Category ON exercise.category_id = Category._id
+- Category _id for Back = 5, Chest = 4, Shoulders = 1, Biceps = 3,
+  Triceps = 2, Legs = 6, Forearms = 9
+
+OFFSET WARNING: run_read_only_sql returns raw metric_weight values with
+no offsets applied. For exercises with a numeric_offset quirk (e.g.
+Machine Wrist Extension), add the offset manually in the SQL:
+(metric_weight * 2.2046 + offset) * reps
+Smith Machine bar weight: 44.09 lbs (20 kg bar).
+Any exercise with "Smith Machine" in the name uses this bar.
+Logged weights are plates only — bar not included.
+When calculating volume in SQL: add 44.09 per set.
+Some sessions used counterbalance supports — check comments.
+When in doubt use 44.09 and note the assumption.
+For other barbell exercises, check user_context.json conventions — bar
+weights are not included in logged values.
+
+TIME RANGE INFERENCE RULE: When a question involves trends, progress, or
+patterns but no time range is specified, infer a sensible default:
+- "How is my X progressing?" → use 90 days
+- "Am I improving at X?" → use 90 days
+- "What's my training like?" → use 30 days
+- "Have I been consistent?" → use 60 days
+- Questions about a specific exercise without a time range → use 90 days
+- Questions about volume or frequency → use 60 days
+
+Always state the time range used at the start of the answer so the user
+knows what period was analyzed. Example: "Looking at the last 90 days..."
+
 RECOMMENDATION RULE: When recommending exercises or answering
 exercise advice questions, use resolve_exercise_name to find
 the user's actual exercise name before referencing it. Never
@@ -615,7 +648,7 @@ class AgentSession:
             {"role": "user", "content": question},
         ]
         new_exchange_start = len(self._context_messages) + len(history_messages)
-        max_iterations = 7
+        max_iterations = 12
         tool_calls_made = 0
 
         # Build per-question system prompt with relevant memories injected
@@ -655,7 +688,7 @@ class AgentSession:
                     tool_config=tool_config,
                     temperature=0.3,
                     max_output_tokens=4000,
-                    thinking_config=types.ThinkingConfig(thinking_budget=0),
+                    thinking_config=types.ThinkingConfig(thinking_budget=1024),
                 )
             else:
                 iter_config = types.GenerateContentConfig(
@@ -664,7 +697,7 @@ class AgentSession:
                     tool_config=tool_config,
                     temperature=0.3,
                     max_output_tokens=4000,
-                    thinking_config=types.ThinkingConfig(thinking_budget=0),
+                    thinking_config=types.ThinkingConfig(thinking_budget=1024),
                 )
 
             try:
@@ -791,6 +824,24 @@ class AgentSession:
             if tool_response_parts:
                 gemini_contents.append(types.Content(role="user", parts=tool_response_parts))
 
+                for prev_content in gemini_contents[:-1]:
+                    if not (hasattr(prev_content, "parts") and prev_content.parts):
+                        continue
+                    for part in prev_content.parts:
+                        if not hasattr(part, "function_response") or part.function_response is None:
+                            continue
+                        resp = part.function_response.response
+                        if not isinstance(resp, dict):
+                            continue
+                        text = resp.get("text") or resp.get("content") or resp.get("result") or ""
+                        if isinstance(text, str) and len(text) > 1500:
+                            n = len(text) - 800
+                            truncated = text[:400] + f" [...{n} chars truncated for context efficiency...] " + text[-400:]
+                            for key in ("text", "content", "result"):
+                                if key in resp:
+                                    resp[key] = truncated
+                                    break
+
             tool_calls_made += len(fc_parts)
 
             if write_cancelled:
@@ -829,6 +880,14 @@ class AgentSession:
     async def _reflect(self, question: str, answer: str) -> str:
         """Ask the model to briefly review its own answer. Falls back to original on error."""
         prompt = (
+            "You are reviewing a DRAFT ANSWER that was generated from tool results "
+            "already retrieved in this session. The tool data is available above in "
+            "the conversation. Your job is to verify the draft answer against that "
+            "tool data and either approve it or rewrite it.\n\n"
+            "CRITICAL: Never ask the user for data. Never say \"please provide\". "
+            "If the answer has issues, fix them yourself using the tool results "
+            "already available. If the tool results are insufficient to answer "
+            "confidently, say so in the answer itself — do not ask the user.\n\n"
             "Review the answer below for these specific problems:\n"
             "1. Does it answer what was actually asked?\n"
             "2. Are weight values consistent with what the tools returned?\n"
@@ -842,6 +901,23 @@ class AgentSession:
             "changed to square brackets [like this], rewrite with parentheses\n"
             "- If any display string was paraphrased or had content removed, "
             "rewrite the answer with the exact display strings\n\n"
+            "ANALYTICAL ANSWER CHECKS (apply when the answer contains data analysis):\n"
+            "1. DATA RANGE CHECK: If the question references any time period — explicit "
+            "(\"last 2 months\"), vague (\"recently\", \"lately\", \"a while back\"), or "
+            "unspecified (no date mentioned) — verify:\n"
+            "   - For explicit ranges: the data covers the full requested period\n"
+            "   - For vague references: at least 30 days of data was fetched\n"
+            "   - For unspecified: the TIME RANGE INFERENCE RULE was applied and the "
+            "answer states which range was used\n"
+            "   If only one session was fetched for a trend question, flag as incomplete.\n"
+            "2. COMPLETENESS CHECK: If the question asks about trends or progress, verify the "
+            "answer includes both a starting point and an ending point for comparison — "
+            "not just a snapshot.\n"
+            "3. UNIT CHECK: Verify all weights are in the correct unit for that exercise "
+            "(kg for kg-native exercises, lbs for all others). Flag if units are inconsistent.\n"
+            "4. NO FABRICATION CHECK: Verify every specific number cited (weights, dates, reps, "
+            "volume figures) appears in the tool results. If a number cannot be traced back "
+            "to tool data, flag it as potentially fabricated.\n\n"
             "If there is a genuine problem, rewrite the answer to fix it.\n"
             "If the answer is correct, return it exactly as-is.\n\n"
             "CRITICAL: Return ONLY the answer text. No thoughts, no reasoning, no \"Thought:\" prefixes, "
@@ -913,19 +989,27 @@ class AgentSession:
             return
 
         prompt = (
-            "Review this conversation and extract ONLY facts worth remembering long-term.\n\n"
-            "STORE: User preferences, physical stats, training goals, recurring patterns, "
-            "personal limits, equipment access, injury history, schedule constraints.\n\n"
-            "DO NOT STORE:\n"
-            "- What the user asked about in this conversation\n"
-            "- What questions were asked\n"
-            "- Conversation summaries or transcripts\n"
-            "- Anything phrased as \"User asked about X\" or \"User requested Y\"\n"
-            "- One-time lookup results (PRs, recent workouts)\n"
-            "- Exercise conventions, equipment offsets, or bar weights (e.g. 'user adds 20kg bar to deadlift') — these belong in exercise_quirks in user_context.json, not memory\n"
-            "- Anything that describes how an exercise is logged or calculated\n"
-            "- Equipment-specific calibrations or machine offsets\n\n"
-            "If there are no genuinely useful long-term facts to store, return an empty list.\n\n"
+            "You are extracting long-term facts worth remembering about this user's "
+            "fitness training. Review the conversation and extract ONLY facts that "
+            "meet ALL of these criteria:\n\n"
+            "EXTRACT:\n"
+            "- Training preferences (frequency, timing, style)\n"
+            "- Physical attributes (injuries, mobility limitations, equipment access)\n"
+            "- Nutrition habits relevant to training\n"
+            "- Long-term trends (stuck on a weight for multiple sessions, consistent "
+            "improvement on an exercise, recurring form issues)\n"
+            "- User-stated goals\n\n"
+            "DO NOT EXTRACT:\n"
+            "- What questions the user asked (\"user asked about X\")\n"
+            "- What the agent answered (\"agent told user X\")\n"
+            "- Single-session observations (\"user lifted 100 lbs today\")\n"
+            "- Information already in user_context.json (exercise conventions, "
+            "bar weights, unit preferences)\n"
+            "- Anything that could change next session\n\n"
+            "Format each fact as a single clear statement about the user.\n"
+            "Example good fact: \"User has been unable to increase Barbell Curl "
+            "weight beyond 52 lbs for the past 3 months.\"\n"
+            "Example bad fact: \"User asked about their Barbell Curl PR.\"\n\n"
             f"Conversation:\n{conversation_text}\n\n"
             "Return JSON array of facts to store, or empty array [] if nothing qualifies."
         )

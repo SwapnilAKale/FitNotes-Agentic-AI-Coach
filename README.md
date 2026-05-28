@@ -203,6 +203,14 @@ Building the loop from scratch was intentional — it teaches what frameworks li
 ### RAG Pipeline
 Three-stage retrieval: query rewriting (casual English → academic terms) → BM25 + dense hybrid search → cross-encoder reranking (threshold 0.0). A relevance gate filters topically adjacent but irrelevant documents before answer composition.
 
+### Exercise Session Display
+get_exercise_sessions returns pre-formatted display_sets strings rather than
+raw weight values. Each string has set number, weights in correct units,
+inline comments in parentheses, drop sets merged with →, and warmup labeled.
+The agent copies these strings verbatim — no arithmetic, no formatting
+decisions. Exercise quirks with a numeric_offset field are applied at the
+tool level before returning results.
+
 ### Write Operations
 Two-phase pattern: stage (validate + preview) → CLI confirmation gate → execute (DB write) → verify (read-back). The agent cannot bypass the gate. All write connections are separate from read connections at the SQLite level.
 
@@ -250,6 +258,15 @@ All tools exposed via a single `combined_server.py` subprocess. Single server av
 
 **Build from scratch before using frameworks.** Building the agent loop, confirmation gate, and context management by hand teaches what LangGraph, LangChain, and similar frameworks abstract away. The abstractions make sense once you've hit the problems they solve.
 
+**Move formatting decisions to the tool, not the agent.** When the agent
+is responsible for formatting structured data (grouping drop sets, applying
+unit conversions, matching comments to sets), it produces inconsistent results
+across sessions. Pre-format at the tool level and have the agent copy verbatim.
+
+**Two sources of truth for the same fact will diverge.** Unit preferences
+defined in both user_context.json and memory.json caused conflicting answers.
+Pick one authoritative source and enforce it explicitly in the system prompt.
+
 ---
 
 ## Running the Evals
@@ -294,6 +311,39 @@ trusted:
 
 Enable only after simple lookups are fully verified — analytical answers cannot
 be cross-checked against the raw data the way PR lookups can.
+
+### Session & Memory Architecture (Pre-Deployment)
+
+The current auto-extraction runs at CLI session end via the `finally` block
+in cli.py. On the web server, sessions never terminate — the AgentSession
+runs continuously and there is no natural trigger for extraction.
+
+**Three options for web session management:**
+- Option A — Inactivity timer: trigger extraction after X minutes of no
+  /chat requests. Most production-like but requires asyncio background
+  tasks with cancellation logic.
+- Option B — Message count trigger: run extraction every N messages
+  (e.g. every 10 exchanges) silently in the background. Simple, 5 lines.
+- Option C — Explicit end session button: UI button triggers extraction
+  before clearing context. User controls when the session ends.
+- Recommended: Option B + Option C combined.
+
+**Conversational memory architecture (three-layer):**
+Currently the agent has short-term context (growing message history) and
+long-term facts (memory.json, 30 fact cap). Missing middle layer:
+- Short-term: last N messages (active context per request)
+- Mid-term: session summaries — compressed LLM summaries of past
+  conversations stored and retrieved at session start
+- Long-term: extracted facts in memory.json (existing)
+
+**Per-message delete button:**
+Add a delete button under each message in the chat UI. Pressing it removes
+that specific message from the agent's conversation history so it no longer
+influences future responses. Gives the user explicit control over what the
+agent remembers from the current session.
+
+Implement all of the above before deploying to web — the growing context
+window will hit quota limits and produce inconsistent behavior without it.
 
 ### Learning extensions
 

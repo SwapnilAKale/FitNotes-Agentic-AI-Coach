@@ -941,6 +941,18 @@ async def _get_personal_record(exercise_name: str) -> str:
 def _get_exercise_history_sync(exercise_name: str, days: int = 30) -> str:
     from src.db import get_connection, run_query
 
+    _quirk_offset = 0
+    try:
+        _ctx_path = os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "user_context.json")
+        with open(_ctx_path, encoding="utf-8") as _f:
+            _ctx = json.load(_f)
+        for _q in _ctx.get("exercise_quirks", []):
+            if _q.get("exercise_name") == exercise_name and "numeric_offset" in _q:
+                _quirk_offset = _q["numeric_offset"]
+                break
+    except Exception:
+        pass
+
     safe_name = exercise_name.replace("'", "''")
     sql = f"""
         SELECT tl.date,
@@ -956,6 +968,8 @@ def _get_exercise_history_sync(exercise_name: str, days: int = 30) -> str:
     try:
         conn = get_connection(DB_PATH)
         rows = run_query(conn, sql)
+        if _quirk_offset:
+            rows = [{**r, "typed_value": round(r["typed_value"] + _quirk_offset, 1)} for r in rows]
         return json.dumps(
             {
                 "exercise": exercise_name,
@@ -2546,7 +2560,9 @@ def _get_exercise_sessions_sync(arguments: dict) -> str:
                     g = groups[dg]
                     is_warmup = set_num == 1 and max_weight > 0 and g["first_weight"] < 0.6 * max_weight
                     label = f"Set {set_num} (Warmup)" if is_warmup else f"Set {set_num}"
-                    result.append(f"{label}: {' → '.join(g['parts'])}")
+                    indent = " " * len(f"{label}: ")
+                    joined = f"\n{indent}".join(g["parts"])
+                    result.append(f"{label}: {joined}")
             return result
 
         for session in sessions:

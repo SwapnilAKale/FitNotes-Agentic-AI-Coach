@@ -41,6 +41,17 @@ def _get_db_fingerprint(path: str) -> str:
     except Exception:
         return ""
 
+def _get_exercise_names(path: str) -> set:
+    try:
+        import sqlite3
+        conn = sqlite3.connect(path)
+        rows = conn.execute("SELECT name FROM exercise").fetchall()
+        conn.close()
+        return {r[0] for r in rows}
+    except Exception:
+        return set()
+
+
 _last_db_fingerprint: str = _get_db_fingerprint(DB_PATH)
 
 _baseline_row_count: int = 0
@@ -527,7 +538,7 @@ async def _reinitialize_session():
 
 
 @app.post("/reload-db")
-async def reload_db():
+async def reload_db(new_exercises: list = None):
     global _last_db_fingerprint
 
     current_fingerprint = _get_db_fingerprint(DB_PATH)
@@ -538,7 +549,10 @@ async def reload_db():
     agent_ready = False
     asyncio.create_task(_reinitialize_session())
     _last_db_fingerprint = current_fingerprint
-    return JSONResponse(content={"status": "reloading", "message": "Reloading database in background."})
+    payload = {"status": "reloading", "message": "Reloading database in background."}
+    if new_exercises:
+        payload["new_exercises"] = new_exercises
+    return JSONResponse(content=payload)
 
 
 @app.post("/upload")
@@ -571,10 +585,12 @@ async def upload_db(file: UploadFile):
                 "message": "Upload has warnings. Proceed anyway?",
             })
 
+        old_exercises = _get_exercise_names(DB_PATH)
         os.unlink(tmp_path)
         with open(DB_PATH, "wb") as f:
             f.write(contents)
         _baseline_row_count = validation.get("row_count", _baseline_row_count)
+        new_exercises = sorted(_get_exercise_names(DB_PATH) - old_exercises)
 
     except Exception as e:
         try:
@@ -583,7 +599,7 @@ async def upload_db(file: UploadFile):
             pass
         return JSONResponse(status_code=500, content={"status": "error", "errors": [str(e)]})
 
-    return await reload_db()
+    return await reload_db(new_exercises=new_exercises)
 
 
 @app.post("/upload/confirm")
