@@ -1080,3 +1080,104 @@ those priors are consistently overridden. The only reliable fix is to embed
 the override instruction in the tool result data itself — it's processed as
 fresh in-context information rather than background instructions competing
 with training priors.
+---
+
+## Session 6 (continued): Analytics Prep & Multi-Agent Decision
+
+### Analytics prep — what was built
+Five prerequisites implemented before enabling analytical queries:
+
+1. Memory auto-extraction rewrite — extraction prompt now explicitly rejects
+   conversation transcripts ("user asked about X") and single-session observations.
+   Only stores durable insights: long-term trends, user-stated goals, persistent
+   preferences, physical attributes. Paired good/bad examples in the prompt.
+
+2. Schema prompt analytical capability — instead of fixed query templates,
+   the schema prompt now explains the underlying data model and SQL building
+   blocks (strftime, SUM, GROUP BY, subqueries) so the agent can construct
+   queries appropriate to the specific question rather than following templates.
+
+3. Context pruning — tool results exceeding 1500 chars are truncated in
+   conversation history (first 400 + marker + last 400). Applied to all
+   previous tool results after each iteration. Prevents quota burn on
+   analytical queries returning large datasets.
+
+4. Reflection step analytical checks — four new checks added to _reflect():
+   - DATA RANGE CHECK: verifies full time period covered, including vague
+     ("recently") and unspecified time references
+   - COMPLETENESS CHECK: trend answers must have start + end comparison points
+   - UNIT CHECK: weights in correct unit per exercise
+   - NO FABRICATION CHECK: every cited number must trace to tool results
+   Critical fix: reflection prompt now explicitly states it is reviewing a
+   draft answer — never ask the user for data, fix issues using available
+   tool results.
+
+5. Thinking budget — main agent reasoning loop increased from 0 to 1024
+   tokens. Reflection and auto-extraction left at 0 (mechanical tasks,
+   no reasoning benefit).
+
+### Time range inference
+When no time range is specified, agent infers a sensible default based on
+question type (90 days for progress/improvement questions, 60 days for
+volume/frequency, 30 days for general training questions). Always states
+the range used at the start of the answer.
+
+### SQL column name bug — two-layer fix
+Agent kept using wrong column names (exercise_name, E.id, weight) despite
+schema prompt showing correct names. Root cause: agent generates SQL from
+training priors, not from the schema prompt.
+Fix layer 1: SQL COLUMN RULES added to SYSTEM_PROMPT — explicitly names
+metric_weight, exercise._id, and correct JOIN patterns.
+Fix layer 2: CRITICAL SQL RULES added to _SQL_SYSTEM in llm.py for the
+text-to-SQL pipeline.
+Lesson: schema descriptions in prompts are not enough when the agent's
+training data strongly encodes a different convention. The rule must appear
+in the system prompt as an explicit override.
+
+### Offset consistency across tools
+get_exercise_history now applies numeric_offset from exercise quirks —
+same as get_exercise_sessions. Previously get_exercise_history returned
+raw metric_weight * 2.2046 with no offset, causing inconsistent values
+depending on which tool the agent used.
+run_read_only_sql has no offset awareness — OFFSET WARNING in system prompt
+tells agent to add offsets manually in SQL when needed.
+
+### Smith Machine bar weight
+Bar weight = 20 kg = 44.09 lbs. Agent was using +20 (treating as lbs)
+instead of +44.09. Fixed in system prompt to use name-pattern rule:
+"any exercise with Smith Machine in the name uses this bar." No hardcoded
+exercise list — new Smith Machine exercises are automatically covered.
+Some sessions use counterbalance supports (reducing effective bar weight) —
+check comments for support usage, use 44.09 as default when unsure.
+
+### New exercise detection on DB upload
+When user uploads a new .fitnotes backup, server compares exercise list
+before and after. If new exercises found, frontend shows a prompt asking
+if the user wants to add quirks for those exercises.
+
+### Multi-agent decision
+Single agent analytically functional but fundamentally limited for
+comprehensive analysis: 51 exercises logged, 12 iteration limit means
+agent can only sample 8-10 exercises. User wants complete coverage of
+entire database regardless of size.
+
+Decision: build multi-agent architecture on a separate git branch.
+Architecture:
+- Data Agent: pure Python, no LLM, deterministic collection pipeline
+  Phase 1 (always): all active exercises, session-level aggregation,
+  plateau detection, PR table, weekly volume trends
+  Phase 2 (trigger-based): full comment history for exercises with
+  plateau > 4 weeks; full session detail for exercises with >20% weight change.
+  Triggers are Python logic, not LLM decisions.
+- Analysis Agent: receives complete pre-processed dataset, thinking_budget=4096,
+  reasons over full picture without requesting more data
+- Coordinator: routes analytical vs simple questions, orchestrates pipeline,
+  returns final answer
+
+Why Option C (hybrid aggregation) with deterministic triggers rather than
+agent-directed data requests: every time agent controls data collection
+decisions, it produces inconsistent results. Deterministic Python triggers
+ensure complete coverage without LLM decision points in the data layer.
+
+Session/memory architecture for web deployment documented in README
+Future Work section — implement before deploying.

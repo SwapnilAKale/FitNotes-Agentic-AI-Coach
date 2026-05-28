@@ -241,6 +241,8 @@ All tools exposed via a single `combined_server.py` subprocess. Single server av
 | 9 | Polish — unit fixes, 1-rep PR warnings, relevance gate, error handling |
 | 10 | Gemini migration, Memory Option B, ground truth regeneration |
 | 11 | Exercise quirks system, tool grouping |
+| Session 6 | Analytics prep — memory extraction rewrite, schema analytical patterns, context pruning, reflection checks, thinking budget, SQL column rules, time range inference |
+| Multi-agent | Separate branch — Data Agent + Analysis Agent + Coordinator for complete DB analysis |
 
 ---
 
@@ -266,6 +268,16 @@ across sessions. Pre-format at the tool level and have the agent copy verbatim.
 **Two sources of truth for the same fact will diverge.** Unit preferences
 defined in both user_context.json and memory.json caused conflicting answers.
 Pick one authoritative source and enforce it explicitly in the system prompt.
+
+**Schema prompt column names are not enough when training priors override them.**
+The agent kept using wrong SQL column names despite correct schema descriptions.
+Fix: add explicit SQL COLUMN RULES to the system prompt as a hard override,
+not just a schema description.
+
+**Deterministic data collection beats agent-directed data requests.**
+For analytical completeness, define what data to collect in Python logic,
+not LLM decisions. The agent deciding what to fetch introduces inconsistency.
+A fixed collection pipeline ensures complete coverage every time.
 
 ---
 
