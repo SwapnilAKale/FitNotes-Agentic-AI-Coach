@@ -1080,3 +1080,120 @@ those priors are consistently overridden. The only reliable fix is to embed
 the override instruction in the tool result data itself — it's processed as
 fresh in-context information rather than background instructions competing
 with training priors.
+
+Multi-Agent System: Building the Data Agent
+Architecture decision: why agent-directed data collection fails at scale
+The single agent worked for simple lookups but hit a fundamental limit for analytics: 51 exercises across 2+ years cannot be comprehensively analyzed in 12 iterations. At each question, the agent sampled 8-10 exercises. The answer depended on which exercises it happened to pick. Different questions got different samples. Complete coverage was impossible within token constraints. No amount of "look at all exercises" in the system prompt changes this — the agent can only do N tool calls per question, and each call returns O(1) exercises.
+Decision: build a multi-agent system on a separate git branch:
+
+Data Agent: pure Python, zero LLM calls, deterministic collection pipeline
+Analysis Agent: receives complete pre-processed dataset, reasoning only
+Coordinator: simple router between analytical and simple question paths
+
+The key insight: the data layer must be completely separate from the reasoning layer. No LLM decisions in data collection. No LLM calls to decide which exercises to include.
+Pre-aggregation is architecturally superior to agent-directed data requests
+Initial approach: Coordinator decides what data to request based on the question (call collect() with exercise_names=[...]). Problem: this requires the Coordinator to be an intelligent data strategist — exactly what we want to eliminate.
+Better approach (from a previous conversation on this project): Data Agent always runs a fixed, complete pipeline. Phase 1 always runs for all active exercises. Phase 2 triggers deterministically via Python conditions (plateau > 4 weeks, improvement > 20%). Analysis Agent receives a complete self-contained package and never asks for more data.
+Why it's better:
+
+Coordinator becomes a pure router — no intelligence needed about what data to request
+Analysis Agent never needs to request more data mid-reasoning
+Phase 2 triggers are deterministic Python, not LLM decisions
+Output is compact summaries, not raw session arrays — fits in LLM context
+The Analysis Agent always sees the complete picture, not a sampled subset
+
+The pre-aggregation approach should be implemented as a prepare_analysis_package() wrapper on top of collect(), not as a replacement. collect() is the correct raw data access layer.
+Pure Python for the data layer eliminates an entire class of bugs
+The single-agent system had all math done by the LLM: unit conversions, offset application, bar weight addition. This produced inconsistent answers — LLMs apply the same calculation differently depending on context, phrasing, and what else is in the conversation. Different sessions, different results.
+Data Agent approach: every calculation happens in deterministic Python before the LLM ever sees a number. The Analysis Agent receives 130.0 lbs, not 58.97 with a note saying "multiply by 2.2046." It cannot apply unit conversions because there is nothing left to convert.
+This eliminated the entire category of "agent math" bugs from Session 6 (unit conversions applied twice, offsets missing on some calls, bar weights forgotten on others). When the data layer is deterministic, the LLM's job is to reason, not to do arithmetic.
+Exhaustive code review finds bugs that testing cannot
+Building the Data Agent involved multiple rounds of comprehensive code review — reading every function, tracing every data path — that found bugs the tests never triggered:
+
+_fetch_all_training_dates didn't exclude categories 10/11/12 — 9 phantom training days inflated total_training_days, streak, gap, and every date-based stat
+"couldn't"/"couldnt" in PAIN_KEYWORDS caused 33 false pain flags — rep failure comments flagged as injury
+_fetch_exercise_lifecycle used HAVING instead of WHERE for category filter — semantically wrong, worked in SQLite by coincidence
+_aggregate_weekly used strftime('%Y-%W') which splits year-boundary weeks incorrectly
+EXCLUDED_CATEGORY_IDS constant defined at the top, literal (10, 11, 12) used in 6 SQL queries — constant was decorative
+alltime_all_rows fetched 6810 rows on every collect() call regardless of filters or exercise count
+
+None of these would have shown up in happy-path testing. They required reading every line and reasoning about edge cases. Write the code, then read it as if you are looking for bugs, not as if you are verifying correctness.
+Phantom training days inflate all date-based statistics
+_fetch_all_training_dates used SELECT DISTINCT date FROM training_log with no category filter. There were 9 days where only excluded-category exercises (Morning, Evening, Society, Neck) were logged — no real exercise. These phantom days inflated:
+
+total_training_days (309 → should be 300)
+longest_streak_days and longest_gap_days
+sessions_per_week and weeks_missed
+day_of_week_patterns and seasonal_patterns
+PR context consecutive-day counts
+Consecutive day effect analytics
+
+Fix: JOIN exercise and WHERE e.category_id NOT IN (10, 11, 12) in the dates query. Every query that uses training dates must apply the same category exclusion as the set queries — they are not independent operations.
+"Couldn't" is not a pain keyword
+PAIN_KEYWORDS contained "couldn't" and "couldnt." Checking these keywords against real DB comments: all 33 occurrences were about rep failure ("Couldnt do 60", "Couldnt squeeze at the top"), not injury or pain. The keyword was flagging normal training comments as injury events, inflating pain_session_count across many exercises.
+The words belong in COMMENT_TREND_KEYWORDS["failure"] where they track rep failure frequency as a training pattern. They do not belong in PAIN_KEYWORDS where they trigger injury alerts.
+Lesson: every keyword in a classification list must be verified against real data before inclusion. "Couldn't" sounds intuitively like it belongs with pain. In workout logging it almost always means hitting rep failure — normal, expected, desirable.
+SQL HAVING vs WHERE: semantic correctness matters even when SQLite allows it
+_fetch_exercise_lifecycle used HAVING e.category_id NOT IN (10, 11, 12) after GROUP BY. SQLite allows this because category_id is in the GROUP BY clause. But HAVING is for conditions on aggregated results. WHERE is for row-level filters applied before aggregation. Category_id is a row-level filter — it belongs in WHERE.
+SQLite's permissiveness means this bug hides until someone reads the code and thinks about what the clause is doing, not just whether it produces the right output. Always ask: is this a row-level condition or a group-level condition? If row-level, it goes in WHERE regardless of whether HAVING also works.
+ISO 8601 week numbering vs Python's strftime('%Y-%W')
+strftime('%Y-%W') treats January 1 as week 00 if it falls before the first Monday. Training sessions on December 28-31 might be "2025-52" while January 1-3 becomes "2026-00" — the same training week split across two artificial buckets.
+Fix: use date.isocalendar() which returns ISO 8601 week numbers. ISO 8601 defines the week containing the first Thursday as week 1 of the year. Cross-year training weeks stay in one bucket. Format: f"{iso_year:04d}-W{iso_week:02d}" → "2025-W52", "2026-W01".
+This affected three places that must all use the same week format: _aggregate_weekly, _compute_muscle_group_summary, and _compute_training_consistency. If any one of them uses a different format, weekly aggregation and consistency calculation will produce mismatched keys and silently produce wrong counts.
+Constants that are defined but never used create silent maintenance debt
+EXCLUDED_CATEGORY_IDS = (10, 11, 12) was defined at the module level. All 6 SQL queries used the literal (10, 11, 12) in strings. If someone changed the constant, the queries would silently not update.
+Fix: derive _EXCL_SQL = f"({', '.join(str(c) for c in EXCLUDED_CATEGORY_IDS)})" immediately after the constant. Use _EXCL_SQL in all 6 queries via f-strings. Changing EXCLUDED_CATEGORY_IDS now automatically updates every query.
+Pattern: if you define a constant for a value, derive every hardcoded form of that value from the constant. Never define a constant and also use the literal — the constant becomes decoration.
+Cross-unit comparisons require explicit normalization
+The Deadlift was logged in lbs before a specific date, in kg after. Sessions store max_working_weight in the logged unit. When computing PR and plateau, the code compared raw numbers: 10 (lbs, pre-switch) vs 65 (kg, post-switch). This happened to produce correct results because 10 < 65 numerically. It is a latent bug: if pre-switch weights were numerically higher than post-switch kg values, the PR would pick the wrong session.
+Fix: _to_unit(value, from_unit, to_unit) helper. Used in _compute_pr and _compute_progression to normalize all sessions to the current exercise unit before any comparison. The fix produces the same results for current Deadlift data (the latent bug never triggered) but is correct for any future data where the unit switch crosses numerically significant values.
+FitNotes' built-in unit conversion handles global gym switches cleanly
+While designing a complex session-normalization scheme for the scenario of switching gyms (lbs → kg), the user discovered that FitNotes has a built-in imperial/metric conversion feature. Switching the app's unit setting converts all historical data in the DB simultaneously — the backup exported after a switch is self-consistent throughout.
+This means: when the user switches via FitNotes, the uploaded backup has consistent units. The only mixed-unit case is manual partial switches (like the current situation where one exercise was manually moved to kg). The _to_unit fix handles those correctly. For global gym switches, no complex migration is needed — switch in the app, export backup, upload, update user_context.json.
+Lesson: understand the tools you are building on before designing solutions to problems they already solve.
+Exercise data completeness requires domain knowledge, not just schema knowledge
+Building the Data Agent required understanding how each exercise type actually stores its data:
+
+Walking, Treadmill: distance (km) and duration_seconds are the real performance metrics. weight=0, reps=0 always. Walking is a pre-gym walk, not a training exercise — its data is useful for correlating with same-day strength performance.
+Cycling: duration_seconds is the metric. distance=0, weight=0. Comments add structure detail (intervals, difficulty).
+Dead Hang: duration_seconds is the metric. reps=0 is the logging convention, not a failure.
+Farmers Walk: weight is the progression metric. reps=0 is the convention — it is not rep-based.
+Dumbbell Hold: reps field stores duration in seconds. Not a rep count.
+
+None of this is obvious from the schema. It required reading the actual DB data, checking the app, and understanding the user's logging conventions. The exercise_quirks system in user_context.json is the right place to document these — it makes conventions explicit and readable by the Analysis Agent.
+Data pipelines must be built with domain knowledge, not just schema knowledge. Schema tells you what fields exist. Domain knowledge tells you what they mean.
+The reps=0 failed-attempt heuristic needs exercise awareness
+Default logic: reps == 0 AND duration_seconds == 0 AND distance == 0 → is_failed_attempt = True. This is correct for strength exercises (a set logged with 0 reps and nothing in other fields is genuinely a failed attempt).
+But it incorrectly flagged every Farmers Walk set and every Dead Hang set, because reps=0 is the normal logging convention for those exercises.
+Fix: reps_zero_is_normal flag in exercise_quirks. When True, reps=0 is never a failed attempt for that exercise. For duration-based exercises where duration_seconds > 0, the existing logic already handles disambiguation correctly — those are not failed attempts even without the flag.
+Aggregation level selection is a data architecture decision, not a display decision
+For 90-day queries: session-level detail. For 365-day: weekly. For all-time: monthly. Without automatic aggregation level selection, a "how has my training been over the past 2 years?" query would return raw session arrays for 300+ training days — overwhelming any LLM context window.
+The aggregation level selection (session ≤ 90 days, weekly ≤ 365, monthly for all-time) directly determines whether the Analysis Agent can reason over a complete picture or gets drowned in data. This is decided in the data layer, not the presentation layer.
+Phase 2 triggers must be deterministic Python, not LLM decisions
+Phase 2 (fetch full comment history) triggers when: plateau_days > 28 OR weight_change_pct > 20. These thresholds are constants in Python. The LLM never decides whether to fetch comments.
+Why it matters: LLMs are inconsistent about when to fetch more data. Across sessions, the agent would sometimes think to fetch comments and sometimes not, producing different quality answers to the same question. Deterministic Python triggers ensure complete coverage for every exercise that meets the criteria, every time, regardless of how the question is phrased.
+Output size is a first-class design constraint for multi-agent systems
+All-time + all exercises + Phase 2 = 4.7 MB. Overflows any LLM context window.
+90-day + all exercises = 2.6 MB. Still too large for most use cases.
+Single exercise + Phase 2 = 112 KB. Correct target.
+Muscle group + 365 days = 282 KB. Correct target.
+The Coordinator must never pass the raw collect() output to the Analysis Agent. Its job is to extract only the fields relevant to the question. The collect() function returns everything. A prepare_analysis_package() wrapper returns only what the Analysis Agent needs — compact summaries, not raw session arrays.
+The compact package strips sets arrays (every individual set with all its fields — this is the bloat) while keeping all analytics derived from those sets: pain_analysis, technique_variants, form_quality, comment_keyword_trends, full_comments for Phase 2 exercises. The Analysis Agent has everything comment-derived without carrying the raw comment storage.
+The alltime_rows fetch is a performance bottleneck in filtered queries
+Every collect() call fetches all 6810 rows from 2000-01-01 to today for learning curve computation, even when querying a single exercise for 90 days. This is because learning curves require all-time session history to compute first_ever_session, sessions_to_first_pr, and first_30d_weight_gain.
+The proper fix is pre-aggregation: a SQL query that returns one row per exercise (MIN(date), COUNT(DISTINCT date), first_pr_date), then targeted row fetches only for the first 30 days of each exercise's history. This reduces from 6810 rows to ~30 rows for targeted queries.
+Not yet implemented — acceptable at current data size (0.09s). Worth implementing before data grows beyond 20,000 sets.
+Goal and bodyweight tables may be empty — test with real data before declaring features complete
+The test backup had 0 goals and 0 bodyweight entries. The code paths for goal projection (_compute_goal_projection, _process_goals) and bodyweight correlation (_compute_bw_strength_correlation) were written and verified correct against the schema but never tested against real data. Edge cases that only appear with actual values (negative e1rm rate, multiple goals for the same exercise, bodyweight entries far from training dates) remain untested.
+Lesson: always test against real data before declaring a feature complete. Schema-level correctness and real-world correctness are different things.
+Two storage systems always drift — make every read operation a sync point
+Confirmed again during Data Agent development with the list_user_articles / ChromaDB / disk sync issue from Session 6 (carried over from the single-agent work). The pattern holds universally: whenever two storage systems must stay in sync, pick one as the source of truth and make every read operation heal drift in both directions. Don't assume sync operations stay synchronized — they don't.
+Verified the same lessons transfer from single-agent to multi-agent context
+Several lessons from the single-agent work were re-learned independently during Data Agent development:
+
+Move all math to the data layer (Session 6: "move formatting to the tool") — independently arrived at the same principle
+Never let an LLM do arithmetic on structured data — independently confirmed
+Deterministic beats flexible when correctness matters — confirmed again
+Two sources of truth for the same fact will diverge — confirmed with EXCLUDED_CATEGORY_IDS
+
+When the same lesson appears independently in two different architectural contexts, it is genuinely a fundamental principle, not a one-off observation.
