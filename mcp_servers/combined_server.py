@@ -1365,76 +1365,17 @@ async def _delete_user_article(filename: str) -> str:
 
 
 def _resolve_exercise_name_sync(user_term: str) -> str:
-    from src.db import get_connection
-
-    conn = get_connection(DB_PATH)
-
-    # Tier 0: space-normalized exact match — handles every compound word variation
-    # ("skullcrusher" → "skull crusher", "lateralraise" → "lateral raise", etc.)
-    # without needing a predefined list.
-    user_term_nospace = user_term.lower().replace(' ', '')
-    cursor = conn.execute(
-        "SELECT name FROM exercise WHERE REPLACE(LOWER(name), ' ', '') = ?",
-        (user_term_nospace,),
-    )
-    rows = cursor.fetchall()
-    if len(rows) == 1:
+    from src.shared.resolver import resolve_exercise_name as _resolve
+    result = _resolve(user_term, DB_PATH)
+    match = result.get("match")
+    candidates = result.get("candidates", [])
+    if match:
         return json.dumps({
             "exact_match": True,
-            "resolved_name": rows[0]["name"],
+            "resolved_name": match,
             "candidates": [],
             "message": "Exact match found.",
         })
-    if len(rows) > 1:
-        candidates = [r["name"] for r in rows]
-        return json.dumps({
-            "exact_match": False,
-            "resolved_name": None,
-            "candidates": candidates,
-            "message": (
-                f"No exact match. Found {len(candidates)} possible exercise(s). "
-                "Present these to the user and ask which one they mean before calling any data tool."
-            ),
-        })
-
-    # Exact match first
-    cursor = conn.execute(
-        "SELECT name FROM exercise WHERE LOWER(name) = LOWER(?)", (user_term,)
-    )
-    row = cursor.fetchone()
-    if row:
-        return json.dumps({
-            "exact_match": True,
-            "resolved_name": row["name"],
-            "candidates": [],
-            "message": "Exact match found.",
-        })
-
-    # Equipment token pre-filter: if the query contains a short equipment token
-    # (EZ, KB, DB, BB, KG) at a word boundary, restrict subsequent candidate
-    # fetches to exercises that also contain that token.
-    import re as _re
-    _EQUIPMENT_TOKENS = ["EZ", "KB", "DB", "BB", "KG"]
-    equipment_token = next(
-        (tok for tok in _EQUIPMENT_TOKENS
-         if _re.search(r'(?<![A-Za-z])' + tok + r'(?![A-Za-z])', user_term, _re.IGNORECASE)),
-        None,
-    )
-
-    def _filter_by_token(names):
-        if not equipment_token:
-            return names
-        return [
-            n for n in names
-            if _re.search(r'(?<![A-Za-z])' + equipment_token + r'(?![A-Za-z])', n, _re.IGNORECASE)
-        ]
-
-    # Tier 2: Partial LIKE match
-    cursor = conn.execute(
-        "SELECT name FROM exercise WHERE LOWER(name) LIKE LOWER(?) ORDER BY name LIMIT 8",
-        (f"%{user_term}%",),
-    )
-    candidates = _filter_by_token([r["name"] for r in cursor.fetchall()])
     if candidates:
         return json.dumps({
             "exact_match": False,
@@ -1445,79 +1386,6 @@ def _resolve_exercise_name_sync(user_term: str) -> str:
                 "Present these to the user and ask which one they mean before calling any data tool."
             ),
         })
-
-    # Tier 3: Plural/singular expansion + word-by-word matching.
-    # For each word, also try flipping its trailing-s (or adding one).
-    # Only keep exercises where at least 2 query words match (1 for single-word queries).
-    def _expand_queries(term):
-        variants = [term]
-        words = term.split()
-        for i, word in enumerate(words):
-            flipped = word[:-1] if word.lower().endswith('s') else word + 's'
-            variant = ' '.join(words[:i] + [flipped] + words[i + 1:])
-            if variant != term:
-                variants.append(variant)
-        return list(dict.fromkeys(variants))
-
-    def _dedup(names):
-        seen = {}
-        for n in names:
-            seen.setdefault(n, None)
-        return list(seen)
-
-    raw = []
-    for variant in _expand_queries(user_term):
-        words = variant.split()
-        words_lower = [w.lower() for w in words]
-        min_word_matches = min(2, len(words_lower))
-        if words:
-            placeholders = " OR ".join(["LOWER(name) LIKE LOWER(?)"] * len(words))
-            params = tuple(f"%{w}%" for w in words)
-            cursor = conn.execute(
-                f"SELECT DISTINCT name FROM exercise WHERE {placeholders} ORDER BY name LIMIT 8",
-                params,
-            )
-            raw.extend(
-                n for n in (r["name"] for r in cursor.fetchall())
-                if sum(1 for w in words_lower if w in n.lower()) >= min_word_matches
-            )
-    candidates = _filter_by_token(_dedup(raw))[:8]
-    if candidates:
-        return json.dumps({
-            "exact_match": False,
-            "resolved_name": None,
-            "candidates": candidates,
-            "message": (
-                f"No exact or partial match. Found {len(candidates)} exercise(s) matching "
-                "individual words. Present these to the user and ask which one they mean."
-            ),
-        })
-
-    # Tier 4: Fuzzy character-level match using difflib.SequenceMatcher.
-    # Compares space-stripped lowercase strings to handle typos.
-    import difflib as _difflib
-    query_nospace = user_term.lower().replace(' ', '')
-    all_names = conn.execute("SELECT name FROM exercise ORDER BY name").fetchall()
-    scored = sorted(
-        (
-            (_difflib.SequenceMatcher(None, query_nospace, row["name"].lower().replace(' ', '')).ratio(), row["name"])
-            for row in all_names
-        ),
-        key=lambda x: -x[0],
-    )
-    candidates = _filter_by_token([name for ratio, name in scored if ratio >= 0.75][:5])
-
-    if candidates:
-        return json.dumps({
-            "exact_match": False,
-            "resolved_name": None,
-            "candidates": candidates,
-            "message": (
-                f"No exact or partial match. Found {len(candidates)} exercise(s) matching "
-                "individual words. Present these to the user and ask which one they mean."
-            ),
-        })
-
     return json.dumps({
         "exact_match": False,
         "resolved_name": None,

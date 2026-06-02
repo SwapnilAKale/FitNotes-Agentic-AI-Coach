@@ -20,10 +20,14 @@ CRITICAL — Comment join rule:
 import re
 import sqlite3
 import json
+import math
 import os
+import logging
 from datetime import date, datetime, timedelta
 from collections import defaultdict
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 DB_PATH           = os.environ.get("FITNOTES_DB_PATH",  "data/FitNotes_Backup.fitnotes")
@@ -161,6 +165,15 @@ def _epley_1rm(weight: float, reps: int) -> float:
     return round(weight * (1 + reps / 30), 1)
 
 
+def _to_kg(weight: float, unit: str) -> float:
+    """
+    Normalize a display weight to kg for cross-unit comparison.
+    Used when comparing weights that may span a unit switch (e.g. Deadlift
+    logged in lbs before 2025-12-26, kg after).
+    """
+    return weight / 2.2046 if unit == "lbs" else weight
+
+
 def _is_pain_comment(comment: Optional[str]) -> bool:
     if not comment: return False
     c = comment.lower()
@@ -197,12 +210,74 @@ def _detect_drop_group(comment: Optional[str]) -> Optional[int]:
 
 # ── Warmup and form ────────────────────────────────────────────────────────────
 
-def _detect_warmup_flags(sets: list) -> None:
-    if not sets: return
-    session_max = max(s["weight"] for s in sets)
-    threshold   = session_max * WARMUP_THRESHOLD
-    for i, s in enumerate(sets):
-        s["is_warmup"] = (i == 0 and s["weight"] < threshold)
+def _detect_warmup_flags(sets: list,
+                          exercise_name: str = "",
+                          ctx: dict = None) -> None:
+    """
+    Mark warmup sets. Three layers, highest-priority first:
+
+    Layer 1 — Comment rule: any set whose comment contains 'warmup' or
+              'warm up' is flagged regardless of weight.
+
+    Layer 2 — Explicit exercise rule: check warmup_sets in user_context.json
+              for this exercise. Explicit weights take precedence over the
+              heuristic (e.g. Dumbbell Skull Crusher 7.5 lbs is always warmup).
+
+    Layer 3 — Progressive heuristic: walk from the front, comparing each
+              unflagged set to the next unflagged set. Flag if weight <
+              next_weight * 0.75. Continue while the condition holds, stop
+              when working weight is reached. Uses second set as reference
+              for the first — catches 70 lbs before 100/115 lbs working sets,
+              which the old 60%-of-session-max rule missed.
+              Multiple sequential warmup sets are all detected.
+    """
+    if not sets:
+        return
+
+    for s in sets:
+        s["is_warmup"] = False
+
+    # Layer 1 — comment-based (any set, any position)
+    for s in sets:
+        comment = (s.get("comment") or "").lower()
+        if "warmup" in comment or "warm up" in comment:
+            s["is_warmup"] = True
+
+    # Layer 2 — explicit exercise rules from user_context.json warmup_sets
+    if ctx and exercise_name:
+        warmup_cfg = (ctx.get("warmup_sets") or {}).get(exercise_name, {})
+        if isinstance(warmup_cfg, dict):
+            explicit_weights = set(warmup_cfg.get("weights", []))
+        elif isinstance(warmup_cfg, (list, tuple)):
+            explicit_weights = set(warmup_cfg)
+        else:
+            explicit_weights = set()
+        if explicit_weights:
+            for s in sets:
+                if s["weight"] in explicit_weights:
+                    s["is_warmup"] = True
+
+    # Layer 3 — progressive heuristic
+    # For each unflagged set, find the next unflagged set and compare.
+    # Flag current set if weight < next_weight * 0.75 (not 60% of session
+    # max — that threshold was too high and missed many real warmup sets).
+    # Stop as soon as a set reaches working weight. Can flag multiple
+    # consecutive initial warmup sets.
+    for i in range(len(sets) - 1):
+        if sets[i]["is_warmup"]:
+            continue  # already flagged — keep checking subsequent sets
+        # Find reference: next unflagged set's weight
+        ref_weight = None
+        for j in range(i + 1, len(sets)):
+            if not sets[j]["is_warmup"]:
+                ref_weight = sets[j]["weight"]
+                break
+        if ref_weight is None or ref_weight <= 0:
+            break
+        if sets[i]["weight"] < ref_weight * 0.75:
+            sets[i]["is_warmup"] = True
+        else:
+            break  # working weight reached, stop
 
 
 def _derive_form_quality(working_sets: list) -> tuple:
@@ -247,10 +322,139 @@ def _trend(values: list, up_pct: float = 0.10, down_pct: float = 0.10) -> str:
     return "stable"
 
 
+def _safe_compute(fn, *args, default=None, label="", **kwargs):
+    """
+    Call fn(*args, **kwargs), returning default on any exception.
+    Ensures one failing computation never crashes the entire analysis.
+    A partial result missing one metric is far more useful than no result.
+    """
+    try:
+        return fn(*args, **kwargs)
+    except Exception as e:
+        logger.warning("[data_agent] %s failed: %s", label or fn.__name__, e)
+        return default
+
+
+# ── Thin-data gating — statistical helpers ────────────────────────────────────
+#
+# Principle: Python reports evidence strength (facts about the data).
+# The Analysis Agent decides the bar (a judgment about domain knowledge).
+#
+# Every correlational output carries: n per condition, effect size, CI, overlap.
+# Do NOT collapse these into a single percentage — that loses the three
+# independent dimensions the Analysis Agent needs to reason correctly.
+#
+# CI uses the t-distribution without scipy. n=2 → df=1 → t=12.7 → huge margin.
+# The CI blows up automatically on thin data. This is correct behavior:
+# the math self-flags thin data without requiring a chosen cutoff.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# 95% CI t-quantiles (two-tailed, alpha=0.025 per tail)
+_T95 = {
+    1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776,  5: 2.571,
+    6: 2.447,  7: 2.365, 8: 2.306, 9: 2.262, 10: 2.228,
+    15: 2.131, 20: 2.086, 30: 2.042, 60: 2.000,
+}
+
+def _t95(df: int) -> float:
+    """95% CI t-quantile. Linearly interpolates between table entries."""
+    if df <= 0:    return float("inf")
+    if df in _T95: return _T95[df]
+    if df >= 60:   return 1.960
+    keys = sorted(_T95)
+    lo = max(k for k in keys if k < df)
+    hi = min(k for k in keys if k > df)
+    frac = (df - lo) / (hi - lo)
+    return _T95[lo] + frac * (_T95[hi] - _T95[lo])
+
+
+def _ci_stats(values: list) -> dict:
+    """
+    n, mean, std, and 95% CI for a list of values.
+    n=1 → CI=None (can't estimate spread from one point).
+    n≥2 → t-distribution CI. Blows up for small n — correct behavior.
+    """
+    n = len(values)
+    if n == 0:
+        return {"n": 0, "mean": None, "std": None, "ci_95": None}
+    if n == 1:
+        return {"n": 1, "mean": round(values[0], 1), "std": None, "ci_95": None}
+    mean   = sum(values) / n
+    var    = sum((x - mean) ** 2 for x in values) / (n - 1)
+    std    = var ** 0.5
+    margin = _t95(n - 1) * std / (n ** 0.5)
+    return {
+        "n":     n,
+        "mean":  round(mean, 1),
+        "std":   round(std, 1),
+        "ci_95": [round(mean - margin, 1), round(mean + margin, 1)],
+    }
+
+
+def _cohen_d(a: list, b: list) -> Optional[float]:
+    """
+    Cohen's d between two groups. None if either group < 2 values.
+    |d| < 0.2 small, 0.2–0.5 medium, > 0.5 large.
+    """
+    if len(a) < 2 or len(b) < 2:
+        return None
+    ma = sum(a) / len(a);  mb = sum(b) / len(b)
+    va = sum((x - ma) ** 2 for x in a) / (len(a) - 1)
+    vb = sum((x - mb) ** 2 for x in b) / (len(b) - 1)
+    pooled = (((len(a) - 1) * va + (len(b) - 1) * vb) /
+              (len(a) + len(b) - 2)) ** 0.5
+    return round((ma - mb) / pooled, 2) if pooled > 0 else 0.0
+
+
+def _cis_overlap(ci_a: Optional[list], ci_b: Optional[list]) -> bool:
+    """True if two CIs overlap. Conservative: returns True if either is None."""
+    if not ci_a or not ci_b:
+        return True
+    return ci_a[0] <= ci_b[1] and ci_b[0] <= ci_a[1]
+
+
+def _effect_label(d: Optional[float], n_min: int) -> str:
+    """
+    Convenience label from Cohen's d and minimum group size.
+    Always travels with the underlying numbers — label alone is never reported.
+    """
+    if d is None or n_min < 2:
+        return "insufficient_data"
+    ad = abs(d)
+    if ad < 0.2:   return "weak"
+    if ad < 0.5:   return "moderate"
+    return "strong"
+
+
+def _pearson_r_with_ci(xs: list, ys: list) -> dict:
+    """
+    Pearson r with 95% CI via Fisher z-transform.
+    Requires n ≥ 4 for a meaningful CI (denominator is sqrt(n-3)).
+    Returns {"r": ..., "ci_95": [...], "n": n}.
+    """
+    n = len(xs)
+    if n < 3:
+        return {"r": None, "ci_95": None, "n": n}
+    mx = sum(xs) / n;  my = sum(ys) / n
+    num = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    dx  = sum((x - mx) ** 2 for x in xs) ** 0.5
+    dy  = sum((y - my) ** 2 for y in ys) ** 0.5
+    if dx == 0 or dy == 0:
+        return {"r": 0.0, "ci_95": None, "n": n}
+    r = max(-1.0, min(1.0, num / (dx * dy)))
+    if n < 4 or abs(r) >= 1.0:
+        return {"r": round(r, 3), "ci_95": None, "n": n}
+    z    = 0.5 * math.log((1 + r) / (1 - r))
+    se   = 1.0 / (n - 3) ** 0.5
+    r_lo = math.tanh(z - 1.960 * se)
+    r_hi = math.tanh(z + 1.960 * se)
+    return {"r": round(r, 3), "ci_95": [round(r_lo, 3), round(r_hi, 3)], "n": n}
+
+
 # ── DB queries ─────────────────────────────────────────────────────────────────
 
 def _get_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -421,7 +625,7 @@ def _build_sessions_from_rows(rows: list, ctx: dict,
                 "is_warmup":          False,
             })
 
-        _detect_warmup_flags(sets)
+        _detect_warmup_flags(sets, exercise_name=exercise_name, ctx=ctx)
         working_sets = [s for s in sets if not s["is_warmup"]] or sets
         warmup_sets  = [s for s in sets if s["is_warmup"]]
 
@@ -650,8 +854,10 @@ def _compute_progression(sessions: list) -> dict:
         e1rm_start = e1rm_start_raw
 
     weight_change     = round(max_weight_end - max_weight_start, 1)
-    weight_change_pct = round((weight_change / max_weight_start * 100)
-                               if max_weight_start > 0 else 0.0, 1)
+    weight_change_pct = (
+        round(weight_change / max_weight_start * 100, 1)
+        if max_weight_start > 0 else None
+    )
 
     current_max = max_weight_end; plateau_since = last["date"]
     for s in reversed(sessions):
@@ -736,6 +942,56 @@ def _compute_pr(sessions: list, unit: str) -> Optional[dict]:
     }
 
 
+def _compute_alltime_pr(pr_history: list, exercise_name: str,
+                         ctx: dict) -> Optional[dict]:
+    """
+    Compute all-time PR from pre-fetched pr_history rows.
+    pr_history is already in memory (fetched once by _fetch_pr_history).
+    No extra DB query needed.
+
+    Uses kg-normalized comparison to correctly handle exercises that changed
+    units mid-history (e.g. Deadlift: lbs before 2025-12-26, kg after).
+    Comparing raw numbers across a unit switch would pick the wrong session.
+    """
+    ex_prs = [r for r in pr_history if r["exercise_name"] == exercise_name]
+    if not ex_prs:
+        return None
+
+    offset = _get_numeric_offset(ctx, exercise_name)
+
+    converted = []
+    for r in ex_prs:
+        weight = _recover_typed_weight(r["metric_weight"], offset)
+        reps   = r["reps"]
+        unit   = "kg" if _is_kg_native(ctx, exercise_name, r["date"]) else "lbs"
+        e1rm   = _epley_1rm(weight, reps)
+        converted.append({
+            "date":          r["date"],
+            "weight":        weight,
+            "reps":          reps,
+            "unit":          unit,
+            "weight_kg":     _to_kg(weight, unit),  # normalized for comparison
+            "estimated_1rm": e1rm,
+        })
+
+    # Find best by kg-normalized weight, then max reps, then most recent
+    best_kg       = max(c["weight_kg"] for c in converted)
+    at_best       = [c for c in converted if abs(c["weight_kg"] - best_kg) < 0.05]
+    best_reps     = max(c["reps"] for c in at_best)
+    at_best_reps  = [c for c in at_best if c["reps"] == best_reps]
+    pr_entry      = sorted(at_best_reps, key=lambda x: x["date"])[-1]
+    # All-time best e1RM — may come from a higher-rep session at moderate weight
+    best_e1rm     = max(c["estimated_1rm"] for c in converted)
+
+    return {
+        "weight":        pr_entry["weight"],
+        "reps":          pr_entry["reps"],
+        "date":          pr_entry["date"],
+        "estimated_1rm": best_e1rm,
+        "unit":          pr_entry["unit"],
+    }
+
+
 def _compute_duration_progression(sessions: list) -> Optional[dict]:
     """
     Progression based on duration_seconds for time-based exercises (e.g. Dead Hang).
@@ -808,8 +1064,10 @@ def _evaluate_phase2(progression: dict, end_date: date) -> tuple:
     if progression.get("plateau_since"):
         plateau_dt   = datetime.strptime(progression["plateau_since"], "%Y-%m-%d").date()
         plateau_days = (end_date - plateau_dt).days
-    triggered = (plateau_days > PLATEAU_TRIGGER_DAYS or
-                 progression.get("weight_change_pct", 0) > IMPROVEMENT_TRIGGER_PCT)
+    triggered = (
+        plateau_days > PLATEAU_TRIGGER_DAYS or
+        (progression.get("weight_change_pct") or 0) > IMPROVEMENT_TRIGGER_PCT
+    )
     return triggered, plateau_days
 
 
@@ -857,44 +1115,115 @@ def _compute_training_frequency(sessions: list, start_date: str, end_date: str) 
     }
 
 
-def _compute_rest_performance_buckets(sessions: list) -> list:
-    if len(sessions) < 3: return []
+def _compute_rest_performance_buckets(sessions: list) -> dict:
+    """
+    Group sessions by days of rest since the previous session, compare e1RM.
+
+    Each bucket: n, mean, std, 95% CI.
+    CI blows up for small n — wide CI signals thin data to the Analysis Agent.
+    comparison.confidence_label always travels with the raw statistical numbers.
+    """
+    if len(sessions) < 3:
+        return {"buckets": [], "comparison": None}
     data = []
     for i in range(1, len(sessions)):
-        prev_dt = datetime.strptime(sessions[i-1]["date"], "%Y-%m-%d").date()
-        curr_dt = datetime.strptime(sessions[i]["date"],   "%Y-%m-%d").date()
-        rest    = (curr_dt - prev_dt).days
+        prev = datetime.strptime(sessions[i-1]["date"], "%Y-%m-%d").date()
+        curr = datetime.strptime(sessions[i  ]["date"], "%Y-%m-%d").date()
+        rest = (curr - prev).days
         if sessions[i]["estimated_1rm"] > 0:
             data.append((rest, sessions[i]["estimated_1rm"]))
-    if not data: return []
-    buckets = {"1-3 days": [], "4-6 days": [], "7-13 days": [], "14+ days": []}
+    if not data:
+        return {"buckets": [], "comparison": None}
+
+    raw: dict = {"1-3 days": [], "4-6 days": [], "7-13 days": [], "14+ days": []}
     for rest, e1rm in data:
-        if   rest <= 3:   buckets["1-3 days"].append(e1rm)
-        elif rest <= 6:   buckets["4-6 days"].append(e1rm)
-        elif rest <= 13:  buckets["7-13 days"].append(e1rm)
-        else:             buckets["14+ days"].append(e1rm)
-    return [{"rest_range": b, "session_count": len(e1rms),
-             "avg_e1rm": round(sum(e1rms)/len(e1rms), 1),
-             "max_e1rm": round(max(e1rms), 1)}
-            for b, e1rms in buckets.items() if e1rms]
+        if   rest <= 3:  raw["1-3 days"].append(e1rm)
+        elif rest <= 6:  raw["4-6 days"].append(e1rm)
+        elif rest <= 13: raw["7-13 days"].append(e1rm)
+        else:            raw["14+ days"].append(e1rm)
+
+    buckets = []
+    for name, vals in raw.items():
+        if not vals:
+            continue
+        s = _ci_stats(vals)
+        buckets.append({
+            "rest_range": name,
+            "n":          s["n"],
+            "mean_e1rm":  s["mean"],
+            "std_e1rm":   s["std"],
+            "ci_95":      s["ci_95"],
+            "max_e1rm":   round(max(vals), 1),
+        })
+
+    comparison = None
+    if len(buckets) >= 2:
+        best  = max(buckets, key=lambda b: b["mean_e1rm"] or 0)
+        worst = min(buckets, key=lambda b: b["mean_e1rm"] or 0)
+        if best["rest_range"] != worst["rest_range"]:
+            d = _cohen_d(raw[best["rest_range"]], raw[worst["rest_range"]])
+            comparison = {
+                "best_bucket":      best["rest_range"],
+                "worst_bucket":     worst["rest_range"],
+                "mean_diff_e1rm":   round((best["mean_e1rm"] or 0) - (worst["mean_e1rm"] or 0), 1),
+                "cohen_d":          d,
+                "cis_overlap":      _cis_overlap(best["ci_95"], worst["ci_95"]),
+                "confidence_label": _effect_label(d, min(best["n"], worst["n"])),
+            }
+
+    return {"buckets": buckets, "comparison": comparison}
 
 
-def _compute_consecutive_day_effect(sessions: list, all_dates: list) -> list:
-    if not sessions or not all_dates: return []
+def _compute_consecutive_day_effect(sessions: list, all_dates: list) -> dict:
+    """
+    Group sessions by consecutive training days before them, compare e1RM.
+    Each condition: n, mean, std, 95% CI. comparison carries effect size.
+    """
+    if not sessions or not all_dates:
+        return {"by_consecutive_days": [], "comparison": None}
     date_set = set(all_dates)
     def consec_before(d_str):
-        dt = datetime.strptime(d_str, "%Y-%m-%d").date(); count = 0
-        prev = dt - timedelta(days=1)
+        dt = datetime.strptime(d_str, "%Y-%m-%d").date()
+        count = 0
+        prev  = dt - timedelta(days=1)
         while prev.strftime("%Y-%m-%d") in date_set:
             count += 1; prev -= timedelta(days=1)
         return count
     by_c: dict = defaultdict(list)
     for s in sessions:
         c = consec_before(s["date"])
-        if s["estimated_1rm"] > 0: by_c[c].append(s["estimated_1rm"])
-    return [{"consecutive_days_before": c, "session_count": len(e1rms),
-             "avg_e1rm": round(sum(e1rms)/len(e1rms), 1)}
-            for c, e1rms in sorted(by_c.items())]
+        if s["estimated_1rm"] > 0:
+            by_c[c].append(s["estimated_1rm"])
+
+    rows = []
+    for c, vals in sorted(by_c.items()):
+        st = _ci_stats(vals)
+        rows.append({
+            "consecutive_days_before": c,
+            "n":          st["n"],
+            "mean_e1rm":  st["mean"],
+            "std_e1rm":   st["std"],
+            "ci_95":      st["ci_95"],
+        })
+
+    comparison = None
+    if len(rows) >= 2:
+        best  = max(rows, key=lambda r: r["mean_e1rm"] or 0)
+        worst = min(rows, key=lambda r: r["mean_e1rm"] or 0)
+        if best["consecutive_days_before"] != worst["consecutive_days_before"]:
+            d = _cohen_d(
+                by_c[best["consecutive_days_before"]],
+                by_c[worst["consecutive_days_before"]])
+            comparison = {
+                "best_condition":   best["consecutive_days_before"],
+                "worst_condition":  worst["consecutive_days_before"],
+                "mean_diff_e1rm":   round((best["mean_e1rm"] or 0) - (worst["mean_e1rm"] or 0), 1),
+                "cohen_d":          d,
+                "cis_overlap":      _cis_overlap(best["ci_95"], worst["ci_95"]),
+                "confidence_label": _effect_label(d, min(best["n"], worst["n"])),
+            }
+
+    return {"by_consecutive_days": rows, "comparison": comparison}
 
 
 def _compute_rep_range_distribution(sessions: list) -> dict:
@@ -1094,7 +1423,7 @@ def _build_daily_workouts(all_rows: list, ctx: dict) -> list:
                         "distance":          round(r.get("distance", 0) or 0, 3),
                         "duration_seconds":  int(r.get("duration_seconds", 0) or 0),
                         "is_warmup":         False} for r in ex_rows]
-            _detect_warmup_flags(ex_sets)
+            _detect_warmup_flags(ex_sets, exercise_name=ex_name, ctx=ctx)
             working = [s for s in ex_sets if not s["is_warmup"]] or ex_sets
             max_w   = max(s["weight"] for s in working)
             vol     = sum((s["weight"] + bar_weight) * s["reps"] for s in ex_sets)
@@ -1166,6 +1495,14 @@ def _detect_supersets(all_rows: list) -> list:
 
 def _compute_inter_exercise_correlation(sessions: list, exercise_name: str,
                                          daily_workouts: list) -> list:
+    """
+    For each exercise that preceded this one in the same session, compare
+    e1RM when preceded vs not preceded.
+
+    Each entry: n per condition, mean e1rm, CI, Cohen's d, CI overlap, label.
+    Sorted by abs(mean_diff_e1rm) descending — largest effects first.
+    Minimum 2 sessions per condition required to include an entry.
+    """
     before_map = {
         day["date"]: [ex["exercise_name"] for ex in day["exercises"]
                       if ex["position"] < next(
@@ -1174,32 +1511,42 @@ def _compute_inter_exercise_correlation(sessions: list, exercise_name: str,
         for day in daily_workouts
         if any(e["exercise_name"] == exercise_name for e in day["exercises"])
     }
-    if not before_map: return []
+    if not before_map:
+        return []
     all_others = set(ex for exs in before_map.values() for ex in exs)
     result = []
     for other in all_others:
-        preceded     = [s["estimated_1rm"] for s in sessions
-                        if s["date"] in before_map
-                        and other in before_map[s["date"]]
-                        and s["estimated_1rm"] > 0]
+        preceded = [s["estimated_1rm"] for s in sessions
+                    if s["date"] in before_map
+                    and other in before_map[s["date"]]
+                    and s["estimated_1rm"] > 0]
         not_preceded = [s["estimated_1rm"] for s in sessions
                         if (s["date"] not in before_map
                             or other not in before_map.get(s["date"], []))
                         and s["estimated_1rm"] > 0]
-        if len(preceded) >= 2 and len(not_preceded) >= 2:
-            avg_p = round(sum(preceded)/len(preceded), 1)
-            avg_n = round(sum(not_preceded)/len(not_preceded), 1)
-            diff  = round((avg_p - avg_n) / avg_n * 100, 1) if avg_n else 0
-            result.append({
-                "preceding_exercise":      other,
-                "sessions_preceded_by":    len(preceded),
-                "avg_e1rm_when_preceded":  avg_p,
-                "sessions_not_preceded":   len(not_preceded),
-                "avg_e1rm_when_not":       avg_n,
-                "e1rm_diff_pct":           diff,
-                "effect": ("negative" if diff < -5 else "positive" if diff > 5 else "neutral"),
-            })
-    return sorted(result, key=lambda x: abs(x["e1rm_diff_pct"]), reverse=True)
+        if len(preceded) < 2 or len(not_preceded) < 2:
+            continue
+        sp   = _ci_stats(preceded)
+        snp  = _ci_stats(not_preceded)
+        d    = _cohen_d(preceded, not_preceded)
+        mean_diff = round((sp["mean"] or 0) - (snp["mean"] or 0), 1)
+        effect = ("negative" if mean_diff < -5 else
+                  "positive" if mean_diff > 5  else "neutral")
+        result.append({
+            "preceding_exercise":       other,
+            "n_preceded":               sp["n"],
+            "n_not_preceded":           snp["n"],
+            "mean_e1rm_when_preceded":  sp["mean"],
+            "ci_95_when_preceded":      sp["ci_95"],
+            "mean_e1rm_when_not":       snp["mean"],
+            "ci_95_when_not":           snp["ci_95"],
+            "mean_diff_e1rm":           mean_diff,
+            "cohen_d":                  d,
+            "cis_overlap":              _cis_overlap(sp["ci_95"], snp["ci_95"]),
+            "confidence_label":         _effect_label(d, min(sp["n"], snp["n"])),
+            "effect":                   effect,
+        })
+    return sorted(result, key=lambda x: abs(x["mean_diff_e1rm"]), reverse=True)
 
 
 # ── Global analytics ───────────────────────────────────────────────────────────
@@ -1216,15 +1563,49 @@ def _compute_day_of_week_patterns(all_dates: list, start_date: str, end_date: st
     }
 
 
-def _compute_exercise_dow_e1rm(sessions: list) -> list:
+def _compute_exercise_dow_e1rm(sessions: list) -> dict:
+    """
+    Group sessions by day of week, compare e1RM.
+    Each day: n, mean, std, 95% CI.
+    comparison carries best/worst day, Cohen's d, CI overlap, label.
+    """
     by_dow: dict = defaultdict(list)
     for s in sessions:
         dow = datetime.strptime(s["date"], "%Y-%m-%d").strftime("%A")
-        if s["estimated_1rm"] > 0: by_dow[dow].append(s["estimated_1rm"])
+        if s["estimated_1rm"] > 0:
+            by_dow[dow].append(s["estimated_1rm"])
+
     days = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
-    return [{"day": d, "session_count": len(by_dow[d]),
-             "avg_e1rm": round(sum(by_dow[d])/len(by_dow[d]), 1)}
-            for d in days if by_dow.get(d)]
+    rows = []
+    for d in days:
+        vals = by_dow.get(d, [])
+        if not vals:
+            continue
+        st = _ci_stats(vals)
+        rows.append({
+            "day":       d,
+            "n":         st["n"],
+            "mean_e1rm": st["mean"],
+            "std_e1rm":  st["std"],
+            "ci_95":     st["ci_95"],
+        })
+
+    comparison = None
+    if len(rows) >= 2:
+        best  = max(rows, key=lambda r: r["mean_e1rm"] or 0)
+        worst = min(rows, key=lambda r: r["mean_e1rm"] or 0)
+        if best["day"] != worst["day"]:
+            d = _cohen_d(by_dow[best["day"]], by_dow[worst["day"]])
+            comparison = {
+                "best_day":         best["day"],
+                "worst_day":        worst["day"],
+                "mean_diff_e1rm":   round((best["mean_e1rm"] or 0) - (worst["mean_e1rm"] or 0), 1),
+                "cohen_d":          d,
+                "cis_overlap":      _cis_overlap(best["ci_95"], worst["ci_95"]),
+                "confidence_label": _effect_label(d, min(best["n"], worst["n"])),
+            }
+
+    return {"by_day": rows, "comparison": comparison}
 
 
 def _compute_seasonal_patterns(all_dates: list) -> list:
@@ -1397,35 +1778,60 @@ def _process_bodyweight(entries: list) -> dict:
 
 
 def _compute_bw_strength_correlation(sessions: list, bw_entries: list) -> dict:
-    if not sessions or not bw_entries: return {}
+    """
+    Correlate bodyweight with e1RM over time.
+    Adds Pearson r with 95% CI (Fisher z-transform) and confidence label.
+    n < 3: no correlation computed. n < 4: r reported but CI is None.
+    """
+    if not sessions or not bw_entries:
+        return {}
     bw_by_date = {e["date"]: e["weight"] for e in bw_entries}
     bw_sorted  = sorted(bw_by_date.keys())
     ratios = []
     for s in sessions:
-        if s["estimated_1rm"] <= 0: continue
+        if s["estimated_1rm"] <= 0:
+            continue
         nearest = min(bw_sorted, key=lambda d: abs(
-            (datetime.strptime(d, "%Y-%m-%d").date() -
-             datetime.strptime(s["date"], "%Y-%m-%d").date()).days), default=None)
-        if nearest is None: continue
-        gap = abs((datetime.strptime(nearest, "%Y-%m-%d").date() -
+            (datetime.strptime(d,            "%Y-%m-%d").date() -
+             datetime.strptime(s["date"],    "%Y-%m-%d").date()).days), default=None)
+        if nearest is None:
+            continue
+        gap = abs((datetime.strptime(nearest,   "%Y-%m-%d").date() -
                    datetime.strptime(s["date"], "%Y-%m-%d").date()).days)
         if gap <= 14:
             bw = bw_by_date[nearest]
-            exercise_unit = s.get("unit", "lbs")
-            bw_in_exercise_unit = bw * 2.2046 if exercise_unit == "lbs" else bw
             ratios.append({
-                "date":                        s["date"],
-                "e1rm":                        s["estimated_1rm"],
-                "bodyweight_kg":               round(bw, 2),
-                "bodyweight_in_exercise_unit": round(bw_in_exercise_unit, 2),
-                "exercise_unit":               exercise_unit,
-                "e1rm_to_bw":                  round(s["estimated_1rm"] / bw_in_exercise_unit, 3)
-                                               if bw_in_exercise_unit > 0 else None,
+                "date":          s["date"],
+                "e1rm":          s["estimated_1rm"],
+                "bodyweight_kg": round(bw, 2),
+                "e1rm_to_bw":    round(s["estimated_1rm"] / bw, 3) if bw > 0 else None,
             })
-    if len(ratios) < 2: return {"ratios": ratios, "trend": "insufficient_data"}
+    n = len(ratios)
+    if n < 2:
+        return {"ratios": ratios, "n": n, "trend": "insufficient_data",
+                "pearson": {"r": None, "ci_95": None, "n": n},
+                "confidence_label": "insufficient_data"}
     ratio_vals = [r["e1rm_to_bw"] for r in ratios if r["e1rm_to_bw"]]
-    return {"ratios": ratios, "current_ratio": ratios[-1]["e1rm_to_bw"] if ratios else None,
-            "trend": _trend(ratio_vals, 0.02, 0.02)}
+    bw_vals    = [r["bodyweight_kg"] for r in ratios]
+    e1rm_vals  = [r["e1rm"]          for r in ratios]
+    pearson    = _pearson_r_with_ci(bw_vals, e1rm_vals)
+    r_val      = pearson["r"]
+    if r_val is None or n < 4:
+        conf_label = "insufficient_data"
+    elif abs(r_val) < 0.3:
+        conf_label = "weak"
+    elif abs(r_val) < 0.6:
+        conf_label = "moderate"
+    else:
+        conf_label = "strong"
+    return {
+        "ratios":           ratios,
+        "n":                n,
+        "current_ratio":    ratios[-1]["e1rm_to_bw"] if ratios else None,
+        "trend":            _trend(ratio_vals, 0.02, 0.02),
+        "pearson":          pearson,
+        "confidence_label": conf_label,
+    }
 
 
 def _process_goals(raw_goals: list, ctx: dict) -> list:
@@ -1684,7 +2090,8 @@ def collect(
             allowed_ids = {cat_map[g] for g in muscle_groups if g in cat_map}
             filtered_rows = [r for r in filtered_rows if r["category_id"] in allowed_ids]
         if exercise_names:
-            filtered_rows = [r for r in filtered_rows if r["exercise_name"] in exercise_names]
+            lower_names   = {n.lower() for n in exercise_names}
+            filtered_rows = [r for r in filtered_rows if r["exercise_name"].lower() in lower_names]
 
         # ── Daily workout view and supersets ──────────────────────────────────
         daily_workouts    = _build_daily_workouts(filtered_rows, ctx)
@@ -1723,17 +2130,19 @@ def collect(
             sessions = _build_sessions_from_rows(ex_rows, ctx, ex_name)
             if not sessions: continue
 
-            pr = _compute_pr(sessions, unit)
+            pr = _safe_compute(_compute_pr, sessions, unit, default=None, label="pr_period")
             is_weight_based_ex = (pr is not None and pr.get("weight", 0) > 0)
 
             if is_weight_based_ex:
-                progression      = _compute_progression(sessions)
-                phase2_triggered, plateau_days = _evaluate_phase2(progression, end_date)
+                progression = _safe_compute(
+                    _compute_progression, sessions, default={}, label="progression")
+                p2_result   = _safe_compute(
+                    _evaluate_phase2, progression, end_date,
+                    default=(False, 0), label="evaluate_phase2")
+                phase2_triggered, plateau_days = p2_result
             else:
                 progression      = None
                 plateau_days     = 0
-                # Non-weight exercises: trigger Phase 2 if any sessions have comments
-                # (since all meaningful data for these exercises is in comments)
                 phase2_triggered = any(s["comment_count"] > 0 for s in sessions)
 
             duration_progression = (_compute_duration_progression(sessions)
@@ -1743,66 +2152,74 @@ def collect(
 
             full_comments = None
             if include_phase2 and phase2_triggered:
-                full_comments = _fetch_full_comments_for_exercise(conn, ex_name)
+                try:
+                    full_comments = _fetch_full_comments_for_exercise(conn, ex_name)
+                except Exception as e:
+                    logger.warning("[data_agent] full_comments fetch failed for %s: %s",
+                                   ex_name, e)
+                    full_comments = None
 
             # All-time sessions for learning curve
             alltime_sessions = (_build_sessions_from_rows(alltime_cache[ex_name], ctx, ex_name)
                                  if alltime_cache.get(ex_name) else sessions)
 
             exercise_results.append({
-                "name":          ex_name, "category": category,
-                "unit":          unit, "numeric_offset": offset,
-                "bar_weight":    bar_wt_native, "bar_weight_unit": unit,
-                "is_cardio":     is_cardio, "cardio_note": cardio_note,
+                "name":           ex_name,
+                "category":       category,
+                "unit":           unit,
+                "numeric_offset": offset,
+                "bar_weight":     bar_wt_native,
+                "bar_weight_unit": unit,
+                "is_cardio":      is_cardio,
+                "cardio_note":    cardio_note,
 
                 # Zoom levels
                 "sessions":              sessions,
-                "weekly_aggregations":   _aggregate_weekly(sessions),
-                "monthly_aggregations":  _aggregate_monthly(sessions),
-                "yearly_aggregations":   _aggregate_yearly(sessions, unit),
+                "weekly_aggregations":   _safe_compute(_aggregate_weekly,   sessions,       default=[], label="weekly_agg"),
+                "monthly_aggregations":  _safe_compute(_aggregate_monthly,  sessions,       default=[], label="monthly_agg"),
+                "yearly_aggregations":   _safe_compute(_aggregate_yearly,   sessions, unit, default=[], label="yearly_agg"),
 
                 # Progression and PR
                 "progression":           progression,
                 "duration_progression":  duration_progression,
                 "distance_progression":  distance_progression,
-                "pr":                    pr,
-                "pr_context":            _compute_pr_context(sessions, all_training_dates, all_bw_entries),
-                "pr_velocity":           _compute_pr_velocity(pr_history, ex_name),
+                "pr":                    _safe_compute(_compute_alltime_pr,  pr_history, ex_name, ctx,                   default=None, label="pr_alltime"),
+                "pr_period":             pr,
+                "pr_context":            _safe_compute(_compute_pr_context,  sessions, all_training_dates, all_bw_entries, default=[],   label="pr_context"),
+                "pr_velocity":           _safe_compute(_compute_pr_velocity, pr_history, ex_name,                        default={"total_prs": 0, "monthly_counts": [], "velocity_trend": "none"}, label="pr_velocity"),
 
                 # Trends
-                "volume_trend":          _trend([s["total_volume"]  for s in sessions]),
-                "e1rm_trend":            _trend([s["estimated_1rm"] for s in sessions
-                                                  if s["estimated_1rm"] > 0], 0.05, 0.05),
-                "form_trend":            _compute_form_trend(sessions),
-                "comment_keyword_trends":_compute_comment_keyword_trends(sessions),
+                "volume_trend":          _safe_compute(_trend, [s["total_volume"]  for s in sessions],                          default="insufficient_data", label="volume_trend"),
+                "e1rm_trend":            _safe_compute(_trend, [s["estimated_1rm"] for s in sessions if s["estimated_1rm"] > 0], 0.05, 0.05, default="insufficient_data", label="e1rm_trend"),
+                "form_trend":            _safe_compute(_compute_form_trend,             sessions,       default="insufficient_data", label="form_trend"),
+                "comment_keyword_trends":_safe_compute(_compute_comment_keyword_trends, sessions,       default={},                  label="comment_keyword_trends"),
 
                 # e1RM
                 "e1rm_history":          [{"date": s["date"], "estimated_1rm": s["estimated_1rm"]}
                                            for s in sessions if s["estimated_1rm"] > 0],
-                "e1rm_projection":       _compute_e1rm_projection(sessions),
+                "e1rm_projection":       _safe_compute(_compute_e1rm_projection, sessions, default={}, label="e1rm_projection"),
 
                 # Analysis
-                "rep_range_distribution":  _compute_rep_range_distribution(sessions),
-                "technique_variants":      _compute_technique_variants(sessions, unit),
-                "pain_analysis":           _compute_pain_analysis(sessions),
-                "training_frequency":      _compute_training_frequency(sessions, start_str, end_str),
-                "rest_performance_buckets":_compute_rest_performance_buckets(sessions),
-                "consecutive_day_effect":  _compute_consecutive_day_effect(sessions, all_training_dates),
-                "workout_position_effect": _compute_exercise_workout_position(sessions, daily_workouts, ex_name),
-                "inter_exercise_correlation": _compute_inter_exercise_correlation(sessions, ex_name, daily_workouts),
-                "dow_e1rm_pattern":        _compute_exercise_dow_e1rm(sessions),
-                "bw_strength_correlation": _compute_bw_strength_correlation(sessions, period_bw_entries),
-                "learning_curve":          _compute_learning_curve(alltime_sessions),
+                "rep_range_distribution":   _safe_compute(_compute_rep_range_distribution,     sessions,                              default={},  label="rep_range_dist"),
+                "technique_variants":       _safe_compute(_compute_technique_variants,          sessions, unit,                        default=[],  label="technique_variants"),
+                "pain_analysis":            _safe_compute(_compute_pain_analysis,               sessions,                              default={"pain_session_count": 0, "pain_session_dates": [], "pain_occurrences": [], "failed_attempt_count": 0, "failed_attempts": []}, label="pain_analysis"),
+                "training_frequency":       _safe_compute(_compute_training_frequency,          sessions, start_str, end_str,          default={},  label="training_frequency"),
+                "rest_performance_buckets": _safe_compute(_compute_rest_performance_buckets,    sessions,                              default={"buckets": [], "comparison": None},            label="rest_perf_buckets"),
+                "consecutive_day_effect":   _safe_compute(_compute_consecutive_day_effect,      sessions, all_training_dates,          default={"by_consecutive_days": [], "comparison": None}, label="consec_day_effect"),
+                "workout_position_effect":  _safe_compute(_compute_exercise_workout_position,   sessions, daily_workouts, ex_name,     default=[],  label="workout_pos_effect"),
+                "inter_exercise_correlation": _safe_compute(_compute_inter_exercise_correlation, sessions, ex_name, daily_workouts,    default=[],  label="inter_ex_corr"),
+                "dow_e1rm_pattern":         _safe_compute(_compute_exercise_dow_e1rm,           sessions,                              default={"by_day": [], "comparison": None},              label="dow_e1rm"),
+                "bw_strength_correlation":  _safe_compute(_compute_bw_strength_correlation,     sessions, period_bw_entries,           default={},  label="bw_strength_corr"),
+                "learning_curve":           _safe_compute(_compute_learning_curve,              alltime_sessions,                      default={},  label="learning_curve"),
 
                 # Phase 2
-                "plateau_days":    plateau_days,
-                "phase2_triggered":phase2_triggered,
-                "full_comments":   full_comments,
+                "plateau_days":     plateau_days,
+                "phase2_triggered": phase2_triggered,
+                "full_comments":    full_comments,
             })
 
         # ── Global ─────────────────────────────────────────────────────────────
         mg_summary = _compute_muscle_group_summary(exercise_results)
-        rankings   = _compute_rankings(exercise_results)
 
         if agg_level != "session":
             for ex in exercise_results:
@@ -1825,23 +2242,186 @@ def collect(
             "query_end_date":           end_str,
             "aggregation_level":        agg_level,
             "total_exercises_analyzed": len(exercise_results),
-            "all_time_summary":         _compute_alltime_summary(all_training_dates, conn, pr_history),
+            "all_time_summary":         _safe_compute(_compute_alltime_summary,    all_training_dates, conn, pr_history,       default={},  label="alltime_summary"),
             "muscle_group_summary":     mg_summary,
-            "muscle_group_balance":     _compute_muscle_group_balance(mg_summary),
-            "training_consistency":     _compute_training_consistency(all_training_dates, start_str, end_str),
-            "day_of_week_patterns":     _compute_day_of_week_patterns(all_training_dates, start_str, end_str),
-            "seasonal_patterns":        _compute_seasonal_patterns(all_training_dates),
+            "muscle_group_balance":     _safe_compute(_compute_muscle_group_balance, mg_summary,                               default={},  label="mg_balance"),
+            "training_consistency":     _safe_compute(_compute_training_consistency, all_training_dates, start_str, end_str,   default={},  label="training_consistency"),
+            "day_of_week_patterns":     _safe_compute(_compute_day_of_week_patterns, all_training_dates, start_str, end_str,   default={},  label="dow_patterns"),
+            "seasonal_patterns":        _safe_compute(_compute_seasonal_patterns,    all_training_dates,                       default=[],  label="seasonal_patterns"),
             "daily_workouts":           daily_workouts,
-            "training_density":         _compute_training_density(daily_workouts),
+            "training_density":         _safe_compute(_compute_training_density,     daily_workouts,                           default={},  label="training_density"),
             "superset_patterns":        superset_patterns,
-            "exercise_lifecycle":       _compute_exercise_lifecycle(lifecycle_rows, end_str),
-            "rankings":                 rankings,
-            "bodyweight":               _process_bodyweight(period_bw_entries),
+            "exercise_lifecycle":       _safe_compute(_compute_exercise_lifecycle,   lifecycle_rows, end_str,                  default={},  label="exercise_lifecycle"),
+            "rankings":                 _safe_compute(_compute_rankings,             exercise_results,                         default={},  label="rankings"),
+            "bodyweight":               _safe_compute(_process_bodyweight,           period_bw_entries,                        default={"entries": [], "trend": "no_data", "current_kg": None}, label="bodyweight"),
             "goals":                    goal_projs,
             "exercises":                exercise_results,
         }
     finally:
         conn.close()
+
+
+def prepare_analysis_package(
+    query_period_days: Optional[int] = 90,
+    end_date_str:      Optional[str]  = None,
+    start_date_str:    Optional[str]  = None,
+    muscle_groups:     Optional[list] = None,
+    exercise_names:    Optional[list] = None,
+    aggregation_level: Optional[str]  = None,
+    include_phase2:    bool            = True,
+) -> dict:
+    """
+    Wrapper over collect() for the analytical pipeline.
+    Strips and trims raw data to hit 100-300 KB before sending to the
+    Analysis Agent. All pre-computed analytics are preserved. Only
+    raw series and full enumerations are trimmed.
+
+    What's stripped or trimmed
+    ──────────────────────────
+    session["sets"]
+        Individual set dicts. Pain, technique, form already aggregated
+        at session level or in pain_analysis["pain_occurrences"].
+
+    inter_exercise_correlation
+        Trimmed to top 5 entries per exercise (already sorted by
+        abs(mean_diff_e1rm) desc). Entries beyond 5 add noise, not insight.
+
+    bw_strength_correlation["ratios"]
+        Raw paired observations removed. pearson r, CI, n, trend, and
+        current_ratio are kept — the series itself is not needed.
+
+    exercise_lifecycle["all_exercises"]
+        Full 135-exercise list removed. active, dormant, abandoned, and
+        substitutions are kept — those are what the Analysis Agent uses.
+
+    daily_workouts
+        Removed. Workout-order structure is not needed for trend analysis.
+        superset_patterns (derived from daily_workouts) is kept.
+
+    e1rm_history
+        Trimmed to most recent 20 entries per exercise. The Analysis Agent
+        needs recent trend, not full all-time series.
+
+    full_comments (Phase 2)
+        Trimmed to most recent 150 comments per exercise. All-time comment
+        history beyond that adds context the Analysis Agent can't use in
+        one pass.
+
+    What's kept intact
+    ──────────────────
+    All session-level summaries (no sets), all progression stats, PR
+    (all-time + period), e1RM projection, rep ranges, training frequency,
+    all thin-data gated outputs (rest_performance_buckets,
+    consecutive_day_effect, inter_exercise_correlation top 5,
+    dow_e1rm_pattern), pain_analysis with pain_occurrences, goal
+    projections, rankings, muscle group summary, consistency, lifecycle
+    (active/dormant/abandoned/substitutions), seasonal patterns.
+    """
+    package = collect(
+        query_period_days=query_period_days,
+        end_date_str=end_date_str,
+        start_date_str=start_date_str,
+        muscle_groups=muscle_groups,
+        exercise_names=exercise_names,
+        aggregation_level=aggregation_level,
+        include_phase2=include_phase2,
+    )
+
+    for ex in package.get("exercises", []):
+
+        # Strip per-set arrays from sessions
+        for session in ex.get("sessions", []):
+            session.pop("sets", None)
+
+        if ex.get("is_cardio"):
+            dp  = ex.get("distance_progression") or {}
+            dup = ex.get("duration_progression") or {}
+            tf  = ex.get("training_frequency") or {}
+            raw_sessions = ex.get("sessions", [])
+
+            cardio_ex = {
+                "name":     ex.get("name"),
+                "category": ex.get("category"),
+                "is_cardio": True,
+                "total_sessions_period": dp.get("session_count") or dup.get("session_count"),
+                "all_time_sessions": ex.get("learning_curve", {}).get("total_alltime_sessions"),
+                "sessions": [
+                    {
+                        "date":             s.get("date"),
+                        "distance_km":      s.get("total_distance") or s.get("distance_km"),
+                        "duration_seconds": s.get("total_duration_seconds") or s.get("duration_seconds"),
+                    }
+                    for s in raw_sessions
+                ],
+                "progression": {
+                    "distance_start_km":       dp.get("distance_start_km"),
+                    "distance_end_km":         dp.get("distance_end_km"),
+                    "distance_peak_km":        dp.get("distance_peak_km"),
+                    "distance_peak_date":      dp.get("distance_peak_date"),
+                    "distance_avg_km":         dp.get("avg_distance_km"),
+                    "distance_total_km":       dp.get("total_distance_km"),
+                    "duration_start_seconds":  dup.get("duration_start_seconds"),
+                    "duration_end_seconds":    dup.get("duration_end_seconds"),
+                    "duration_peak_seconds":   dup.get("duration_peak_seconds"),
+                    "duration_peak_date":      dup.get("duration_peak_date"),
+                    "duration_change_pct":     dup.get("duration_change_pct"),
+                    "sessions_in_period":      dp.get("session_count") or dup.get("session_count"),
+                },
+                "last_session_date":  tf.get("last_session_date"),
+                "days_since_last":    tf.get("days_since_last"),
+            }
+
+            ex.clear()
+            ex.update(cardio_ex)
+
+            exc_name = cardio_ex.get("name", "")
+            lifecycle = package.get("exercise_lifecycle", {})
+            for section in lifecycle.values():
+                if isinstance(section, list):
+                    section[:] = [
+                        e for e in section
+                        if e.get("exercise_name") != exc_name
+                        and e.get("name") != exc_name
+                    ]
+                elif isinstance(section, dict):
+                    section.pop(exc_name, None)
+            continue
+
+        # Trim inter_exercise_correlation to top 5
+        # (already sorted by abs(mean_diff_e1rm) desc)
+        if ex.get("inter_exercise_correlation"):
+            ex["inter_exercise_correlation"] = \
+                ex["inter_exercise_correlation"][:5]
+
+        # Strip raw ratios from bw_strength_correlation — keep stats only
+        bw = ex.get("bw_strength_correlation")
+        if isinstance(bw, dict) and "ratios" in bw:
+            bw.pop("ratios", None)
+
+        # Trim e1rm_history to most recent 20 entries
+        if ex.get("e1rm_history"):
+            ex["e1rm_history"] = ex["e1rm_history"][-20:]
+
+        # Trim full_comments to most recent 150 (Phase 2 exercises only)
+        if ex.get("full_comments"):
+            ex["full_comments"] = ex["full_comments"][-150:]
+
+    # Strip exercise_lifecycle full list — keep active/dormant/abandoned/
+    # substitutions only
+    lifecycle = package.get("exercise_lifecycle")
+    if isinstance(lifecycle, dict):
+        lifecycle.pop("all_exercises", None)
+
+    # Strip daily_workouts — workout-order detail not needed for analysis
+    package.pop("daily_workouts", None)
+
+    try:
+        size_kb = len(json.dumps(package).encode()) / 1024
+        logger.debug("[prepare_analysis_package] package size: %.1f KB", size_kb)
+    except Exception:
+        pass
+
+    return package
 
 
 # ── Verification ───────────────────────────────────────────────────────────────
@@ -1922,9 +2502,10 @@ def _print_exercise(data: dict, exercise_name: str) -> None:
     prog = ex["progression"]
     if prog:
         print(f"\n  PROGRESSION")
+        pct_str = f"({prog['weight_change_pct']:+.1f}%)" if prog['weight_change_pct'] is not None else "(started from 0)"
         print(f"    {prog['first_session_date']} -> {prog['last_session_date']}  "
               f"{prog['display_weight_start']} -> {prog['display_weight_end']}  "
-              f"({prog['weight_change_pct']:+.1f}%)  e1RM: {prog['e1rm_start']} -> {prog['e1rm_end']}")
+              f"{pct_str}  e1RM: {prog['e1rm_start']} -> {prog['e1rm_end']}")
         if prog.get("plateau_since"):
             print(f"    Plateau since {prog['plateau_since']} ({ex['plateau_days']} days)")
         if prog.get("regression_from_peak"):
@@ -1935,10 +2516,14 @@ def _print_exercise(data: dict, exercise_name: str) -> None:
             dr = prog["diminishing_returns"]
             print(f"    Returns: {dr['pattern']}  "
                   f"{dr['early_rate_per_month']:+.2f} -> {dr['recent_rate_per_month']:+.2f} /mo")
-    if ex["pr"]:
+    if ex.get("pr"):
         pr = ex["pr"]
-        print(f"\n  PR  {pr['weight']} {ex['unit']} x {pr['reps']}  "
+        print(f"\n  PR (all-time)  {pr['weight']} {pr['unit']} x {pr['reps']}  "
               f"({pr['date']})  e1RM={pr['estimated_1rm']}")
+    if ex.get("pr_period"):
+        pp = ex["pr_period"]
+        print(f"  PR (period)    {pp['weight']} {pp['unit']} x {pp['reps']}  "
+              f"({pp['date']})  e1RM={pp['estimated_1rm']}")
     freq = ex["training_frequency"]
     if freq:
         gap_str = f"{freq['avg_days_between']}d" if freq.get('avg_days_between') is not None else "N/A"
@@ -1958,15 +2543,24 @@ def _print_exercise(data: dict, exercise_name: str) -> None:
         print(f"  TECHNIQUES  " +
               "  ".join(f"{tv['variant']}(n={tv['session_count']},e1RM={tv['avg_e1rm']})"
                         for tv in ex["technique_variants"]))
-    if ex.get("rest_performance_buckets"):
-        print(f"  REST EFFECT " +
-              "  ".join(f"{b['rest_range']}:{b['avg_e1rm']}"
-                        for b in ex["rest_performance_buckets"]))
+    rpb = ex.get("rest_performance_buckets") or {}
+    if rpb.get("buckets"):
+        bucket_str = "  ".join(
+            f"{b['rest_range']}(n={b['n']},mean={b['mean_e1rm']},ci={b['ci_95']})"
+            for b in rpb["buckets"])
+        print(f"  REST EFFECT  {bucket_str}")
+        if rpb.get("comparison"):
+            c = rpb["comparison"]
+            print(f"    → best={c['best_bucket']} vs {c['worst_bucket']}  "
+                  f"diff={c['mean_diff_e1rm']}  d={c['cohen_d']}  "
+                  f"ci_overlap={c['cis_overlap']}  [{c['confidence_label']}]")
     if ex.get("inter_exercise_correlation"):
         print(f"  INTER-EX (top 3)")
         for c in ex["inter_exercise_correlation"][:3]:
             print(f"    {c['preceding_exercise']:35s}  "
-                  f"diff={c['e1rm_diff_pct']:+.1f}%  {c['effect']}")
+                  f"diff={c['mean_diff_e1rm']:+.1f}  d={c['cohen_d']}  "
+                  f"n={c['n_preceded']}v{c['n_not_preceded']}  "
+                  f"ci_overlap={c['cis_overlap']}  [{c['confidence_label']}]  {c['effect']}")
     lc = ex.get("learning_curve", {})
     if lc:
         print(f"  LEARNING    first={lc['first_ever_session']}  "
@@ -2040,13 +2634,32 @@ if __name__ == "__main__":
     period   = args[0] if len(args) > 0 else "90"
     end_arg  = args[1] if len(args) > 1 and _looks_like_date(args[1]) else None
     offset   = 1 if end_arg else 0
-    ex1      = args[1 + offset] if len(args) > 1 + offset and not _looks_like_date(args[1 + offset]) else "Lat Pulldown"
-    ex2      = args[2 + offset] if len(args) > 2 + offset else "Machine Wrist Extension"
+    ex_args  = [a for a in args[1 + offset:] if not _looks_like_date(a)]  # exercise names — empty = summary only, no default
     period_val = None if period.lower() == "all" else int(period)
     print(f"\n{'='*72}")
     print(f"  Data Agent — Complete  |  period={period}")
     print(f"{'='*72}")
     data = collect(query_period_days=period_val, end_date_str=end_arg)
     _print_summary(data)
-    _print_exercise(data, ex1)
-    _print_exercise(data, ex2)
+    if not ex_args:
+        print(f"\n  (no exercises specified — pass names after period to see detail)")
+        print(f'  e.g. python src/data_agent.py 90 "" "Lat Pulldown" "Flat Dumbbell Bench Press"')
+    else:
+        for ex_name in ex_args:
+            _print_exercise(data, ex_name)
+
+    # ── Size comparison ──────────────────────────────────────────────────
+    try:
+        raw_kb = len(json.dumps(data).encode()) / 1024
+        pkg    = prepare_analysis_package(
+                     query_period_days=period_val, end_date_str=end_arg)
+        pkg_kb = len(json.dumps(pkg).encode()) / 1024
+        reduction = 100 * (1 - pkg_kb / raw_kb) if raw_kb > 0 else 0
+        print(f"\n{'─'*72}")
+        print(f"  PACKAGE SIZE")
+        print(f"  collect() with sets:          {raw_kb:>8.1f} KB")
+        print(f"  prepare_analysis_package():   {pkg_kb:>8.1f} KB")
+        print(f"  Reduction:                    {reduction:>7.0f}%")
+        print(f"{'─'*72}")
+    except Exception as e:
+        print(f"\n  [size comparison failed: {e}]")
