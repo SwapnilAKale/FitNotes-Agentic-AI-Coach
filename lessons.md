@@ -1197,3 +1197,127 @@ Deterministic beats flexible when correctness matters — confirmed again
 Two sources of truth for the same fact will diverge — confirmed with EXCLUDED_CATEGORY_IDS
 
 When the same lesson appears independently in two different architectural contexts, it is genuinely a fundamental principle, not a one-off observation.
+
+---
+
+## Multi-Agent System: Building the Analysis Agent and Coordinator
+
+### The name resolver should be the first thing in any new data pipeline
+
+A classifier extracted "walking" (lowercase). The database has "Walking" (capital W).
+The exercise name filter silently found no match and fell back to building a package
+for all 50 exercises. Every downstream answer was reading the wrong data.
+
+The 5-tier exercise name resolver already existed in the codebase. It handles case,
+typos, compound words, and plural/singular variants. Wiring it into the Coordinator
+before passing names to the Data Agent fixed the bug in one step.
+
+Lesson: name resolution is infrastructure, not a nice-to-have. Every component that
+accepts user-provided or LLM-extracted strings and queries a database needs a resolver
+in between. Do not assume the LLM will produce exact database values.
+
+### Test the component in isolation before debugging the pipeline
+
+The Analysis Agent was suspected of being unable to analyze cardio data. Dozens of
+system prompt and data structure changes were attempted. None fixed it.
+
+Running the Analysis Agent directly with a correct package answered the Walking
+question perfectly in one shot. The Analysis Agent was never the problem.
+
+Lesson: when a pipeline produces a wrong answer, test each component independently
+before assuming the reasoning component is at fault. Build a one-file test harness
+that calls the component directly. The bug that seems like an LLM reasoning failure
+is often a data or routing bug upstream.
+
+### Training priors fill gaps in the data — give the model what it expects
+
+The Analysis Agent consistently hallucinated "78 sessions" for Walking even though
+that number was not in the package. The number was plausible (78 Walking sessions
+over 15 months is reasonable) and nothing in the package contradicted it.
+
+The grounding check passed it, inventing a verification source ("Verified against
+exercise_lifecycle.active") that no longer existed. Both models were filling gaps
+with plausible values.
+
+Adding `all_time_sessions: 78` explicitly to the package stopped the hallucination
+immediately. The model was not broken — it expected a session count field to exist
+(fitness apps always show one) and invented a value when it didn't find it.
+
+Lesson: when a model repeatedly produces the same hallucinated value across multiple
+prompt variations, the value probably represents a field it expected to find. Add the
+real value to the data. Suppressing the output through instruction is less reliable
+than satisfying the expectation through data.
+
+### Grounding checks catch contradictions; they do not catch plausible fabrications
+
+The grounding check was designed to remove claims directly contradicted by the
+package. It works well for this. But when an LLM produces a plausible-sounding
+number that has no corresponding field in the package — nothing contradicts it —
+the grounding check passes it and may even invent a fake verification source.
+
+Lesson: grounding checks are not a complete fabrication shield. They are a
+contradiction detector. Claims that are plausible but fabricated (session counts,
+dates, typical gym values) can pass through. The correct fix is upstream: ensure
+the data contains the real values so the model reads them rather than inventing them.
+
+### Type-agnostic analysis requires explicit instruction and clean data structures
+
+The Analysis Agent treated Walking as a "lifestyle activity" with no performance
+metrics despite having distance_km and duration_seconds in every session.
+
+Two things fixed it:
+1. Explicit system prompt rule: "Every exercise logged was deliberately tracked by
+   the user. The act of logging is the signal that it matters. Do not treat any
+   exercise as a lifestyle or recreational activity."
+2. Clean cardio-only data structure: removing all strength fields (max_working_weight,
+   reps_at_max, estimated_1rm, volume — all zero for cardio) so the model doesn't
+   pattern-match zero-valued fields to "empty record."
+
+Lesson: models have strong priors about what constitutes "real" training data. When
+exercise data doesn't fit the expected pattern (weights and reps), the model may
+dismiss it. Override this with explicit instruction AND clean data — one without the
+other is not reliable.
+
+### Shared infrastructure belongs in shared/ from day one
+
+The exercise name resolver was duplicated as inline logic inside the MCP server.
+When the Coordinator needed name resolution, it couldn't access the MCP server
+directly. Either the logic had to be duplicated or a shared module had to be created.
+
+Extracting to `src/shared/resolver.py` required no behavior changes — the MCP server
+became a thin wrapper, the Coordinator imported the same function.
+
+Lesson: any logic used by more than one component belongs in a shared module from
+the moment the second caller appears. Inline implementation in one place means
+either duplication or awkward coupling when the second caller arrives.
+
+### Two exercise types need two clean data structures
+
+Cardio exercises and strength exercises produce fundamentally different data. Using
+the same package structure for both — with strength fields set to zero for cardio —
+confused the Analysis Agent. Zero-valued strength fields pattern-match to "empty
+record" in a model trained on gym data.
+
+The fix: detect `is_cardio` in `prepare_analysis_package()` and build a completely
+different structure with only the relevant fields: distance, duration, progression,
+frequency. No zeros, no irrelevant fields, no ambiguity.
+
+Lesson: when two data types share the same schema but with most fields inapplicable
+to one type, it is better to have two schemas than one schema with zeros. Zeros are
+ambiguous — they can mean "not applicable" or "failed attempt" or "empty data."
+Explicit structure removes the ambiguity.
+
+### exercise_lifecycle key was 'exercise_name', not 'name'
+
+A deletion loop that should have removed cardio exercises from exercise_lifecycle
+silently failed for multiple iterations. The loop checked `e.get("name")` but the
+actual key in exercise_lifecycle entries is `e.get("exercise_name")`.
+
+The check returned None for every entry. `None != "Walking"` is always True. Nothing
+was filtered. The data was never deleted. The diagnostic that should have caught
+this only printed entries where the key was found — silence meant "not found" but
+was interpreted as "already deleted."
+
+Lesson: when a deletion or filter loop produces no errors but also produces no
+changes, the silent path is usually a key name mismatch. Print the first entry of
+the structure being filtered before writing the filter condition.

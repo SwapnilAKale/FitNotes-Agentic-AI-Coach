@@ -314,3 +314,136 @@ Every architectural decision has a documented reason in lessons.md including wha
 
 License
 MIT
+
+---
+
+## Tech Stack — Multi-Agent Additions (update existing table)
+
+| Component | Technology |
+|-----------|-----------|
+| Analysis Agent | Gemini 3.1 Flash Lite, thinking_budget=4096, grounding check |
+| Coordinator | Gemini 3.1 Flash Lite, temperature=0, routing + coverage check |
+| Shared Resolver | src/shared/resolver.py — 5-tier exercise name resolution |
+| Cardio Package | Clean per-type data structure, no strength fields for cardio |
+
+---
+
+## Project Structure — add to src/ section
+
+```
+src/
+├── analysis_agent.py     # Analysis Agent — analyze(), ground_check(), run()
+├── coordinator.py        # Coordinator — route(), classify, analytical pipeline
+├── shared/
+│   ├── __init__.py
+│   └── resolver.py       # Shared 5-tier exercise name resolver
+```
+
+---
+
+## Multi-Agent System — replace planned sections with verified
+
+**Analysis Agent (`src/analysis_agent.py`) — complete**
+
+Receives `prepare_analysis_package()` output. One Gemini call with
+`thinking_budget=4096`. Returns a draft answer. A separate grounding
+check call verifies every numerical claim against the package and edits
+inline — removes claims directly contradicted by the data, qualifies
+correlational claims with small sample sizes. Never requests more data.
+
+System prompt is type-agnostic: the agent analyzes whatever metrics are
+present — weights and reps for strength, distance and duration for
+cardio, comments for any exercise type. "Every exercise logged was
+deliberately tracked and deserves performance analysis."
+
+**Coordinator (`src/coordinator.py`) — complete**
+
+Single entry point for every user message. One classification call
+(temperature=0, thinking_budget=0) extracts route, exercise_names,
+muscle_groups, query_period_days. Routes to:
+- Analytical: Data Agent → prepare_analysis_package() → Analysis Agent
+  → grounding check → coverage check (1 retry if incomplete)
+- Operational: existing AgentSession.answer() via MCP tools
+
+Exercise names from the classifier are resolved through
+`src/shared/resolver.py` before building the package. This handles
+case differences, typos, compound words, and plural/singular variants.
+
+**Shared Resolver (`src/shared/resolver.py`) — complete**
+
+Extracted from `mcp_servers/combined_server.py`. Same 5-tier logic:
+space-normalised exact → case-insensitive exact → partial LIKE →
+plural/singular expansion → fuzzy difflib ≥ 0.75. Used by both the
+Coordinator (before building the analytical package) and the MCP server
+(single-agent tool calls). One implementation, two callers.
+
+**Cardio exercise data structure — complete**
+
+Cardio exercises (is_cardio=True) receive a clean, purpose-built
+structure in `prepare_analysis_package()` with no strength fields:
+`sessions` (date, distance_km, duration_seconds), `progression`
+(distance and duration trend), `last_session_date`, `days_since_last`,
+`all_time_sessions`, `total_sessions_period`. Strength-specific fields
+(max_working_weight, reps_at_max, estimated_1rm, volume, etc.) are
+stripped entirely. The exercise is also removed from
+`exercise_lifecycle` so the Analysis Agent cannot anchor on all-time
+summary counts instead of period-specific progression data.
+
+---
+
+## What Each Component Built — add rows
+
+| Stage / Component | What Was Built |
+|---|---|
+| **multi-agent** | **Analysis Agent — grounding check, type-agnostic system prompt, thinking_budget=4096** |
+| **multi-agent** | **Coordinator — routing, coverage check, shared resolver integration** |
+| **multi-agent** | **shared/resolver.py — 5-tier name resolver extracted from MCP server** |
+| **multi-agent** | **Cardio data structure — clean per-type package, no strength fields for cardio exercises** |
+
+---
+
+## Key Lessons — add
+
+**The name resolver should be the first thing wired into any new data pipeline.**
+A single case mismatch ("walking" vs "Walking") caused the classifier to pass an
+unmatched exercise name to the Data Agent. The filter silently fell back to all
+50 exercises, the package was built for the wrong scope, and the Analysis Agent
+produced wrong answers. Hours of debugging the Analysis Agent's "understanding"
+of cardio data. The resolver already existed and solved the problem in one step.
+Wire it early, not as an afterthought.
+
+**Test the component in isolation before debugging the pipeline.**
+Running `chat_analysis_agent.py` — a direct call to the Analysis Agent with the
+correct package — answered the Walking question perfectly in one shot. The bug
+was never in the Analysis Agent. Direct isolation testing reveals this in seconds;
+pipeline debugging can chase it for hours.
+
+**Training priors fill gaps in the data.**
+When the Analysis Agent couldn't find a total session count for Walking (the field
+didn't exist in the package), it hallucinated a plausible number (78) from its
+training data about fitness apps. Adding `all_time_sessions: 78` to the package
+immediately stopped the hallucination. The model wasn't broken — it was filling
+in a field it expected to exist. The fix is to give it the data, not to suppress
+the output.
+
+**Type-agnostic analysis requires explicit instruction.**
+The Analysis Agent defaulted to treating Walking as a "lifestyle activity" with
+no performance metrics. Adding "every exercise logged was deliberately tracked —
+the act of logging is the signal that it matters" to the system prompt fixed this.
+Models have strong priors about what counts as "real" training data. Override them
+explicitly or the model will silently ignore valid exercise data.
+
+**Grounding checks can hallucinate their own verification sources.**
+When the Analysis Agent fabricated "78 sessions," the grounding check passed it
+with "Verified against exercise_lifecycle.active for Walking" — even after Walking
+had been removed from exercise_lifecycle. The grounding checker invented a source
+to justify keeping a plausible-sounding number. Grounding checks catch direct
+contradictions reliably; they do not reliably catch hallucinated values that happen
+to be plausible.
+
+**Two different output structures for two different exercise types.**
+Cardio exercises and strength exercises produce fundamentally different data.
+Putting both through the same package structure (strength fields set to zero for
+cardio) confused the Analysis Agent because fitness-app training data associates
+all-zero strength fields with "empty" or "failed" records. A clean, purpose-built
+structure for each type eliminates the ambiguity.

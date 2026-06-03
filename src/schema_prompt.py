@@ -1,5 +1,6 @@
 import json
 import os
+from datetime import datetime
 from pathlib import Path as _Path
 
 _SCHEMA = """
@@ -16,7 +17,7 @@ One row per set performed. This is the primary table.
 | date                | TEXT    | ISO format: YYYY-MM-DD                     |
 | metric_weight       | REAL    | Weight in **kilograms**                    |
 | reps                | INTEGER | Repetitions performed                      |
-| distance            | INTEGER | Distance in meters (cardio exercises)      |
+| distance            | REAL    | Distance in **kilometers** — do NOT divide by 1000. SUM(distance) gives km directly. A value of 0.83 means 0.83 km. |
 | duration_seconds    | INTEGER | Duration in seconds (cardio / timed sets)  |
 | is_personal_record  | INTEGER | 1 if this set was a PR, 0 otherwise        |
 
@@ -236,8 +237,39 @@ SET STRUCTURE:
 
 
 def build_schema_prompt() -> str:
-    ctx = load_user_context()
-    schema = _SCHEMA.strip()
+    today        = datetime.now().strftime("%Y-%m-%d")
+    current_year = datetime.now().strftime("%Y")
+
+    latest_date = today
+    try:
+        from src.db import get_connection
+        db_path = os.environ.get("FITNOTES_DB_PATH", "data/FitNotes_Backup.fitnotes")
+        conn    = get_connection(db_path)
+        row     = conn.execute("SELECT MAX(date) FROM training_log").fetchone()
+        if row and row[0]:
+            latest_date = row[0]
+        conn.close()
+    except Exception:
+        pass
+
+    date_context = f"""\
+DATE CONTEXT AND TEMPORAL INTERPRETATION:
+- Today's date: {today}
+- Latest workout entry in database: {latest_date}
+- "this year" / "this calendar year" → the current calendar year:
+  date >= '{current_year}-01-01'
+- "in the last year" / "over the past year" / "progress in a year" /
+  "in a year" → a rolling 12-month window counting back from the
+  LATEST workout entry, not from today:
+  date >= date('{latest_date}', '-1 year')
+- "lately" / "recently" → last 30 days from the latest entry:
+  date >= date('{latest_date}', '-30 days')
+- "last month" → date >= date('{latest_date}', '-1 month')
+Use the latest workout entry as the anchor for relative ranges because
+the user's data may not extend to today."""
+
+    ctx            = load_user_context()
+    schema         = date_context + "\n\n" + _SCHEMA.strip()
     user_ctx_block = build_user_context_prompt(ctx)
     if user_ctx_block:
         return schema + "\n\n" + user_ctx_block

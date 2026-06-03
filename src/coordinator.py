@@ -112,12 +112,25 @@ PARAMETER EXTRACTION (analytical route only):
     "all time" / "ever"  → null
     not specified        → 90  (default)
 
+CUSTOM SQL (analytical route only):
+  Set needs_custom_sql=true ONLY for analytical questions that require a
+  cross-cutting query the per-exercise package cannot answer: queries
+  spanning multiple exercises on the same day, gaps between sessions,
+  day-of-week patterns, streaks, or total counts/aggregates across all
+  exercises. For these, set custom_sql_intent to a short description of
+  what to query. For normal per-exercise questions (progression, PRs,
+  plateaus, form), set needs_custom_sql=false and custom_sql_intent=null.
+  Custom SQL is for counts, dates, gaps, and patterns — never for
+  reporting individual set weights, which the package already covers.
+
 Return ONLY valid JSON, no preamble, no markdown fences:
 {
   "route": "analytical" | "operational",
   "exercise_names": ["..."] | null,
   "muscle_groups": ["..."] | null,
-  "query_period_days": 90 | null
+  "query_period_days": 90 | null,
+  "needs_custom_sql": false,
+  "custom_sql_intent": null
 }
 """.strip()
 
@@ -214,10 +227,12 @@ class Coordinator:
         Defaults to operational on any failure — safe fallback.
         """
         default = {
-            "route":             "operational",
-            "exercise_names":    None,
-            "muscle_groups":     None,
-            "query_period_days": 90,
+            "route":              "operational",
+            "exercise_names":     None,
+            "muscle_groups":      None,
+            "query_period_days":  90,
+            "needs_custom_sql":   False,
+            "custom_sql_intent":  None,
         }
         try:
             config = types.GenerateContentConfig(
@@ -253,6 +268,8 @@ class Coordinator:
             params.setdefault("exercise_names",    None)
             params.setdefault("muscle_groups",     None)
             params.setdefault("query_period_days", 90)
+            params.setdefault("needs_custom_sql",  False)
+            params.setdefault("custom_sql_intent", None)
             return params
 
         except Exception as e:
@@ -340,12 +357,27 @@ class Coordinator:
             scoped_question = question
 
         # Stubs — replace when shared modules are built
-        research = None   # TODO: shared/rag.py pre-fetch
-        memories = None   # TODO: shared/memory.py retrieval
+        try:
+            from src.shared.rag import search_fitness_knowledge
+            research = search_fitness_knowledge(question) or None
+        except Exception:
+            research = None
+        try:
+            from src.shared.memory import retrieve_relevant_memories
+            memories = retrieve_relevant_memories(question) or None
+        except Exception:
+            memories = None
+
+        # Supplementary cross-cutting SQL (counts, dates, gaps, patterns)
+        custom_query = None
+        if params.get("needs_custom_sql") and params.get("custom_sql_intent"):
+            custom_query = await self._generate_custom_sql(
+                question, params["custom_sql_intent"]
+            )
 
         # First pass
         answer, flagged = await analysis_run(
-            pkg, scoped_question, research, memories, conversation_context
+            pkg, scoped_question, research, memories, conversation_context, custom_query
         )
 
         # Coverage check (question + answer only, no data)
@@ -365,12 +397,42 @@ class Coordinator:
                 },
             ]
             answer, flagged2 = await analysis_run(
-                pkg, scoped_question, research, memories, retry_context
+                pkg, scoped_question, research, memories, retry_context, custom_query
             )
             flagged.extend(flagged2)
             # No second coverage check — return best effort
 
         return answer, flagged
+
+    # ── Custom SQL ────────────────────────────────────────────────────────────
+
+    async def _generate_custom_sql(self, question: str, intent: str) -> dict | None:
+        """
+        Generate and run one supplementary SQL query for a cross-cutting
+        question. Returns {"intent", "rows", "row_count"} or None on failure.
+        """
+        try:
+            from src.llm import generate_sql
+            from src.schema_prompt import build_schema_prompt
+            from src.data_agent import query as run_custom_query
+
+            schema = build_schema_prompt()
+            prompt_question = (
+                f"{question}\n\n"
+                f"Focus: {intent}. Return counts, dates, gaps, or patterns. "
+                f"Do not return individual set weights."
+            )
+            sql = await asyncio.to_thread(generate_sql, prompt_question, schema)
+            result = await asyncio.to_thread(run_custom_query, sql)
+            if result.get("row_count", 0) == 0:
+                return None
+            return {
+                "intent":    intent,
+                "rows":      result.get("rows", []),
+                "row_count": result.get("row_count", 0),
+            }
+        except Exception:
+            return None
 
     # ── Operational path ──────────────────────────────────────────────────────
 

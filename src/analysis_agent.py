@@ -335,12 +335,35 @@ def _fmt_conversation(conversation_context: Optional[list]) -> str:
     return "\n".join(lines)
 
 
+def _fmt_custom_query(custom_query: Optional[dict]) -> str:
+    if not custom_query:
+        return ""
+    intent = custom_query.get("intent", "")
+    rows   = custom_query.get("rows", [])
+    count  = custom_query.get("row_count", len(rows))
+    lines = ["[SUPPLEMENTARY QUERY RESULT]"]
+    if intent:
+        lines.append(f"This cross-cutting query answers: {intent}")
+    lines.append(f"Rows returned: {count}")
+    import json as _json
+    lines.append(_json.dumps(rows, indent=2, default=str)[:3000])
+    lines.append(
+        "Note: this is a supplementary database query for a cross-cutting "
+        "question the main package does not cover (counts, dates, gaps, "
+        "patterns). Any weight values here are typed values in lbs — they "
+        "do not include bar weights or offsets, so use them for counts, "
+        "dates, and trends, not for exact weight claims."
+    )
+    return "\n".join(lines)
+
+
 def _build_user_message(
     package:              dict,
     question:             str,
     research:             Optional[list],
     memories:             Optional[list],
     conversation_context: Optional[list],
+    custom_query:         Optional[dict] = None,
 ) -> str:
     try:
         package_json = json.dumps(package, indent=2)
@@ -348,13 +371,19 @@ def _build_user_message(
         logger.warning("[analysis_agent] package serialisation failed: %s", e)
         package_json = "{}"
 
-    return "\n\n".join([
+    sections = [
         "[WORKOUT PACKAGE]\n" + package_json,
         _fmt_research(research),
+    ]
+    custom_block = _fmt_custom_query(custom_query)
+    if custom_block:
+        sections.append(custom_block)
+    sections.extend([
         _fmt_memories(memories),
         _fmt_conversation(conversation_context),
         f"[QUESTION]\n{question}",
     ])
+    return "\n\n".join(sections)
 
 
 # ── Core functions ────────────────────────────────────────────────────────────
@@ -365,6 +394,7 @@ async def analyze(
     research:             Optional[list] = None,
     memories:             Optional[list] = None,
     conversation_context: Optional[list] = None,
+    custom_query:         Optional[dict] = None,
 ) -> str:
     """
     Single Gemini call with thinking_budget=4096.
@@ -380,7 +410,7 @@ async def analyze(
         raise ValueError("package must not be empty")
 
     user_message = _build_user_message(
-        package, question, research, memories, conversation_context
+        package, question, research, memories, conversation_context, custom_query
     )
 
     response = await asyncio.to_thread(
@@ -507,6 +537,7 @@ async def run(
     research:             Optional[list] = None,
     memories:             Optional[list] = None,
     conversation_context: Optional[list] = None,
+    custom_query:         Optional[dict] = None,
 ) -> tuple[str, list]:
     """
     Full analysis pipeline: generate draft → ground check.
@@ -526,7 +557,7 @@ async def run(
                           package_value} for debugging
     """
     draft   = await analyze(
-        package, question, research, memories, conversation_context
+        package, question, research, memories, conversation_context, custom_query
     )
     grounded, flagged = await ground_check(draft, package)
     return grounded, flagged
