@@ -30,7 +30,7 @@ from typing import Optional
 from google import genai
 from google.genai import types
 
-from src.data_agent import prepare_analysis_package
+from src.data_agent import prepare_analysis_package, DataAgentIntegrityError
 from src.analysis_agent import run as analysis_run
 
 logger = logging.getLogger(__name__)
@@ -197,6 +197,23 @@ class Coordinator:
         if route == "analytical":
             try:
                 answer, flagged = await self._run_analytical(question, params)
+            except DataAgentIntegrityError as e:
+                ids_str = ", ".join(v.invariant_id for v in e.violations)
+                logger.error(
+                    "[coordinator] data integrity check failed: %s\n  %s",
+                    ids_str,
+                    "\n  ".join(
+                        f"{v.invariant_id}: {v.message}" for v in e.violations
+                    ),
+                )
+                error  = str(e)
+                answer = (
+                    f"I cannot answer this question right now. "
+                    f"A data integrity check failed ({ids_str}). "
+                    f"The analytical pipeline was stopped to prevent "
+                    f"incorrect analysis from reaching you. "
+                    f"Please try again or contact support if this persists."
+                )
             except Exception as e:
                 logger.error("[coordinator] analytical pipeline failed: %s", e)
                 # Fall back to operational on pipeline failure
@@ -330,6 +347,7 @@ class Coordinator:
         # Without this, filtered packages produce misleading statements
         # like "100% of your training volume" when only one muscle group
         # was fetched.
+        pkg_scope   = pkg.get("scope", "broad")
         scope_parts = []
         if exercise_names:
             scope_parts.append(
@@ -349,6 +367,20 @@ class Coordinator:
                 "total gym days across all exercises, not days specific "
                 "to the filtered group. Do not use it to state how many "
                 "times a muscle group or exercise was trained."
+            )
+
+        # Scope-specific analytical limitations note
+        if pkg_scope == "broad":
+            scope_parts.append(
+                "Note: broad analytical package — individual comment "
+                "histories are excluded. Use pain_analysis and "
+                "comment_keyword_trends for comment-based insights; "
+                "do NOT claim comment detail is unavailable in the data."
+            )
+        elif pkg_scope == "group":
+            scope_parts.append(
+                "Note: group analytical package — comment histories are "
+                "capped at 30 per exercise plus all pain-flagged entries."
             )
 
         if scope_parts:

@@ -197,8 +197,33 @@ User question
               │
               ▼
          Final answer
-Data Agent (src/data_agent.py)
-Pure Python, zero LLM calls. Always runs a fixed, complete pipeline regardless of the question.
+Data Agent (src/data_agent/)
+Pure Python, zero LLM calls. Structured as a four-module package:
+
+- fetch.py — all SQLite access; returns typed raw rows, no interpretation
+- process.py — pure function: (raw_rows, user_context) → package; no DB, no clock, no I/O
+- validate.py — independent post-condition checks; never recomputes, only asserts invariants
+- __init__.py — thin facades: collect(), prepare_analysis_package(); exports DataAgentIntegrityError
+
+Correctness spec and test suites:
+
+docs/data_agent_spec.md — invariants named after the bug each one catches, plus golden cases pinned to a DB snapshot
+tests/test_data_agent_golden.py — pinned results against the real database
+tests/test_data_agent_validate.py — synthetic per-invariant defect injection tests
+
+Validator behavior — runs on every package produced by collect() and prepare_analysis_package():
+
+Soft violations (G4 size ceiling, G5 scope leaks) are logged as warnings
+Any integrity violation (wrong units, PR below session max, negative weights, etc.) raises DataAgentIntegrityError
+The Coordinator catches DataAgentIntegrityError before calling the Analysis Agent and returns a clean failure message to the user — a wrong package can never reach the LLM
+
+Scope-aware packaging — the Coordinator derives scope from query filters; trim_package() builds accordingly:
+
+FOCUSED (≤ 3 named exercises): full detail — sessions, full_comments, all stat blocks, all aggregation levels
+GROUP (muscle-group filter): full_comments capped to 30 most recent + all pain-flagged entries; one aggregation level
+BROAD (no filter): full_comments removed; deep-stat blocks removed; one aggregation level (< 180 days → weekly, 180–730 days → monthly, > 730 days → yearly)
+BROAD 365-day package: 1 443 KB → 396 KB — resolves the free-tier 429 failures on general questions
+
 Phase 1 — Always runs for all exercises active in the query period:
 
 Session-level aggregation: max weight, e1RM, volume, form quality, pain flag per session
@@ -226,13 +251,6 @@ Output aggregation is time-based:
 ≤ 90 days → session-level detail
 ≤ 365 days → weekly aggregation
 All-time → monthly aggregation
-
-Stress-tested sizes:
-
-All exercises, 90-day, no Phase 2: 2.6 MB, 0.46s
-Single exercise + Phase 2: 112 KB, 0.09s
-Back group, 365-day: 282 KB, 0.17s
-All-time + Phase 2: 4.7 MB, 0.83s
 
 Analysis Agent (planned)
 Receives prepare_analysis_package() output — compact summaries with all comment-derived analytics, Phase 2 full comments for triggered exercises. Reasoning only, no data decisions. thinking_budget=4096. Never asks for more data — the package is complete.
@@ -308,7 +326,7 @@ The RAG pipeline (query rewriting, BM25, dense retrieval, cross-encoder rerankin
 The MCP server protocol is implemented directly using the mcp Python SDK
 The confirmation gate for write operations is an explicit CLI-level intercept, not a framework feature
 Long-term memory uses ChromaDB for semantic retrieval — same vector search used for the knowledge base
-The Data Agent (src/data_agent.py, multi-agent branch) is pure Python with zero LLM calls — deterministic, testable, debuggable
+The Data Agent (src/data_agent/, multi-agent branch) is a four-module pure-Python package (fetch / process / validate / __init__); zero LLM calls; the validator hard-stops on integrity violations before any wrong data can reach the LLM
 
 Every architectural decision has a documented reason in lessons.md including what went wrong when the first approach was tried. Every stage was implemented iteratively, verified against real data, and refactored when the design proved wrong.
 
@@ -447,3 +465,95 @@ Putting both through the same package structure (strength fields set to zero for
 cardio) confused the Analysis Agent because fitness-app training data associates
 all-zero strength fields with "empty" or "failed" records. A clean, purpose-built
 structure for each type eliminates the ambiguity.
+
+---
+
+# README Additions — Shared Modules & Custom SQL (Session 7, Part 2)
+
+Append to the relevant sections of README.md.
+
+---
+
+## Project Structure — add to src/shared/
+
+```
+src/shared/
+├── __init__.py
+├── resolver.py        # 5-tier exercise name resolution
+├── memory.py          # Read-only ChromaDB fact retrieval
+├── rag.py             # Fitness knowledge search with source labeling
+└── sql_executor.py    # Safe read-only SQL execution
+```
+
+---
+
+## Shared Modules — complete
+
+**src/shared/memory.py**
+`retrieve_relevant_memories(question) -> list[str]`. Read-only ChromaDB
+retrieval — memory writes stay on the single agent exclusively. Embeds the
+question against the user_memory collection (BAAI/bge-small-en-v1.5),
+returns up to 5 facts with cosine distance < 0.8. Returns [] on any error,
+never blocks the pipeline. Wired into the Coordinator's analytical path.
+
+**src/shared/rag.py**
+`search_fitness_knowledge(question) -> list | None`. Query rewriting →
+hybrid search (ChromaDB + BM25) → cross-encoder reranking → three-tier
+source labeling (user_article / pubmed-wikipedia / none). Returns results
+in the format the Analysis Agent's _fmt_research expects. Used for analytical
+questions where research context supports analysis of personal data;
+standalone research questions still route operational to the single agent's
+search_fitness_knowledge MCP tool.
+
+**src/shared/sql_executor.py**
+`run_query(sql, db_path) -> list[dict]`. Sanitization (curly quotes, em-dash),
+SELECT/WITH-only guard (rejects all write statements), LIMIT 10000 injection
+if absent, 30-second timeout via connection timer + interrupt. Errors
+propagate to caller. data_agent.query() was refactored to use this executor
+for execution, keeping the typed_weight conversion layer on top.
+
+---
+
+## Custom SQL Pipeline (Option B) — complete
+
+The Coordinator generates one supplementary SQL query for cross-cutting
+questions the per-exercise package cannot answer: gaps between sessions,
+day-of-week patterns, same-day exercise combinations, total counts and
+aggregates across all exercises.
+
+Flow: _classify() returns needs_custom_sql and custom_sql_intent →
+_generate_custom_sql() builds SQL via src/llm.generate_sql() with the
+schema from src/schema_prompt.build_schema_prompt() → runs via
+data_agent.query() (which uses shared/sql_executor) → result passed to the
+Analysis Agent as a labeled supplementary query result.
+
+Custom SQL is scoped to counts, dates, gaps, and patterns — never individual
+set weights, which the standard package already polishes (offsets, bar
+weights, units). Aggregate weights receive typed_weight conversion (kg→lbs);
+the result is labeled so the Analysis Agent treats those as typed values, not
+display values.
+
+---
+
+## Schema — Distance Column Correction
+
+The training_log.distance column is stored in KILOMETERS (REAL), not meters.
+The schema description previously documented it as integer meters. This was
+never caught because the data_agent package reads distance directly (correct)
+and no other code queried the column until custom SQL. The schema now
+correctly states distance is in km — SUM(distance) gives kilometers directly,
+never divide by 1000.
+
+---
+
+## Temporal Interpretation in SQL Generation
+
+build_schema_prompt() now injects a DATE CONTEXT block with today's date and
+the latest workout entry in the database, plus interpretation rules:
+- "this year" → current calendar year (date >= 'YYYY-01-01')
+- "over the past year" / "in a year" → rolling 12 months back from the latest
+  DB entry (not from today, since the user's data may not be current)
+- "lately" / "recently" → 30 days back from the latest entry
+
+Relative ranges anchor to the latest workout entry because the user's data may
+not extend to today.

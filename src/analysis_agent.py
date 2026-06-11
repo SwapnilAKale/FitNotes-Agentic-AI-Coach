@@ -29,8 +29,13 @@ logger = logging.getLogger(__name__)
 
 # ── Gemini setup ──────────────────────────────────────────────────────────────
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-_client = genai.Client(api_key=GEMINI_API_KEY)
+_client = None
+
+def _get_client():
+    global _client
+    if _client is None:
+        _client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+    return _client
 
 ANALYSIS_MODEL  = "gemini-3.1-flash-lite"   # same as agent.py — free tier, supports thinking
 GROUNDING_MODEL = "gemini-3.1-flash-lite"   # no thinking needed for grounding check
@@ -88,6 +93,10 @@ Database values are absolute truth. The agent interprets the data —
   • Never recalculate, re-derive, or modify values from the package
   • If plateau_days = 76, write 76. If pr.weight = 130.0 lbs, write 130 lbs.
   • Use the units already in the package — never convert units yourself
+  • Pace is already calculated for you — each cardio session and the cardio
+    progression block carry pace in minutes per kilometre. Read it directly;
+    never derive pace yourself by dividing duration by distance. Never report
+    pace for an exercise that has no distance (e.g. cycling, dead hangs).
   • If a field is None or absent, it is unknown — do not substitute a guess
   • training_consistency counts all gym visits in the period across all
     exercises. Never use it to describe how often a specific muscle group
@@ -414,7 +423,7 @@ async def analyze(
     )
 
     response = await asyncio.to_thread(
-        _client.models.generate_content,
+        _get_client().models.generate_content,
         model=ANALYSIS_MODEL,
         contents=[types.Content(
             role="user",
@@ -476,7 +485,7 @@ async def ground_check(
     )
 
     response = await asyncio.to_thread(
-        _client.models.generate_content,
+        _get_client().models.generate_content,
         model=GROUNDING_MODEL,
         contents=[types.Content(
             role="user",

@@ -1321,3 +1321,114 @@ was interpreted as "already deleted."
 Lesson: when a deletion or filter loop produces no errors but also produces no
 changes, the silent path is usually a key name mismatch. Print the first entry of
 the structure being filtered before writing the filter condition.
+
+---
+
+## Shared Modules, Custom SQL & the Distance Schema Bug
+
+### A schema description that lies corrupts everything downstream that trusts it
+
+The training_log.distance column was documented as "integer, meters" in the schema
+prompt since the project began. It is actually REAL, stored in kilometers. This
+never surfaced because the deterministic data_agent package reads the column directly
+(and was therefore correct), and no other component queried distance — until the
+custom SQL pipeline arrived.
+
+The first cardio distance query through custom SQL divided by 1000 (trusting the
+"meters" description) and returned 0.014 km for a year of walking that was actually
+46 km. Off by a factor of 1000.
+
+Lesson: a schema description is an interface contract. Any component that generates
+queries from it inherits its errors. A wrong unit in the schema is invisible until
+something actually reads that column through the documented interface. When adding a
+new query path, verify the schema descriptions against real database values for the
+columns that path will touch — do not assume the existing description is correct just
+because the rest of the system works.
+
+### A new query path exposes latent schema bugs the old paths hid
+
+The data_agent package never divided distance by 1000 — it read the raw value and
+treated it as km, which happened to be correct. The schema description said meters,
+but no code ever acted on that description, so the lie was harmless. The moment an
+LLM-driven SQL generator read the schema and acted on "meters," the bug became real.
+
+Lesson: latent documentation bugs are activated by new consumers. When you add a
+component that reads documentation the system has been ignoring (a SQL generator
+reading column descriptions, a new agent reading field semantics), expect to surface
+errors that were dormant. Budget for verification, not just integration.
+
+### Read-only by construction for shared retrieval modules
+
+shared/memory.py is read-only by design — memory writes stay exclusively on the
+single agent. The analytical pipeline retrieves facts but never creates them. This
+prevents the multi-agent pipeline from corrupting the memory store with
+analysis-derived assertions, and keeps a single source of truth for writes.
+
+Lesson: when extracting shared modules from a system with read and write operations,
+split them. Give the new consumers read-only interfaces. Concentrate writes in one
+place. A retrieval module that can also write is a future consistency bug.
+
+### Route research questions to the tool, analysis questions to the pipeline
+
+Standalone research questions ("what does science say about X") route to the single
+agent's search_fitness_knowledge MCP tool. The shared RAG module is for when the
+Analysis Agent needs research context to support analysis of the user's own training
+data. Same underlying retrieval, different entry points based on whether the question
+is about the user's data or about general fitness science.
+
+Lesson: the same capability can serve two roles. Decide the routing by what the user
+is actually asking about — their data versus general knowledge — not by which
+component happens to own the capability.
+
+### Anchor relative time ranges to the data, not to today
+
+"Progress over the past year" should count back from the user's latest logged entry,
+not from today's date — the user's data may not extend to the present. "This year,"
+by contrast, means the current calendar year regardless of data. Two phrasings, two
+correct anchors.
+
+Lesson: temporal language in user questions has multiple valid interpretations.
+"This year" is calendar-anchored; "the past year" is rolling and should anchor to the
+most recent data point, not the wall clock. Inject both the current date and the
+latest data date into the query generation context and give explicit rules for each
+phrasing.
+
+### Scope a new capability to what it is for, not to everything it could do
+
+Custom SQL could technically return anything — including individual set weights. But
+those weights would lack the offsets, bar weights, and unit polish the standard
+package applies. Rather than rebuild that polish for arbitrary query results
+(impossible for aggregates with no per-row exercise/date context), custom SQL is
+scoped to what it is actually for: counts, dates, gaps, and patterns. Individual
+weights stay with the package that handles them correctly.
+
+Lesson: a new capability does not have to do everything. Scope it to the gap it fills.
+Trying to make custom SQL also handle polished weight reporting would have either
+limited the queries it could express or reintroduced the data-handling burden on the
+agent. Letting each component own what it does best keeps both clean.
+
+---
+
+## Data Agent hardening — Session 8
+
+**Write the correctness spec before the tests.** Name each invariant after the bug it would have caught, and pin golden cases to a real data snapshot. When the invariant is named "PR must not fall below session max," the reason for the check is self-documenting. A spec-then-tests order means you know exactly which class of wrong is being prevented, not just that the current output matches.
+
+**`@pytest.mark.xfail(strict=True)` turns known bugs into a self-documenting fix-list.** The suite is green while the bug is open. When the fix lands, the xfail unexpectedly passes and fails loud — telling you to remove the marker. To-do list and regression guard become the same file.
+
+**Split data pipelines into fetch / process / validate.** Fetch touches I/O only; process is a pure function (thread the clock in as a parameter; derive mid-pipeline lookups from already-fetched data, no second DB trip); validate asserts post-conditions independently and never recomputes values. Purity makes each stage testable in isolation with synthetic inputs.
+
+**Ship the validator in report mode while known violations exist; flip to raising only when the count hits zero.** Log all violations before raising — the full list matters more than stopping at the first. Partial visibility (only first violation logged) hides the scope of the problem.
+
+**Catch the integrity exception before any generic handler that could fall through to an LLM call.** A plausible answer built on failed data is the worst outcome — it looks correct and can't be caught downstream. The specific handler short-circuits cleanly; the generic fallback must never see the integrity case.
+
+**Audit findings must be verified against live data before being accepted as bugs.** One proposed "critical bug" was withdrawn because the data could not, even in principle, distinguish the two interpretations — the difference was user metadata, not observable data. Accepting an audit finding without verification wastes hardening effort on phantom problems.
+
+**Declaration vs prose is the central problem of parsing free-text comments.** The same noun appears in genuine declarations ("One support") and in narrative ("could no longer hold the bar," past-tense "supported"). Match strict declaration patterns with word-boundary anchors; route everything else to a loud review log. Never silently apply, never silently drop — the review log is the audit trail.
+
+**Measure before designing a size optimization.** A byte audit showed the assumed culprit (per-set session arrays) was already near zero after aggregation stripping. The actual weight was raw comment text (38 %) and redundant aggregation zoom levels (28 %). Design follows measurement; measurement prevents optimizing the wrong thing.
+
+**Keep exactly one authoritative array when several represent the same data at different zoom levels.** Sending weekly, monthly, and yearly aggregations for a question whose window calls for monthly gives the LLM a choice. It sometimes chooses wrong — picking yearly totals for a 6-month question, or weekly granularity when the table is too wide. One level per query, selected deterministically by window length, removes the choice entirely.
+
+**For heuristic classifiers feeding analytics, decide explicitly which error direction is worse.** False positives (mislabeling real working sets as warmups) harm PR and progression numbers. False negatives (missing a genuine warmup) inflate them slightly. The warmup rule was biased conservative: relative gap thresholds (not absolute), category-first-of-day gate, minimum-reps filter, at-most-one constraint. Relative gaps survive the user changing their training weight; absolute thresholds do not.
+
+**Diagnostic audit scripts must call the real pipeline code path, not reimplement the rule.** A script that re-derives warmup logic independently validates a copy of the system, not the system itself. If the pipeline rule changes, the script stays wrong while appearing to confirm the fix. Import and call the live function directly.

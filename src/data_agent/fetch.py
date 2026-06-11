@@ -1,0 +1,295 @@
+"""
+src/data_agent/fetch.py
+Database boundary — ALL sqlite access lives here and ONLY here.
+
+Public surface:
+  fetch_data(end_str)  -> dict bundle of raw rows
+  load_user_context()  -> dict
+  query(sql)           -> dict
+  sanitize_sql(sql)    -> str
+"""
+
+import sqlite3
+import json
+import os
+import logging
+
+logger = logging.getLogger(__name__)
+
+# ── Paths ──────────────────────────────────────────────────────────────────────
+DB_PATH           = os.environ.get("FITNOTES_DB_PATH",  "data/FitNotes_Backup.fitnotes")
+USER_CONTEXT_PATH = os.environ.get("USER_CONTEXT_PATH", "data/user_context.json")
+
+# ── Category exclusion ─────────────────────────────────────────────────────────
+# Categories 10, 11, 12 are excluded from all queries.
+# Keep in sync with CATEGORY_NAMES in process.py.
+EXCLUDED_CATEGORY_IDS = (10, 11, 12)
+_EXCL_SQL = f"({', '.join(str(c) for c in EXCLUDED_CATEGORY_IDS)})"
+
+
+# ── Connection ──────────────────────────────────────────────────────────────────
+
+def _get_connection() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+# ── File I/O ───────────────────────────────────────────────────────────────────
+
+def load_user_context() -> dict:
+    with open(USER_CONTEXT_PATH, "r") as f:
+        return json.load(f)
+
+
+# ── Raw DB queries ─────────────────────────────────────────────────────────────
+
+def _fetch_all_sets_in_period(conn: sqlite3.Connection,
+                               start_date: str, end_date: str) -> list:
+    """
+    Single bulk query: ALL sets for ALL exercises in [start_date, end_date].
+    LEFT JOIN Comment — comment = None = unremarkable set, valid data.
+    """
+    cur = conn.cursor()
+    cur.execute(f"""
+        SELECT
+            tl._id               AS set_id,
+            tl.date,
+            tl.metric_weight,
+            tl.reps,
+            tl.distance,
+            tl.duration_seconds,
+            tl.is_personal_record,
+            e.name               AS exercise_name,
+            e.category_id,
+            c.comment
+        FROM training_log tl
+        JOIN exercise e ON tl.exercise_id = e._id
+        LEFT JOIN Comment c ON c.owner_id = tl._id
+        WHERE tl.date >= ? AND tl.date <= ?
+          AND e.category_id NOT IN {_EXCL_SQL}
+        ORDER BY tl.date ASC, tl._id ASC
+    """, (start_date, end_date))
+    return [dict(row) for row in cur.fetchall()]
+
+
+def _fetch_exercise_lifecycle(conn: sqlite3.Connection) -> list:
+    cur = conn.cursor()
+    cur.execute(f"""
+        SELECT e.name AS exercise_name, e.category_id,
+               MIN(tl.date) AS first_date, MAX(tl.date) AS last_date,
+               COUNT(*) AS total_sets,
+               COUNT(DISTINCT tl.date) AS total_sessions
+        FROM training_log tl
+        JOIN exercise e ON tl.exercise_id = e._id
+        WHERE e.category_id NOT IN {_EXCL_SQL}
+        GROUP BY e._id, e.name, e.category_id
+        ORDER BY e.category_id, e.name
+    """)
+    return [dict(row) for row in cur.fetchall()]
+
+
+def _fetch_pr_history(conn: sqlite3.Connection) -> list:
+    cur = conn.cursor()
+    cur.execute(f"""
+        SELECT tl.date, tl.metric_weight, tl.reps, e.name AS exercise_name
+        FROM training_log tl
+        JOIN exercise e ON tl.exercise_id = e._id
+        WHERE tl.is_personal_record = 1
+          AND e.category_id NOT IN {_EXCL_SQL}
+        ORDER BY tl.date ASC
+    """)
+    return [dict(row) for row in cur.fetchall()]
+
+
+def _fetch_all_bodyweight(conn: sqlite3.Connection) -> list:
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT date, body_weight_metric, body_fat, comments
+        FROM BodyWeight
+        ORDER BY date ASC
+    """)
+    return [{"date": row["date"],
+             "weight": row["body_weight_metric"],
+             "body_fat": row["body_fat"],
+             "comments": row["comments"]}
+            for row in cur.fetchall()]
+
+
+def _fetch_goals(conn: sqlite3.Connection) -> list:
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT
+            g._id          AS goal_id,
+            e.name         AS exercise_name,
+            g.metric_weight,
+            g.reps,
+            g.target_date,
+            g.start_date,
+            g.title        AS notes,
+            g.type_id,
+            g.unit         AS unit_flag
+        FROM Goal g
+        JOIN exercise e ON g.exercise_id = e._id
+        ORDER BY g.target_date ASC
+    """)
+    return [dict(row) for row in cur.fetchall()]
+
+
+def _fetch_all_training_dates(conn: sqlite3.Connection) -> list:
+    cur = conn.cursor()
+    cur.execute(f"""
+        SELECT DISTINCT tl.date
+        FROM training_log tl
+        JOIN exercise e ON tl.exercise_id = e._id
+        WHERE e.category_id NOT IN {_EXCL_SQL}
+        ORDER BY tl.date ASC
+    """)
+    return [row["date"] for row in cur.fetchall()]
+
+
+# ── Main fetch entry point ─────────────────────────────────────────────────────
+
+def fetch_data(end_str: str) -> dict:
+    """
+    Run all up-front SELECTs in a single connection and return a typed bundle.
+
+    alltime_rows covers the full DB history (from 2000-01-01 to end_str).
+    process.py derives period_rows by filtering alltime_rows on start_str.
+
+    Bundle keys:
+        alltime_rows  — all sets not in excluded categories, up to end_str
+        bodyweight    — all BodyWeight entries
+        goals         — all Goal rows
+        lifecycle     — per-exercise lifecycle summary
+        pr_history    — all is_personal_record=1 rows
+        training_dates — all distinct training dates (no date cap)
+    """
+    conn = _get_connection()
+    try:
+        training_dates = _fetch_all_training_dates(conn)
+        return {
+            "alltime_rows":    _fetch_all_sets_in_period(conn, "2000-01-01", end_str),
+            "bodyweight":      _fetch_all_bodyweight(conn),
+            "goals":           _fetch_goals(conn),
+            "lifecycle":       _fetch_exercise_lifecycle(conn),
+            "pr_history":      _fetch_pr_history(conn),
+            "training_dates":  training_dates,
+        }
+    finally:
+        conn.close()
+
+
+# ── Dynamic SQL fallback ───────────────────────────────────────────────────────
+
+def sanitize_sql(sql: str) -> str:
+    """
+    Replace Unicode curly quotes with straight quotes before execution.
+    LLM-generated SQL frequently contains curly quotes which cause OperationalError.
+    """
+    return (sql
+            .replace("‘", "'").replace("’", "'")
+            .replace("“", '"').replace("”", '"')
+            .replace("‚", "'").replace("‛", "'"))
+
+
+def query(sql: str) -> dict:
+    """
+    Fallback dynamic SQL query for questions the pre-built Data Agent functions
+    do not cover.
+
+    Use only when collect() data genuinely cannot answer the question.
+    The pre-built path (collect) is always preferred — it returns clean,
+    unit-converted, offset-applied, bar-weight-included values.
+
+    This function returns RAW DB values. The caller is responsible for
+    understanding the conversion rules documented in the WARNING below.
+
+    Args:
+        sql: A SELECT statement. Any other statement type is rejected.
+
+    Returns:
+        {
+            "rows":    list of dicts (column -> raw value),
+            "columns": list of column names,
+            "row_count": int,
+            "warning": str   <-- always present, always read this
+        }
+
+    WARNING — Raw values returned, no automatic conversions applied:
+        metric_weight : stored as kg (FitNotes always divides typed value by 2.2046).
+                        To recover typed value: metric_weight * 2.2046
+        numeric_offset: NOT applied. Machine Wrist Extension and similar exercises
+                        have an offset in user_context.json that this query does not add.
+        bar_weight    : NOT included. Barbell and Smith Machine exercises log plates
+                        only. Bar weight must be added separately for true load.
+        unit label    : NOT determined. KG-native exercises (Deadlift, Seated Machine
+                        Curl (Kg), Machine Wrist Extension, Hand Gripper) report in kg;
+                        all others in lbs. The label is not attached to raw rows.
+        is_personal_record: raw integer (0 or 1), not boolean.
+
+    The Analysis Agent must apply these conversions or explicitly note in its
+    answer that weights shown are raw logged values before conversion.
+    """
+    sql = sanitize_sql(sql.strip())
+
+    # Reject any non-SELECT statement (WITH...SELECT CTEs are allowed)
+    first_word = sql.split()[0].upper() if sql.split() else ""
+    is_cte     = (
+        first_word == "WITH"
+        and "SELECT" in sql.upper()
+        and not any(kw in sql.upper()
+                    for kw in (" INSERT ", " UPDATE ", " DELETE ",
+                                " DROP ",   " CREATE ", " ALTER "))
+    )
+    if first_word != "SELECT" and not is_cte:
+        return {
+            "rows":      [],
+            "columns":   [],
+            "row_count": 0,
+            "warning":   (
+                "REJECTED: only SELECT statements are permitted. "
+                f"Received statement type: {first_word}"
+            ),
+        }
+
+    conn = _get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(sql)
+        rows    = [dict(row) for row in cur.fetchall()]
+        columns = [description[0] for description in cur.description] if cur.description else []
+
+        # Auto-convert metric_weight to typed_weight so the Analysis Agent
+        # never sees raw stored kg values directly.
+        has_metric_weight = bool(rows) and "metric_weight" in rows[0]
+        if has_metric_weight:
+            for row in rows:
+                if row.get("metric_weight") is not None:
+                    row["typed_weight"] = round(row["metric_weight"] * 2.2046, 1)
+                else:
+                    row["typed_weight"] = None
+            columns = columns + ["typed_weight"]
+
+        return {
+            "rows":      rows,
+            "columns":   columns,
+            "row_count": len(rows),
+            "warning":   (
+                "PARTIAL CONVERSION APPLIED: typed_weight = metric_weight * 2.2046 "
+                "(recovers original typed value). Still missing: numeric_offset (e.g. "
+                "Machine Wrist Extension +5), bar_weight (barbell/Smith Machine exercises "
+                "log plates only), and unit label (kg-native exercises: Deadlift from "
+                "2025-12-26, Seated Machine Curl (Kg), Machine Wrist Extension, Hand Gripper "
+                "— all others lbs). Use typed_weight for display, not metric_weight."
+            ),
+        }
+    except Exception as e:
+        return {
+            "rows":      [],
+            "columns":   [],
+            "row_count": 0,
+            "warning":   f"QUERY ERROR: {str(e)}",
+        }
+    finally:
+        conn.close()
