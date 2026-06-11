@@ -1508,3 +1508,21 @@ an analytical question has no classifiable content by itself. Any per-message
 classifier in a conversational system needs at least the previous turn —
 passing the last user/assistant pair (truncated) is two lines and removes the
 whole failure class.
+
+---
+
+## Session 9: WAL, write-race prevention, and hardening scope
+
+**A commit message is not a diff. Verify claimed refactors against the code.** Commit history and documentation said a component had been refactored onto a safe read-only executor — the file had never changed. For five sessions, LLM-generated SQL ran on a writable connection behind a text guard that a CTE prefix defeats. The audit habit that catches this: for any "X was refactored" claim, open the file and look for the import. Documentation saying a fix was made is not evidence that it was applied.
+
+**Read-only must be a connection property, not a parser property.** Any textual SQL guard is a blacklist over an infinite grammar and will have holes — token adjacency, comment injection, dialect quirks. Opening SQLite with a `mode=ro` URI makes writes fail at the engine level regardless of what the guard missed. The guard is still useful for producing clean error messages, but it is no longer load-bearing. A bonus side effect: a normal connection silently creates an empty database on a wrong path; a `mode=ro` connection fails immediately and loudly instead.
+
+**Output token ceilings must scale with what a call produces.** A grounding check that echoes the full cleaned answer inside a JSON envelope must have a higher output budget than the draft it verifies — not the same ceiling. When both share the same limit, the most claim-dense answers (the ones most needing verification) are exactly the ones most likely to truncate mid-JSON, fail parsing, and ship unverified. Failure probability correlates with need.
+
+**Triggers defined as "change > X" silently mean "improvement > X".** A Phase 2 trigger expressed as a signed comparison fires only on increases. A significant drop — injury, deload, technique reset — is exactly the case where comment history matters most, and the signed trigger never fires for it. When a spec says "significant change," write `abs(x) > threshold`, not `x > threshold`.
+
+**Lock both directions of a write race.** Blocking new writes during a file swap is the obvious half. The less obvious half is draining an already-in-flight write before the swap starts. A write in a subprocess, already past every guard, is writing to the file you are about to replace. Acquiring the agent lock before touching the file ensures that in-flight write commits first. One direction prevents new corruption; the other drains existing exposure. Both are required for the fix to be complete.
+
+**Measure the actual bottleneck before designing an optimization.** A byte audit of an oversized data package showed that the assumed culprit — per-set session arrays — was already near zero after aggregation stripping. The real weight was raw comment text (38 %) and redundant aggregation zoom levels (28 %). An optimization designed without measurement would have spent effort on the wrong target and missed most of the savings. Measurement should precede design, not follow it.
+
+**Scope derived from classifier intent is wrong when the filter matches nothing.** Deriving package scope from the classified query type breaks when the resolved filter is empty or partial. If the classifier says "focused on one exercise" but the resolver finds no match and the package covers all exercises, the scope label is wrong and the size ceiling that follows from it is wrong. The correct scope is derived from what actually ends up in the package — validate scope against effective package contents, not against original intent.

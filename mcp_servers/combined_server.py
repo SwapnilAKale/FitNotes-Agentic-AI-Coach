@@ -24,6 +24,21 @@ _kb = None
 _staged_writes: dict = {}
 
 
+def _wal_append(tool_name: str, params: dict) -> None:
+    """
+    Journal a confirmed DB write to the WAL (data/agent_writes.json) so
+    /upload can replay it onto a fresh backup. Called only AFTER the commit
+    succeeded. A WAL failure must never fail the write itself — and stdout
+    is the MCP protocol channel, so complaints go to stderr.
+    """
+    try:
+        from src.wal import append_write
+        append_write(tool_name, params)
+    except Exception as exc:
+        print(f"[combined_server] WAL append failed for {tool_name}: {exc}",
+              file=sys.stderr)
+
+
 def _get_kb():
     global _kb
     if _kb is None:
@@ -1622,6 +1637,7 @@ def _execute_staged_workout_sync() -> str:
         conn.close()
 
     _staged_writes.pop("workout", None)
+    _wal_append("execute_staged_workout", staged)
     return json.dumps({"success": True, "sets_written": sets_written, "message": "Workout logged successfully."})
 
 
@@ -1702,6 +1718,7 @@ def _execute_staged_goal_sync() -> str:
         conn.close()
 
     _staged_writes.pop("goal", None)
+    _wal_append("execute_staged_goal", staged)
     return json.dumps({"success": True, "message": "Goal saved successfully."})
 
 
@@ -1919,6 +1936,7 @@ def _execute_staged_goal_update_sync() -> str:
         conn.close()
 
     _staged_writes.pop("update_goal", None)
+    _wal_append("execute_staged_goal_update", staged)
     return json.dumps({"success": True, "message": "Goal updated successfully."})
 
 
@@ -2006,6 +2024,7 @@ def _execute_staged_goal_delete_sync() -> str:
         conn.close()
 
     _staged_writes.pop("delete_goal", None)
+    _wal_append("execute_staged_goal_delete", staged)
     return json.dumps({"success": True, "message": "Goal deleted successfully."})
 
 
@@ -2121,6 +2140,7 @@ def _execute_staged_set_update_sync() -> str:
         conn.close()
 
     _staged_writes.pop("update_set", None)
+    _wal_append("execute_staged_set_update", staged)
     return json.dumps({"success": True, "message": "Set updated successfully.", "is_personal_record": bool(is_pr)})
 
 
@@ -2216,6 +2236,7 @@ def _execute_staged_set_delete_sync() -> str:
         conn.close()
 
     _staged_writes.pop("delete_set", None)
+    _wal_append("execute_staged_set_delete", staged)
     return json.dumps({"success": True, "message": "Set deleted successfully."})
 
 

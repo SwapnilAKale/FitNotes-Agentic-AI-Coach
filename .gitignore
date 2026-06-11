@@ -13,6 +13,7 @@ dist/
 # Personal workout data — never push
 data/memory.json
 data/user_context.json
+data/agent_writes.json
 data/chroma_db/
 corpus/raw/
 personal_lessons.md

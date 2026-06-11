@@ -626,21 +626,45 @@ Removed. Rate limits are handled by the existing generic 429 path.
 - Stale "stubs in place" comments removed from the Coordinator — the shared
   modules have been wired since Session 7.
 
-## Known gaps (documented, not yet fixed)
+---
 
-- `/upload` writes the DB file without holding the agent lock — a query
-  in flight during an upload reads a half-replaced file.
-- `/history` returns only the single agent's history; analytical turns live
-  in `Coordinator._history` and are lost on session restore.
-- Multi-candidate name resolution ("bench" → flat/incline/decline) picks the
-  first candidate without asking. Disambiguation needs a clarification path
-  through the analytical pipeline.
-- `daily_workouts` per-exercise e1RM is computed plates-only (no bar), unlike
-  sessions. Trimmed packages drop `daily_workouts`, so the Analysis Agent
-  never sees the inconsistency — but `workout_position_effect` positions are
-  derived from it.
-- `all_time_summary.total_volume_raw_lbs` multiplies every row by 2.2046,
-  which mislabels kg-native exercise volume; field is marked "raw" but the
-  Analysis Agent could still quote it.
-- Goal projections compare a bar-exclusive target weight against bar-inclusive
-  e1RMs. The Goal table is still empty, so untested either way.
+## Session 9 additions — Data Agent hardening, WAL, and Coordinator wiring
+
+### Data Agent hardening — complete
+
+The Data Agent is now a four-module package (`fetch` / `process` / `validate` / `__init__`). The validator runs in raising mode: any integrity violation raises `DataAgentIntegrityError`, which the Coordinator catches before passing data to the Analysis Agent. Soft violations (G4 size ceiling, G5 scope leaks) are logged as warnings. 73 tests pass across the golden and per-invariant suites. A `@pytest.mark.xfail(strict=True)` strategy kept the suite green while known violations were open — a landed fix flips the marker to a loud failure automatically.
+
+### Scope-aware packaging — BROAD 365d = 396 KB
+
+`prepare_analysis_package()` derives scope from query filters and trims accordingly:
+
+| Scope | Condition | Retained |
+|-------|-----------|---------|
+| FOCUSED | ≤ 3 named exercises | Full detail — sessions, full_comments, all stat blocks, all aggregation levels |
+| GROUP | muscle-group filter | full_comments capped 30 most recent + all pain-flagged; one aggregation level |
+| BROAD | no filter | full_comments removed; deep-stat blocks removed; one aggregation level |
+
+BROAD 365-day package: 1 443 KB → 396 KB (72 % reduction). This resolved the free-tier 429 failures on general questions ("how has my training been?").
+
+### Coordinator wired into cli.py and server.py
+
+Every user message now routes through the Coordinator. A write-intent regex guard routes operational questions (logging, corrections, goal-setting) to the single-agent path without an LLM classification call. `/confirm` bypasses routing — it is the continuation of an in-flight staged write whose context already lives in the agent session.
+
+### Write-Ahead Log
+
+Every confirmed `execute_*` DB write is journaled to `data/agent_writes.json` (gitignored). On FitNotes backup upload, the server replays the WAL onto the new database before reinitializing the agent — agent-written sets survive backup uploads.
+
+The upload+replay race is closed in both directions:
+- **New requests** — `/chat` and `/confirm` return a clean 503 while `_upload_lock` is held, rather than silently racing the file swap.
+- **In-flight turns** — `/upload` acquires `agent_lock` (inside `_upload_lock`) before replacing the DB file, so an ongoing MCP subprocess write drains before the file is touched.
+
+The frontend chatbox is disabled the moment a file is selected for upload and stays locked until `/status` reports ready.
+
+### Known open gaps (updated)
+
+- RAG (`search_fitness_knowledge`) fires on personal-data questions when research context is irrelevant — burns API tokens with no benefit.
+- `/history` returns only the single agent's history; analytical turns live in `Coordinator._history` and are lost on browser session restore.
+- Multi-candidate name resolution picks the first candidate without asking — single-agent path asks for clarification; the analytical path should too.
+- `daily_workouts` e1RM/max_weight is plates-only (no bar), inconsistent with session values; `workout_position_effect` derives from it.
+- `all_time_summary.total_volume_raw_lbs` applies ×2.2046 to kg-native rows — labeled "raw" but the Analysis Agent could quote it without the caveat.
+- `cli.py` 429 handling catches `ClientError` from a different code path than the server's string-match guard — rate limits may not surface correctly on all error shapes.

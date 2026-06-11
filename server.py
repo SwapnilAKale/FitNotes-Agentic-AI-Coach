@@ -28,11 +28,16 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from src.agent import AgentSession
 from src.coordinator import Coordinator
+from src import wal
 
 DB_PATH = os.environ.get("FITNOTES_DB_PATH", "./data/FitNotes_Backup.fitnotes")
 FRONTEND_SERVER = Path(__file__).parent / "frontend" / "server.py"
 
 agent_ready: bool = False
+
+# Serializes the replace-DB-file + WAL-replay critical section so two
+# concurrent uploads can't interleave file writes and replays.
+_upload_lock = asyncio.Lock()
 
 
 def _get_db_fingerprint(path: str) -> str:
@@ -454,6 +459,16 @@ async def history():
 
 @app.post("/chat")
 async def chat(body: ChatRequest):
+    # A chat turn can reach an execute_* MCP tool and write the DB file that
+    # upload+replay is mid-way through replacing. Reject with a clear message
+    # instead of letting it surface as a SQLite lock error or silent loss.
+    if _upload_lock.locked():
+        return JSONResponse(
+            status_code=503,
+            content={"type": "error",
+                     "text": "A database upload is in progress — chat is paused "
+                             "until it finishes. Try again in a few seconds."},
+        )
     if not agent_ready:
         return JSONResponse(
             status_code=503,
@@ -493,6 +508,15 @@ async def chat(body: ChatRequest):
 
 @app.post("/confirm")
 async def confirm(body: ConfirmRequest):
+    # /confirm is the request that actually executes staged DB writes —
+    # it must never run while upload+replay is replacing the DB file.
+    if _upload_lock.locked():
+        return JSONResponse(
+            status_code=503,
+            content={"type": "error",
+                     "text": "A database upload is in progress — your confirmation "
+                             "was not executed. Try again in a few seconds."},
+        )
     if not agent_ready:
         return JSONResponse(
             status_code=503,
@@ -576,40 +600,57 @@ async def upload_db(file: UploadFile):
         tmp.write(contents)
         tmp_path = tmp.name
 
-    try:
-        validation = _validate_db(tmp_path, min_rows=_baseline_row_count)
-
-        if not validation["valid"]:
-            os.unlink(tmp_path)
-            return JSONResponse(
-                status_code=400,
-                content={"status": "error", "errors": validation["errors"]},
-            )
-
-        if validation.get("warnings"):
-            _state["pending_upload_path"] = tmp_path
-            _state["pending_upload_contents"] = contents
-            return JSONResponse(content={
-                "status": "warning",
-                "warnings": validation["warnings"],
-                "message": "Upload has warnings. Proceed anyway?",
-            })
-
-        old_exercises = _get_exercise_names(DB_PATH)
-        os.unlink(tmp_path)
-        with open(DB_PATH, "wb") as f:
-            f.write(contents)
-        _baseline_row_count = validation.get("row_count", _baseline_row_count)
-        new_exercises = sorted(_get_exercise_names(DB_PATH) - old_exercises)
-
-    except Exception as e:
+    async with _upload_lock:
         try:
-            os.unlink(tmp_path)
-        except Exception:
-            pass
-        return JSONResponse(status_code=500, content={"status": "error", "errors": [str(e)]})
+            validation = _validate_db(tmp_path, min_rows=_baseline_row_count)
 
-    return await reload_db(new_exercises=new_exercises)
+            if not validation["valid"]:
+                os.unlink(tmp_path)
+                return JSONResponse(
+                    status_code=400,
+                    content={"status": "error", "errors": validation["errors"]},
+                )
+
+            if validation.get("warnings"):
+                _state["pending_upload_path"] = tmp_path
+                _state["pending_upload_contents"] = contents
+                return JSONResponse(content={
+                    "status": "warning",
+                    "warnings": validation["warnings"],
+                    "message": "Upload has warnings. Proceed anyway?",
+                })
+
+            # agent_lock drains any in-flight chat/confirm turn (which can be
+            # mid-DB-write in the MCP subprocess) before the file is replaced.
+            # New chat/confirm requests are rejected while _upload_lock is held.
+            # Lock order is always _upload_lock -> agent_lock; nothing acquires
+            # _upload_lock while holding agent_lock, so this cannot deadlock.
+            async with agent_lock:
+                old_exercises = _get_exercise_names(DB_PATH)
+                os.unlink(tmp_path)
+                with open(DB_PATH, "wb") as f:
+                    f.write(contents)
+                _baseline_row_count = validation.get("row_count", _baseline_row_count)
+                new_exercises = sorted(_get_exercise_names(DB_PATH) - old_exercises)
+
+                # The fresh backup just wiped any agent-written rows — replay
+                # the journaled writes onto the new file before the agent
+                # reinitializes against it.
+                wal_result = await asyncio.to_thread(wal.replay_writes, DB_PATH)
+                print(f"[Server] WAL replay: {wal_result['replayed']} replayed, "
+                      f"{wal_result['conflicts']} conflicts.")
+
+        except Exception as e:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+            return JSONResponse(status_code=500, content={"status": "error", "errors": [str(e)]})
+
+    reload_response = await reload_db(new_exercises=new_exercises)
+    payload = json.loads(reload_response.body)
+    payload["wal_replay"] = wal_result
+    return JSONResponse(content=payload)
 
 
 @app.post("/upload/confirm")
@@ -628,13 +669,41 @@ async def upload_confirm():
         except Exception:
             pass
 
-    with open(DB_PATH, "wb") as f:
-        f.write(contents)
+    async with _upload_lock:
+        # Same drain-then-replace discipline as /upload (see comment there).
+        async with agent_lock:
+            with open(DB_PATH, "wb") as f:
+                f.write(contents)
 
-    _state["pending_upload_path"] = None
-    _state["pending_upload_contents"] = None
+            _state["pending_upload_path"] = None
+            _state["pending_upload_contents"] = None
 
-    return await reload_db()
+            # Same replay as /upload — this path also replaces the DB file.
+            wal_result = await asyncio.to_thread(wal.replay_writes, DB_PATH)
+            print(f"[Server] WAL replay: {wal_result['replayed']} replayed, "
+                  f"{wal_result['conflicts']} conflicts.")
+
+    reload_response = await reload_db()
+    payload = json.loads(reload_response.body)
+    payload["wal_replay"] = wal_result
+    return JSONResponse(content=payload)
+
+
+@app.get("/wal-status")
+async def wal_status():
+    """Current write-ahead log contents — debugging aid for upload replay."""
+    records = await asyncio.to_thread(wal.get_records)
+    by_status = {"pending": 0, "replayed": 0, "conflict": 0}
+    for r in records:
+        status = r.get("status", "pending")
+        by_status[status] = by_status.get(status, 0) + 1
+    return JSONResponse(content={
+        "total":     len(records),
+        "pending":   by_status["pending"],
+        "replayed":  by_status["replayed"],
+        "conflicts": by_status["conflict"],
+        "records":   records,
+    })
 
 
 @app.post("/upload/article")

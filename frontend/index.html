@@ -80,7 +80,7 @@
     class="flex items-center gap-3 px-5 py-2 text-sm text-blue-300 bg-blue-950 border-b border-blue-800 flex-shrink-0"
     style="display:none">
     <div class="spinner"></div>
-    <span>Connecting to your fitness coach...</span>
+    <span id="init-banner-text">Connecting to your fitness coach...</span>
   </div>
 
   <!-- Chat area -->
@@ -337,8 +337,26 @@ function restoreHistory(history) {
   });
 }
 
+// ── Upload busy state ─────────────────────────────────────────────────────────
+// The chatbox must be locked from the moment an upload starts: the server is
+// replacing the DB file and replaying journaled writes, and a chat sent in
+// that window would be rejected (or worse, race the file swap).
+function showUploadBusy() {
+  document.getElementById('init-banner-text').textContent =
+    'Uploading backup — chat is paused until the database is ready...';
+  document.getElementById('init-banner').style.display = 'flex';
+  setBusy(true);
+}
+
+function clearUploadBusy() {
+  document.getElementById('init-banner').style.display = 'none';
+  setBusy(false);
+}
+
 // ── Init / ready polling ──────────────────────────────────────────────────────
 async function waitForReady() {
+  document.getElementById('init-banner-text').textContent =
+    'Connecting to your fitness coach...';
   document.getElementById('init-banner').style.display = 'flex';
   setBusy(true);
   let failCount = 0;
@@ -410,6 +428,11 @@ async function sendMessage(forcedText) {
     } else if (data.type === 'not_ready') {
       addMsg('error', 'Still initializing — please wait a moment.');
       setBusy(false);
+    } else if (res.status === 503 && data.type === 'error') {
+      // Upload in progress — the banner already explains the situation.
+      // Show a toast, don't add an error bubble, and leave the input
+      // locked — the upload flow (waitForReady) will unlock it.
+      showToast('Database is updating — try again in a moment.', true);
     } else if (data.type === 'error') {
       addMsg('error', esc(data.text || 'An error occurred.'));
       setBusy(false);
@@ -437,6 +460,12 @@ async function sendConfirm(confirmed) {
     });
     const data = await res.json();
     removeThinking();
+    if (res.status === 503 && data.type === 'error') {
+      // Upload in progress — show toast, leave input locked, don't add a
+      // chat bubble. The upload flow (waitForReady) owns the busy state.
+      showToast('Database is updating — your confirmation was not sent. Try again in a moment.', true);
+      return;
+    }
     if (data.type === 'answer') addMsg('agent', esc(data.text || ''));
     else if (data.type === 'error') addMsg('error', esc(data.text || 'Error.'));
     else addMsg('agent', esc(data.text || ''));
@@ -454,11 +483,13 @@ document.getElementById('db-input').addEventListener('change', async (e) => {
   e.target.value = '';
   const fd = new FormData();
   fd.append('file', file);
+  showUploadBusy();   // lock the chatbox for the whole upload+replay window
   try {
     const res = await fetch(`${API}/upload`, {method:'POST', body:fd});
     const data = await res.json();
     if (data.status === 'reloading') {
       showToast('Database uploaded. Reconnecting...');
+      // waitForReady re-asserts busy and clears it when /status says ready
       waitForReady().then(() => {
         if (data.new_exercises && data.new_exercises.length > 0) {
           const list = data.new_exercises.join(', ');
@@ -467,16 +498,34 @@ document.getElementById('db-input').addEventListener('change', async (e) => {
       });
     } else if (data.status === 'ok') {
       showToast('Database already up to date.');
+      clearUploadBusy();
     } else if (data.status === 'warning') {
+      // Chat stays locked while the user decides — the pending upload could
+      // start replacing the DB the moment they hit "Upload Anyway".
       showUploadWarning(data.warnings, async () => {
-        const r = await fetch(`${API}/upload/confirm`, {method:'POST'});
-        const d = await r.json();
-        if (d.status === 'reloading') { showToast('Database uploaded. Reconnecting...'); waitForReady(); }
-      });
+        try {
+          const r = await fetch(`${API}/upload/confirm`, {method:'POST'});
+          const d = await r.json();
+          if (d.status === 'reloading') {
+            showToast('Database uploaded. Reconnecting...');
+            waitForReady();
+          } else {
+            showToast(d.errors?.[0] || d.message || 'Upload failed.', true);
+            clearUploadBusy();
+          }
+        } catch {
+          showToast('Upload failed — could not reach server.', true);
+          clearUploadBusy();
+        }
+      }, () => clearUploadBusy());
     } else {
       showToast(data.errors?.[0] || data.message || 'Upload failed.', true);
+      clearUploadBusy();
     }
-  } catch { showToast('Upload failed — could not reach server.', true); }
+  } catch {
+    showToast('Upload failed — could not reach server.', true);
+    clearUploadBusy();
+  }
 });
 
 document.getElementById('article-input').addEventListener('change', async (e) => {
@@ -506,7 +555,7 @@ document.getElementById('article-input').addEventListener('change', async (e) =>
 });
 
 // ── Upload warning modal ──────────────────────────────────────────────────────
-function showUploadWarning(warnings, onConfirm) {
+function showUploadWarning(warnings, onConfirm, onCancel) {
   const modal = document.createElement('div');
   modal.className = 'fixed inset-0 bg-black/50 flex items-center justify-center z-50';
   modal.innerHTML = `
@@ -520,7 +569,7 @@ function showUploadWarning(warnings, onConfirm) {
     </div>`;
   document.body.appendChild(modal);
   document.getElementById('upload-proceed').addEventListener('click', () => { modal.remove(); onConfirm(); });
-  document.getElementById('upload-cancel').addEventListener('click', () => { modal.remove(); showToast('Upload cancelled.'); });
+  document.getElementById('upload-cancel').addEventListener('click', () => { modal.remove(); showToast('Upload cancelled.'); if (onCancel) onCancel(); });
 }
 
 // ── Attach menu ───────────────────────────────────────────────────────────────
