@@ -128,4 +128,4 @@ def search_fitness_knowledge(question: str) -> list | None:
         return result_list or None
 
     except Exception:
-        return []
+        return None

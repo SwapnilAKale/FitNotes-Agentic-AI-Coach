@@ -14,6 +14,8 @@ import json
 import os
 import logging
 
+from src.shared.sql_executor import run_query as _run_ro_query
+
 logger = logging.getLogger(__name__)
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
@@ -30,7 +32,13 @@ _EXCL_SQL = f"({', '.join(str(c) for c in EXCLUDED_CATEGORY_IDS)})"
 # ── Connection ──────────────────────────────────────────────────────────────────
 
 def _get_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    # Read-only at the connection level (same principle as src/db.py):
+    # the Data Agent only reads, so a bug in this module must not be able
+    # to write — and a plain connect() would silently CREATE an empty DB
+    # file when DB_PATH is wrong, hiding the misconfiguration.
+    normalized = DB_PATH.replace("\\", "/")
+    conn = sqlite3.connect(f"file:{normalized}?mode=ro", uri=True,
+                           check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -233,56 +241,22 @@ def query(sql: str) -> dict:
     """
     sql = sanitize_sql(sql.strip())
 
-    # Reject any non-SELECT statement (WITH...SELECT CTEs are allowed)
-    first_word = sql.split()[0].upper() if sql.split() else ""
-    is_cte     = (
-        first_word == "WITH"
-        and "SELECT" in sql.upper()
-        and not any(kw in sql.upper()
-                    for kw in (" INSERT ", " UPDATE ", " DELETE ",
-                                " DROP ",   " CREATE ", " ALTER "))
-    )
-    if first_word != "SELECT" and not is_cte:
+    # Execution goes through shared/sql_executor.run_query:
+    #   - read-only connection (mode=ro URI) — a write statement that slips
+    #     past any textual guard fails at the database level
+    #   - SELECT/WITH-only guard (raises ValueError)
+    #   - LIMIT 10000 injected when absent
+    #   - 30-second timeout via connection interrupt
+    # The previous inline guard was a space-delimited keyword blacklist on a
+    # read-write connection — "WITH c AS (SELECT 1)INSERT INTO ..." passed it.
+    try:
+        rows = _run_ro_query(sql, DB_PATH)
+    except ValueError as e:
         return {
             "rows":      [],
             "columns":   [],
             "row_count": 0,
-            "warning":   (
-                "REJECTED: only SELECT statements are permitted. "
-                f"Received statement type: {first_word}"
-            ),
-        }
-
-    conn = _get_connection()
-    try:
-        cur = conn.cursor()
-        cur.execute(sql)
-        rows    = [dict(row) for row in cur.fetchall()]
-        columns = [description[0] for description in cur.description] if cur.description else []
-
-        # Auto-convert metric_weight to typed_weight so the Analysis Agent
-        # never sees raw stored kg values directly.
-        has_metric_weight = bool(rows) and "metric_weight" in rows[0]
-        if has_metric_weight:
-            for row in rows:
-                if row.get("metric_weight") is not None:
-                    row["typed_weight"] = round(row["metric_weight"] * 2.2046, 1)
-                else:
-                    row["typed_weight"] = None
-            columns = columns + ["typed_weight"]
-
-        return {
-            "rows":      rows,
-            "columns":   columns,
-            "row_count": len(rows),
-            "warning":   (
-                "PARTIAL CONVERSION APPLIED: typed_weight = metric_weight * 2.2046 "
-                "(recovers original typed value). Still missing: numeric_offset (e.g. "
-                "Machine Wrist Extension +5), bar_weight (barbell/Smith Machine exercises "
-                "log plates only), and unit label (kg-native exercises: Deadlift from "
-                "2025-12-26, Seated Machine Curl (Kg), Machine Wrist Extension, Hand Gripper "
-                "— all others lbs). Use typed_weight for display, not metric_weight."
-            ),
+            "warning":   f"REJECTED: only SELECT statements are permitted. {e}",
         }
     except Exception as e:
         return {
@@ -291,5 +265,30 @@ def query(sql: str) -> dict:
             "row_count": 0,
             "warning":   f"QUERY ERROR: {str(e)}",
         }
-    finally:
-        conn.close()
+
+    columns = list(rows[0].keys()) if rows else []
+
+    # Auto-convert metric_weight to typed_weight so the Analysis Agent
+    # never sees raw stored kg values directly.
+    has_metric_weight = bool(rows) and "metric_weight" in rows[0]
+    if has_metric_weight:
+        for row in rows:
+            if row.get("metric_weight") is not None:
+                row["typed_weight"] = round(row["metric_weight"] * 2.2046, 1)
+            else:
+                row["typed_weight"] = None
+        columns = columns + ["typed_weight"]
+
+    return {
+        "rows":      rows,
+        "columns":   columns,
+        "row_count": len(rows),
+        "warning":   (
+            "PARTIAL CONVERSION APPLIED: typed_weight = metric_weight * 2.2046 "
+            "(recovers original typed value). Still missing: numeric_offset (e.g. "
+            "Machine Wrist Extension +5), bar_weight (barbell/Smith Machine exercises "
+            "log plates only), and unit label (kg-native exercises: Deadlift from "
+            "2025-12-26, Seated Machine Curl (Kg), Machine Wrist Extension, Hand Gripper "
+            "— all others lbs). Use typed_weight for display, not metric_weight."
+        ),
+    }

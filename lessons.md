@@ -1432,3 +1432,79 @@ agent. Letting each component own what it does best keeps both clean.
 **For heuristic classifiers feeding analytics, decide explicitly which error direction is worse.** False positives (mislabeling real working sets as warmups) harm PR and progression numbers. False negatives (missing a genuine warmup) inflate them slightly. The warmup rule was biased conservative: relative gap thresholds (not absolute), category-first-of-day gate, minimum-reps filter, at-most-one constraint. Relative gaps survive the user changing their training weight; absolute thresholds do not.
 
 **Diagnostic audit scripts must call the real pipeline code path, not reimplement the rule.** A script that re-derives warmup logic independently validates a copy of the system, not the system itself. If the pipeline rule changes, the script stays wrong while appearing to confirm the fix. Import and call the live function directly.
+
+---
+
+## Session 9: Full-project audit — docs-vs-code drift and the fixes it hid
+
+**A commit message is not a diff. Verify claimed refactors against the code.**
+The Session 7 commit message (and README, and lessons) all said
+`data_agent.query()` was "refactored onto shared executor." The diff for that
+commit never touched the file. For five sessions, LLM-generated SQL ran on a
+read-write connection guarded by a space-delimited keyword blacklist —
+`WITH c AS (SELECT 1)INSERT INTO ...` passes a check for `" INSERT "` because
+the token is `)INSERT`. Documentation drift is not cosmetic: every later
+reviewer (human or AI) reads "read-only, LIMIT, timeout" and stops checking.
+The audit habit that catches this is mechanical: for every "X was refactored"
+claim, open the file and look for the import.
+
+**Read-only must be a connection property, not a parser property.**
+Any textual SQL guard is a blacklist over an open-ended grammar — it will
+have holes (token adjacency, newlines, comments, dialect quirks). Opening
+SQLite with `file:...?mode=ro` makes every write fail at the engine level
+regardless of what the guard missed. The guard is still useful for clean
+error messages; it is no longer load-bearing. Bonus: a plain
+`sqlite3.connect()` on a wrong path silently creates an empty database and
+the pipeline "works" with zero rows; `mode=ro` fails loudly instead.
+
+**A "fixed" bug can be half-fixed: normalize every comparison, not the one
+in the bug report.** The cross-unit lesson from the Data Agent build said
+PR and progression were normalized via `_to_unit`. True for the start/end
+pair — but the plateau loop, sessions-at-max count, and peak/regression
+detection in the same function still compared raw lbs values against raw kg
+values. When fixing a class of bug inside a function, grep that function for
+every other instance of the operation, not just the line in the report.
+
+**Output token ceilings must scale with what the call returns, not what it
+receives.** The grounding check returns the full cleaned answer wrapped in
+JSON, so its output is strictly larger than the draft — but it shared the
+draft's 2048-token ceiling. Result: the longest, most claim-dense answers
+truncated mid-JSON, failed parsing, and shipped ungrounded, while short
+answers got verified. Failure probability correlated with exactly the
+answers that needed checking most. For any verifier-style LLM call that
+echoes its input, the output budget must be input budget + envelope.
+
+**Triggers defined as "change > X" silently mean "improvement > X".**
+The Phase-2 trigger `weight_change_pct > 20` reads like "big change" but
+fires only on gains. A 30 % regression — the case where comment history
+explains the most — never pulled comments. Signed comparisons on quantities
+described as magnitudes are a quiet spec violation; write `abs(x) > X` when
+the spec says "change."
+
+**Silent drops in filter chains need an explicit "unmatched" channel.**
+The Coordinator dropped exercise names that failed resolution before they
+reached the package, so the package's own unresolved-name reporting never
+saw them — the user asked about two exercises and got an answer about one,
+with no note. Same family as the Walking case-mismatch bug: a filter that
+removes items must put them somewhere visible, never on the floor. The fix
+was to pass unresolved names through and let the existing reporting fire.
+
+**Module-level imports are part of your dependency contract.** `cli.py`
+imported `groq` solely for an exception class, after Groq had been removed
+from the stack and from requirements.txt. Every dev machine had the package
+installed, so nothing failed locally — fresh clones crash at import. After
+removing a dependency, grep for the import, not just the usage.
+
+**`global` bugs hide in functions that mostly work.** `/reload-db` declared
+`global _last_db_fingerprint` but not `agent_ready`, so `agent_ready = False`
+created a dead local. The endpoint still functioned (the background task set
+the flag a moment later), shrinking the bug to a race window that manual
+testing never hit. When a function assigns to more than one module-level
+name, check that every one of them is in the global statement.
+
+**Classifiers without conversation context misroute every follow-up.** The
+routing classifier saw each message standalone: "what about my squat?" after
+an analytical question has no classifiable content by itself. Any per-message
+classifier in a conversational system needs at least the previous turn —
+passing the last user/assistant pair (truncated) is two lines and removes the
+whole failure class.

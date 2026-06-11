@@ -11,9 +11,13 @@ Every user message comes here first. The Coordinator:
   4. Runs a coverage check after analytical answers (1 retry max)
   5. Maintains conversation history for context passing to Analysis Agent
 
-NOT YET WIRED — stubs in place:
-  shared/rag.py    → research pre-fetch; research=None until built
-  shared/memory.py → memory retrieval; memories=None until built
+Shared modules wired into the analytical path:
+  shared/resolver.py → exercise name resolution before package build
+  shared/rag.py      → research pre-fetch (best-effort, None on failure)
+  shared/memory.py   → read-only memory retrieval (best-effort)
+  shared/sql_executor (via data_agent.query) → supplementary custom SQL
+
+NOT YET WIRED:
   Memory extraction from mixed analytical+memory messages
 
 ROUTING RULE: when uncertain, default to operational.
@@ -25,6 +29,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from typing import Optional
 
 from google import genai
@@ -33,11 +38,50 @@ from google.genai import types
 from src.data_agent import prepare_analysis_package, DataAgentIntegrityError
 from src.analysis_agent import run as analysis_run
 
+# Rate-limit error types: re-raised instead of swallowed so CLI/server
+# countdown UX works for analytical-path quota exhaustion.
+try:
+    from google.genai import errors as _genai_errors
+    _GenaiClientError = _genai_errors.ClientError
+except (ImportError, AttributeError):
+    _GenaiClientError = None  # type: ignore[assignment]
+
+try:
+    from google.api_core.exceptions import ResourceExhausted as _ResourceExhausted
+except ImportError:
+    _ResourceExhausted = None  # type: ignore[assignment]
+
 logger = logging.getLogger(__name__)
 
 _GEMINI_API_KEY    = os.environ.get("GEMINI_API_KEY", "")
 COORDINATOR_MODEL  = "gemini-3.1-flash-lite"
 CONTEXT_WINDOW     = 6     # number of recent turns passed to Analysis Agent
+
+# Write-intent guard: questions matching this are routed OPERATIONAL without
+# calling the classifier so a write can never reach the analytical path.
+_WRITE_INTENT_RE = re.compile(
+    r"(?i)"
+    r"(?:"
+    r"\b(?:log|record|add|save|delete|remove|update|change|correct)\b"
+    r".{0,50}"
+    r"\b(?:workout|set|goal|bodyweight|weight|exercise|session|reps?)\b"
+    r"|"
+    r"\bset\s+a?\s*goal\b"
+    r"|"
+    r"\bI\s+did\b.{0,80}\b(?:today|yesterday|this\s+morning|this\s+week)\b"
+    r")"
+)
+
+
+def _is_rate_limit(exc: Exception) -> bool:
+    """True if exc is a Gemini/google-api 429 / ResourceExhausted error."""
+    if _ResourceExhausted is not None and isinstance(exc, _ResourceExhausted):
+        return True
+    if _GenaiClientError is not None and isinstance(exc, _GenaiClientError):
+        if getattr(exc, "code", None) == 429:
+            return True
+    msg = str(exc)
+    return "429" in msg or "RESOURCE_EXHAUSTED" in msg
 
 
 # ── Classification prompt ─────────────────────────────────────────────────────
@@ -98,10 +142,17 @@ OPERATIONAL — use only for questions that require MCP tools:
 
 DEFAULT: when uncertain, use "operational".
 
+If a [PREVIOUS TURNS] block is present, use it ONLY to resolve pronouns
+and follow-up references in the current message ("what about my squat?",
+"and over the last year?"). Classify and extract parameters for the
+CURRENT MESSAGE, carrying over the topic from previous turns when the
+current message is an elliptical follow-up.
+
 PARAMETER EXTRACTION (analytical route only):
   exercise_names:    list of specific exercise names mentioned, or null
   muscle_groups:     muscle groups mentioned → map to exact names:
-                     Back, Chest, Shoulders, Biceps, Triceps, Legs, Forearms
+                     Back, Chest, Shoulders, Biceps, Triceps, Legs,
+                     Forearms, Abs, Cardio
                      or null if none mentioned
   query_period_days: convert time references to integer days, or null for all-time
     "last week"          → 7
@@ -186,8 +237,19 @@ class Coordinator:
               "error":         str | None,
             }
         """
-        # ── 1. Classify ───────────────────────────────────────────────────────
-        params = await self._classify(question)
+        # ── 1. Classify (or short-circuit for obvious write operations) ──────
+        # Misrouting a write to analytical bypasses the confirmation gate.
+        if _WRITE_INTENT_RE.search(question):
+            params = {
+                "route":             "operational",
+                "exercise_names":    None,
+                "muscle_groups":     None,
+                "query_period_days": 90,
+                "needs_custom_sql":  False,
+                "custom_sql_intent": None,
+            }
+        else:
+            params = await self._classify(question)
         route  = params.get("route", "operational")
 
         # ── 2. Route ──────────────────────────────────────────────────────────
@@ -215,6 +277,8 @@ class Coordinator:
                     f"Please try again or contact support if this persists."
                 )
             except Exception as e:
+                if _is_rate_limit(e):
+                    raise
                 logger.error("[coordinator] analytical pipeline failed: %s", e)
                 # Fall back to operational on pipeline failure
                 route  = "operational"
@@ -251,6 +315,19 @@ class Coordinator:
             "needs_custom_sql":   False,
             "custom_sql_intent":  None,
         }
+        # Follow-up questions ("what about my squat?") are unclassifiable
+        # without the previous turn — give the classifier a compact window.
+        classify_input = question
+        if self._history:
+            recent = self._history[-2:]
+            ctx_lines = [
+                f"{t.get('role', '?')}: {(t.get('content') or '')[:300]}"
+                for t in recent
+            ]
+            classify_input = (
+                "[PREVIOUS TURNS]\n" + "\n".join(ctx_lines)
+                + "\n\n[CURRENT MESSAGE]\n" + question
+            )
         try:
             config = types.GenerateContentConfig(
                 system_instruction=_CLASSIFY_SYSTEM,
@@ -263,7 +340,7 @@ class Coordinator:
                 model=COORDINATOR_MODEL,
                 contents=[types.Content(
                     role="user",
-                    parts=[types.Part.from_text(text=question)],
+                    parts=[types.Part.from_text(text=classify_input)],
                 )],
                 config=config,
             )
@@ -290,6 +367,8 @@ class Coordinator:
             return params
 
         except Exception as e:
+            if _is_rate_limit(e):
+                raise
             logger.warning("[coordinator] classify failed: %s — defaulting to operational", e)
             return default
 
@@ -321,17 +400,18 @@ class Coordinator:
             for name in exercise_names:
                 result = resolve_exercise_name(name, db_path)
                 match = result.get("match") or (result.get("candidates") or [None])[0]
-                if match:
-                    resolved.append(match)
-            if resolved:
-                exercise_names = resolved
+                # Keep the original name when resolution fails entirely —
+                # the package filter then reports it in
+                # unresolved_exercise_names and the user is told it wasn't
+                # found. Dropping it here made the name vanish silently:
+                # the answer covered the other exercises with no mention
+                # of the one that didn't exist.
+                resolved.append(match or name)
+            exercise_names = resolved
         muscle_groups     = params.get("muscle_groups")
         query_period_days = params.get("query_period_days", 90)
 
-        # Build compact package
-        # NOTE: research=None and memories=None until shared modules are built.
-        # Package size for general questions (no filter) remains large (~986KB)
-        # until the focused-package gap fix is implemented (P5/P6).
+        # Build compact package (scope-aware trim: BROAD 365d ≈ 396 KB)
         pkg = await asyncio.to_thread(
             prepare_analysis_package,
             query_period_days=query_period_days,
@@ -339,6 +419,18 @@ class Coordinator:
             muscle_groups=muscle_groups,
             include_phase2=True,
         )
+
+        # Pop unresolved exercise names before the LLM sees the package.
+        # These are names the filter failed to match; the package covers
+        # overall training as a broad fallback in that case.
+        unresolved_names = pkg.pop("unresolved_exercise_names", None)
+
+        # Effective names: those that actually appeared in the package
+        # (used to build scope notes — unresolved names are excluded).
+        effective_names = (
+            [n for n in (exercise_names or []) if n not in (unresolved_names or [])]
+            if exercise_names else None
+        ) or None
 
         conversation_context = self._history[-CONTEXT_WINDOW:] or None
 
@@ -349,10 +441,10 @@ class Coordinator:
         # was fetched.
         pkg_scope   = pkg.get("scope", "broad")
         scope_parts = []
-        if exercise_names:
+        if effective_names:
             scope_parts.append(
                 f"Note: the data package covers only these exercises: "
-                f"{', '.join(exercise_names)}."
+                f"{', '.join(effective_names)}."
             )
         elif muscle_groups:
             scope_parts.append(
@@ -388,7 +480,7 @@ class Coordinator:
         else:
             scoped_question = question
 
-        # Stubs — replace when shared modules are built
+        # Best-effort enrichment — research and memories never block the pipeline
         try:
             from src.shared.rag import search_fitness_knowledge
             research = search_fitness_knowledge(question) or None
@@ -434,6 +526,25 @@ class Coordinator:
             flagged.extend(flagged2)
             # No second coverage check — return best effort
 
+        # Prefix answer when requested exercises weren't found in the DB.
+        # Partial resolution (some names matched) covers the matched
+        # exercises; total failure falls back to the broad package.
+        if unresolved_names:
+            names_str = ", ".join(unresolved_names)
+            if effective_names:
+                coverage = ", ".join(effective_names)
+                answer = (
+                    f"Note: {names_str} wasn't found in your workout history, "
+                    f"so this answer covers {coverage}.\n\n"
+                    + answer
+                )
+            else:
+                answer = (
+                    f"Note: {names_str} wasn't found in your workout history, "
+                    f"so this answer covers your overall training instead.\n\n"
+                    + answer
+                )
+
         return answer, flagged
 
     # ── Custom SQL ────────────────────────────────────────────────────────────
@@ -463,7 +574,11 @@ class Coordinator:
                 "rows":      result.get("rows", []),
                 "row_count": result.get("row_count", 0),
             }
-        except Exception:
+        except Exception as e:
+            # Rate limits propagate so the CLI/server countdown UX fires;
+            # any other failure just means no supplementary data.
+            if _is_rate_limit(e):
+                raise
             return None
 
     # ── Operational path ──────────────────────────────────────────────────────
@@ -535,6 +650,8 @@ class Coordinator:
             return answer, complete
 
         except Exception as e:
+            if _is_rate_limit(e):
+                raise
             logger.warning(
                 "[coordinator] coverage check failed: %s — returning original", e
             )

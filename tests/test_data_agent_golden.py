@@ -162,15 +162,15 @@ def test_G_MWE_machine_wrist_extension_offset_unit():
 
 def test_G_WALK_walking_alltime_sessions():
     """
-    Walking all-time session count: 78 distinct training days.
-    Pinned to 2026-05-28 snapshot.
+    Walking all-time session count: 79 distinct training days.
+    Pinned to 2026-06-11 snapshot.
     """
     data = collect(query_period_days=None, exercise_names=["Walking"])
     ex = _ex(data, "Walking")
 
     # C3: total_sessions_alltime must be non-null and correct
     lc = ex.get("learning_curve", {})
-    assert lc.get("total_sessions_alltime") == 78
+    assert lc.get("total_sessions_alltime") == 79
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -253,18 +253,18 @@ def test_G_CARDIO0_cycling_dead_hang_duration_no_pace():
 
 def test_G_ALLTIME_alltime_summary():
     """
-    All-time training summary: first session 2024-06-04, last 2026-05-25,
-    300 distinct training days.
-    Pinned to 2026-05-28 snapshot.
+    All-time training summary: first session 2024-06-04, last 2026-05-29,
+    305 distinct training days.
+    Pinned to 2026-06-11 snapshot.
     """
     data = collect(query_period_days=None)
     ats = data["all_time_summary"]
 
     # E1: boundary dates
     assert ats["first_training_date"] == "2024-06-04"
-    assert ats["last_training_date"]  == "2026-05-25"
+    assert ats["last_training_date"]  == "2026-05-29"
     # E4: distinct training day count
-    assert ats["total_training_days"] == 300
+    assert ats["total_training_days"] == 305
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -745,3 +745,67 @@ def test_G_CATGATE_later_category_exercises_no_warmup():
             f"D3 negative: {ex_name} is not first-in-category on 2024-06-04 "
             "— category gate must block weight-based warmup detection"
         )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# G-SCOPE-FALLBACK · nonexistent exercise_names → broad fallback + loud log
+# spec: scope derived from effective package contents, not classifier intent
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_G_SCOPE_FALLBACK_nonexistent_exercise():
+    """
+    prepare_analysis_package with exercise_names=["Nonexistent Exercise XYZ"]
+    must:
+      • return scope == 'broad'  (filter matched nothing → broad fallback)
+      • return a trimmed package (< 500 KB)
+      • record the unresolved name in package["unresolved_exercise_names"]
+      • emit a WARNING log containing the unresolved name
+    """
+    import json as _json2
+    import logging
+
+    log_records: list = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            log_records.append(record.getMessage())
+
+    da_log = logging.getLogger("src.data_agent")
+    handler = _Capture()
+    da_log.addHandler(handler)
+    try:
+        pkg = prepare_analysis_package(
+            exercise_names=["Nonexistent Exercise XYZ"],
+            query_period_days=90,
+            include_phase2=False,
+        )
+    finally:
+        da_log.removeHandler(handler)
+
+    assert pkg.get("scope") == "broad", (
+        f"G-SCOPE-FALLBACK: expected scope='broad', got {pkg.get('scope')!r}"
+    )
+
+    size_kb = len(_json2.dumps(pkg, default=str).encode()) / 1024
+    assert size_kb < 500, (
+        f"G-SCOPE-FALLBACK: package is {size_kb:.1f} KB, expected < 500 KB "
+        f"(broad trim must run when filter matches nothing)"
+    )
+
+    unresolved = pkg.get("unresolved_exercise_names")
+    assert unresolved, (
+        "G-SCOPE-FALLBACK: 'unresolved_exercise_names' key must be present and non-empty"
+    )
+    assert "Nonexistent Exercise XYZ" in unresolved, (
+        f"G-SCOPE-FALLBACK: expected 'Nonexistent Exercise XYZ' in unresolved list, "
+        f"got {unresolved!r}"
+    )
+
+    loud_logged = any(
+        "Nonexistent Exercise XYZ" in msg or "resolved to 0" in msg
+        for msg in log_records
+    )
+    assert loud_logged, (
+        f"G-SCOPE-FALLBACK: expected a WARNING log containing the unresolved name; "
+        f"captured log messages: {log_records[:10]}"
+    )

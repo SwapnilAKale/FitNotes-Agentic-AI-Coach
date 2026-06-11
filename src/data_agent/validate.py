@@ -37,6 +37,9 @@ Invariants implemented here (checkable from the package alone):
   G2  no None where a value is required given data exists
   G3  package serialises to JSON
   G4  (soft) flag filtered packages over ~400 KB
+  G5  (soft) BROAD packages must not contain dropped deep-stat fields
+  G6  scope consistency (integrity): focused→≤3 exercises;
+      broad→no leaked deep-stat fields + exactly one agg level per exercise
 """
 
 import json
@@ -564,6 +567,52 @@ def _check_g5(package: dict, v: list) -> None:
                     "(trim_package should have removed it)"))
 
 
+def _check_g6(package: dict, v: list) -> None:
+    """
+    G6 (integrity) — scope consistency.
+
+    focused : exercises in package must be <= 3.
+              A focused-labeled 60-exercise package is a scope-derivation bug;
+              it must never reach the Analysis Agent.
+
+    broad   : (a) no non-cardio exercise may carry full_comments or any
+                  dropped deep-stat key (hard version of the soft G5 check);
+              (b) each non-cardio exercise must have exactly one of the three
+                  aggregation-level arrays present (trim_package enforces this).
+    """
+    scope = package.get("scope")
+    exercises = [ex for ex in package.get("exercises", []) if not ex.get("is_cardio")]
+
+    if scope == "focused":
+        n = len(package.get("exercises", []))
+        if n > 3:
+            v.append(_viol("G6",
+                f"scope='focused' but package contains {n} exercises "
+                f"(must be <= 3); scope was derived from classifier intent, "
+                f"not effective filter results"))
+        return
+
+    if scope == "broad":
+        # (a) Leaked deep-stat fields — integrity version of G5
+        for ex in exercises:
+            name = ex.get("name", "?")
+            for field in _BROAD_ABSENT_FIELDS:
+                if field in ex:
+                    v.append(_viol("G6",
+                        f"{name}: scope='broad' package has '{field}' present "
+                        f"(must be absent after trim)"))
+
+        # (b) Exactly one aggregation level per exercise
+        _AGG_KEYS = ("weekly_aggregations", "monthly_aggregations", "yearly_aggregations")
+        for ex in exercises:
+            present = [k for k in _AGG_KEYS if k in ex]
+            if len(present) != 1:
+                name = ex.get("name", "?")
+                v.append(_viol("G6",
+                    f"{name}: scope='broad' package has {len(present)} aggregation "
+                    f"level(s) present ({present}); expected exactly 1"))
+
+
 # ── Public entry point ────────────────────────────────────────────────────────
 
 def validate(package: dict) -> list:
@@ -604,5 +653,6 @@ def validate(package: dict) -> list:
     _check_g3(package, violations)             # G3
     _check_g4(package, violations)             # G4
     _check_g5(package, violations)             # G5
+    _check_g6(package, violations)             # G6
 
     return violations

@@ -41,6 +41,34 @@ ANALYSIS_MODEL  = "gemini-3.1-flash-lite"   # same as agent.py — free tier, su
 GROUNDING_MODEL = "gemini-3.1-flash-lite"   # no thinking needed for grounding check
 THINKING_BUDGET   = 4096
 MAX_OUTPUT_TOKENS = 2048
+# The grounding check must return the ENTIRE cleaned answer inside a JSON
+# envelope plus flagged claims. With the same 2048 ceiling as the draft,
+# any near-limit draft truncates the JSON → parse failure → grounding
+# silently skipped exactly when the answer is longest. Give it headroom.
+GROUNDING_MAX_OUTPUT_TOKENS = 4096
+
+
+def _collect_text(response) -> str:
+    """
+    Concatenate all non-thinking text parts of a Gemini response.
+
+    Thinking models can return multiple parts; parts flagged thought=True
+    are reasoning, not answer. Keeping only the LAST text part (the old
+    behaviour) silently dropped answer text whenever the model returned
+    more than one visible part.
+    """
+    candidate = response.candidates[0] if response.candidates else None
+    texts = []
+    if candidate and candidate.content:
+        for part in candidate.content.parts:
+            if getattr(part, "thought", False):
+                continue
+            text = getattr(part, "text", None)
+            if text:
+                texts.append(text)
+    if texts:
+        return "".join(texts)
+    return getattr(response, "text", "") or ""
 
 # ── System prompts ────────────────────────────────────────────────────────────
 
@@ -437,17 +465,8 @@ async def analyze(
     )
 
     # Gemini thinking models return thinking tokens + response tokens.
-    # Collect only the final response text (non-thinking parts).
-    draft = ""
-    candidate = response.candidates[0] if response.candidates else None
-    if candidate and candidate.content:
-        for part in candidate.content.parts:
-            text = getattr(part, "text", None)
-            if text:
-                draft = text  # last text part is the visible response
-
-    if not draft:
-        draft = getattr(response, "text", "") or ""
+    # Collect all non-thinking text parts.
+    draft = _collect_text(response)
 
     if not draft:
         logger.warning("[analysis_agent] empty response from Gemini")
@@ -493,20 +512,11 @@ async def ground_check(
         )],
         config=types.GenerateContentConfig(
             system_instruction=_GROUNDING_SYSTEM,
-            max_output_tokens=MAX_OUTPUT_TOKENS,
+            max_output_tokens=GROUNDING_MAX_OUTPUT_TOKENS,
         ),
     )
 
-    raw = ""
-    candidate = response.candidates[0] if response.candidates else None
-    if candidate and candidate.content:
-        for part in candidate.content.parts:
-            text = getattr(part, "text", None)
-            if text:
-                raw = text
-
-    if not raw:
-        raw = getattr(response, "text", "") or ""
+    raw = _collect_text(response)
 
     # Parse JSON — if parsing fails, return original draft unchanged
     # and log for debugging. A failed grounding check is better than

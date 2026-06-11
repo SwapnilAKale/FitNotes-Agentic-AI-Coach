@@ -557,3 +557,90 @@ the latest workout entry in the database, plus interpretation rules:
 
 Relative ranges anchor to the latest workout entry because the user's data may
 not extend to today.
+---
+
+# Session 9 — Full-Project Audit: Fixes & Hardening
+
+A line-by-line audit of the multi-agent pipeline (coordinator → data agent →
+analysis agent → grounding → coverage) against the documented behaviour.
+Seven fixes landed; all 73 tests pass.
+
+## Fixed
+
+**Custom SQL execution is now actually read-only.**
+The docs (and a commit message) claimed `data_agent.query()` had been
+refactored onto `shared/sql_executor`. The code never was — LLM-generated SQL
+ran on a read-write connection behind a space-delimited keyword blacklist
+that `WITH c AS (SELECT 1)INSERT INTO ...` walks straight past. `query()`
+now executes through `shared/sql_executor.run_query`: `mode=ro` URI
+connection (writes fail at the database level no matter what the text guard
+misses), SELECT/WITH-only guard, `LIMIT 10000` injection, 30-second
+interrupt timeout. The `typed_weight` conversion layer is unchanged.
+`fetch.py`'s own connection is read-only too — a plain `sqlite3.connect()`
+also silently *creates* an empty DB file when the path is wrong; `mode=ro`
+makes misconfiguration loud.
+
+**Cross-unit comparisons in progression are fully normalized.**
+`_compute_progression` normalized only the start/end pair. The plateau loop,
+`sessions_at_max`, and peak/regression detection still compared raw numbers
+across the Deadlift lbs→kg switch. All comparisons now go through per-session
+kg normalization; reported values stay in the end session's unit. Same
+results for current data (the latent bug never triggered) — correct for any
+future data where it would have.
+
+**Phase 2 triggers on regressions, not just improvements.**
+`weight_change_pct > 20` only fired on improvements. A 20 % *drop* is
+exactly when the comment history matters most (injury, deload, technique
+rebuild). Now `abs(weight_change_pct) > 20`.
+
+**Unresolvable exercise names are reported, not silently dropped.**
+When the Coordinator resolved ["Bench Press", "Foobar"] and Foobar matched
+nothing, it was removed from the filter list — the answer covered Bench with
+no mention that Foobar doesn't exist. Unresolvable names now flow through to
+the package, come back as `unresolved_exercise_names`, and the answer is
+prefixed with what was and wasn't found.
+
+**Grounding check no longer silently skips long answers.**
+The grounding call must return the entire cleaned answer inside a JSON
+envelope, but shared the draft's 2048-token output ceiling — any near-limit
+draft truncated the JSON, failed parsing, and returned ungrounded. Grounding
+now has a 4096-token ceiling. Response parsing across the agent also collects
+*all* non-thinking text parts instead of keeping only the last part.
+
+**`/reload-db` set a dead local variable.**
+`agent_ready = False` without a `global` declaration — the flag never
+changed and `/chat` kept serving against a session about to be torn down.
+
+**`cli.py` imported `groq` — a package not in requirements.txt.**
+Leftover from the eliminated Groq stack; fresh installs crashed at import.
+Removed. Rate limits are handled by the existing generic 429 path.
+
+## Improved
+
+- Classifier sees the previous turn — follow-ups like "what about my squat?"
+  were previously classified with no context.
+- Classifier muscle-group list now includes Abs and Cardio (both are valid
+  categories the Data Agent already filters on; the prompt omitted them).
+- Rate limits raised inside custom-SQL generation now propagate to the
+  countdown UX instead of being swallowed.
+- Stale "stubs in place" comments removed from the Coordinator — the shared
+  modules have been wired since Session 7.
+
+## Known gaps (documented, not yet fixed)
+
+- `/upload` writes the DB file without holding the agent lock — a query
+  in flight during an upload reads a half-replaced file.
+- `/history` returns only the single agent's history; analytical turns live
+  in `Coordinator._history` and are lost on session restore.
+- Multi-candidate name resolution ("bench" → flat/incline/decline) picks the
+  first candidate without asking. Disambiguation needs a clarification path
+  through the analytical pipeline.
+- `daily_workouts` per-exercise e1RM is computed plates-only (no bar), unlike
+  sessions. Trimmed packages drop `daily_workouts`, so the Analysis Agent
+  never sees the inconsistency — but `workout_position_effect` positions are
+  derived from it.
+- `all_time_summary.total_volume_raw_lbs` multiplies every row by 2.2046,
+  which mislabels kg-native exercise volume; field is marked "raw" but the
+  Analysis Agent could still quote it.
+- Goal projections compare a bar-exclusive target weight against bar-inclusive
+  e1RMs. The Goal table is still empty, so untested either way.

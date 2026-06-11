@@ -10,9 +10,14 @@ load_dotenv()
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from groq import RateLimitError
-
 from src.agent import AgentSession
+from src.coordinator import Coordinator
+
+# Gemini ResourceExhausted (429) re-raised by Coordinator when quota is exhausted
+try:
+    from google.api_core.exceptions import ResourceExhausted as _GeminiResourceExhausted
+except ImportError:
+    class _GeminiResourceExhausted(Exception): pass  # type: ignore[misc]
 
 DB_PATH = os.environ.get("FITNOTES_DB_PATH", "./data/FitNotes_Backup.fitnotes")
 memory_only = "--memory-only" in sys.argv
@@ -73,6 +78,8 @@ async def main() -> None:
             print("Drop your FitNotes_Backup.fitnotes file into the data/ folder first.")
             print()
 
+        coordinator = Coordinator(session) if not memory_only else None
+
         while True:
             try:
                 question = input("You: ").strip()
@@ -85,12 +92,18 @@ async def main() -> None:
                 print("Goodbye.")
                 break
             try:
-                result = await session.answer(question)
-                if result["error"] and result["error"] != "max_iterations_reached":
-                    print(f"\n[Error] {result['error']}\n")
+                if memory_only:
+                    result = await session.answer(question)
+                    if result["error"] and result["error"] != "max_iterations_reached":
+                        print(f"\n[Error] {result['error']}\n")
+                    else:
+                        print(f"\n{result['answer']}\n")
                 else:
+                    result = await coordinator.route(question)
+                    if result.get("route"):
+                        print(f"\x1b[2m[route: {result['route']}]\x1b[0m")
                     print(f"\n{result['answer']}\n")
-            except RateLimitError as e:
+            except _GeminiResourceExhausted as e:
                 wait_msg = ""
                 if "Please try again in" in str(e):
                     wait_msg = str(e).split("Please try again in")[1].split(".")[0].strip()

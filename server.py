@@ -27,6 +27,7 @@ DEBUG = args.debug
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from src.agent import AgentSession
+from src.coordinator import Coordinator
 
 DB_PATH = os.environ.get("FITNOTES_DB_PATH", "./data/FitNotes_Backup.fitnotes")
 FRONTEND_SERVER = Path(__file__).parent / "frontend" / "server.py"
@@ -304,6 +305,7 @@ _state: dict = {
 }
 
 session: AgentSession | None = None
+coordinator: Coordinator | None = None
 agent_lock: asyncio.Lock | None = None
 
 
@@ -323,11 +325,12 @@ async def _confirmation_handler(tool_name: str, arguments: dict) -> bool:
 
 
 async def _initialize_in_background() -> None:
-    global session, agent_ready
+    global session, agent_ready, coordinator
     try:
         session = AgentSession(DB_PATH, debug=DEBUG)
         session.confirmation_handler = _confirmation_handler
         await session.initialize()
+        coordinator = Coordinator(session)
         agent_ready = True
         print("[Server] Agent ready.")
     except Exception as exc:
@@ -468,9 +471,9 @@ async def chat(body: ChatRequest):
         _state["allow_execute"] = False
         _state["staging_preview"] = ""
         try:
-            result = await session.answer(body.message)
+            result = await coordinator.route(body.message)
             if DEBUG:
-                print(f"[DEBUG] Result: {json.dumps(result, indent=2)}")
+                print(f"[DEBUG] Result: {json.dumps({k: v for k, v in result.items() if k != 'flagged_claims'}, indent=2)}")
         except Exception as exc:
             if DEBUG:
                 import traceback
@@ -485,7 +488,7 @@ async def chat(body: ChatRequest):
             })
         if result.get("error") and result["error"] != "max_iterations_reached":
             return JSONResponse(content={"type": "error", "text": result["error"]})
-        return JSONResponse(content={"type": "answer", "text": result.get("answer", "")})
+        return JSONResponse(content={"type": "answer", "text": result.get("answer", ""), "route": result.get("route")})
 
 
 @app.post("/confirm")
@@ -505,6 +508,9 @@ async def confirm(body: ConfirmRequest):
         _state["pending_confirmation"] = False
         message = "Yes, confirmed, please execute" if body.confirmed else "Cancel that"
         try:
+            # Route directly to session — /confirm is the continuation of an
+            # in-flight staged write; routing through the Coordinator could
+            # misclassify a bare "yes" as a new analytical or operational query.
             result = await session.answer(message)
         except Exception as exc:
             return _error_response(exc)
@@ -516,7 +522,7 @@ async def confirm(body: ConfirmRequest):
 
 
 async def _reinitialize_session():
-    global session, agent_ready
+    global session, agent_ready, coordinator
     agent_ready = False
 
     if session is not None:
@@ -530,6 +536,7 @@ async def _reinitialize_session():
         session = AgentSession(DB_PATH, debug=DEBUG)
         session.confirmation_handler = _confirmation_handler
         await session.initialize()
+        coordinator = Coordinator(session)
         agent_ready = True
         print("[Server] Agent reinitialized successfully.")
     except Exception as e:
@@ -539,7 +546,10 @@ async def _reinitialize_session():
 
 @app.post("/reload-db")
 async def reload_db(new_exercises: list = None):
-    global _last_db_fingerprint
+    # agent_ready must be in the global statement — without it the
+    # assignment below creates a dead local and /chat keeps serving
+    # against a session that is about to be torn down.
+    global _last_db_fingerprint, agent_ready
 
     current_fingerprint = _get_db_fingerprint(DB_PATH)
     if current_fingerprint == _last_db_fingerprint and current_fingerprint != "":

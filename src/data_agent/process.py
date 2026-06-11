@@ -880,17 +880,35 @@ def _compute_progression(sessions: list) -> dict:
         if max_weight_start > 0 else None
     )
 
-    current_max = max_weight_end; plateau_since = last["date"]
-    for s in reversed(sessions):
-        if s["max_working_weight"] >= current_max: plateau_since = s["date"]
-        else: break
-    sessions_at_max = sum(1 for s in sessions if s["max_working_weight"] >= current_max)
+    # Plateau / peak / regression comparisons are kg-normalized per session
+    # unit. Raw comparison is a latent cross-unit bug for exercises with a
+    # mid-history unit switch (Deadlift): a 150 lbs session would compare as
+    # "above" a 70 kg session. For single-unit exercises the kg conversion
+    # is the same monotonic transform on every value — behaviour unchanged.
+    def _mww_kg(s: dict) -> float:
+        return _to_kg(s["max_working_weight"], s.get("unit", last_unit))
 
-    peak_weight = max(s["max_working_weight"] for s in sessions)
-    peak_date   = next(s["date"] for s in reversed(sessions)
-                       if s["max_working_weight"] == peak_weight)
+    current_max_kg = _mww_kg(last); plateau_since = last["date"]
+    for s in reversed(sessions):
+        if _mww_kg(s) >= current_max_kg - 1e-9: plateau_since = s["date"]
+        else: break
+    sessions_at_max = sum(1 for s in sessions if _mww_kg(s) >= current_max_kg - 1e-9)
+
+    peak_kg      = max(_mww_kg(s) for s in sessions)
+    peak_session = next(s for s in reversed(sessions)
+                        if _mww_kg(s) >= peak_kg - 1e-9)
+    peak_date    = peak_session["date"]
+    # Report the peak in the END session's unit so peak/current/regression
+    # share one frame of reference even across a unit switch. When the peak
+    # session is already in the end unit (the normal case) the raw value is
+    # used unchanged.
+    if peak_session.get("unit", last_unit) == last_unit:
+        peak_weight = peak_session["max_working_weight"]
+    else:
+        peak_weight = round(peak_kg if last_unit == "kg" else peak_kg * 2.2046, 1)
+    end_kg       = _mww_kg(last)
     regression_from_peak = None
-    if max_weight_end < peak_weight:
+    if end_kg < peak_kg - 0.005:
         regression_from_peak = {
             "peak_weight":       peak_weight,
             "peak_date":         peak_date,
@@ -1098,9 +1116,13 @@ def _evaluate_phase2(progression: dict, end_date) -> tuple:
     if progression.get("plateau_since"):
         plateau_dt   = datetime.strptime(progression["plateau_since"], "%Y-%m-%d").date()
         plateau_days = (end_date - plateau_dt).days
+    # abs(): a >20% REGRESSION warrants the full comment history at least as
+    # much as a >20% improvement — comments are where the reason for a drop
+    # lives (injury, deload, technique rebuild). The old `> 20` only fired
+    # on improvements.
     triggered = (
         plateau_days > PLATEAU_TRIGGER_DAYS or
-        (progression.get("weight_change_pct") or 0) > IMPROVEMENT_TRIGGER_PCT
+        abs(progression.get("weight_change_pct") or 0) > IMPROVEMENT_TRIGGER_PCT
     )
     return triggered, plateau_days
 

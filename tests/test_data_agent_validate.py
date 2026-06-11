@@ -957,3 +957,85 @@ def test_real_package_violations_informational():
         f"G5 must not fire — trim_package must have removed all BROAD-dropped fields. "
         f"Found: {sorted(ids)}"
     )
+
+
+# ── G6 ────────────────────────────────────────────────────────────────────────
+
+def _focused_exercise() -> dict:
+    """A minimal correct FOCUSED exercise: all three agg levels retained."""
+    return _exercise()  # base exercise has weekly, monthly, and yearly agg levels
+
+
+def _broad_exercise_one_agg() -> dict:
+    """A correctly-trimmed BROAD exercise: no deep-stat fields, exactly one agg level."""
+    ex = _exercise()
+    for key in ("inter_exercise_correlation", "dow_e1rm_pattern",
+                "consecutive_day_effect", "rest_performance_buckets",
+                "e1rm_history", "pr_context", "full_comments"):
+        ex.pop(key, None)
+    # Keep only weekly_aggregations (the keep-key for query_period_days=90)
+    ex.pop("monthly_aggregations", None)
+    ex.pop("yearly_aggregations", None)
+    return ex
+
+
+def test_g6_focused_too_many_exercises_raises():
+    """scope='focused' with 60 exercises must raise DataAgentIntegrityError (G6)."""
+    from src.data_agent import DataAgentIntegrityError, _report_violations
+
+    pkg = _package()
+    pkg["scope"] = "focused"
+    # Inject 60 exercises (copy with different names to avoid unit/other violations)
+    pkg["exercises"] = [
+        {**_focused_exercise(), "name": f"Exercise_{i}"}
+        for i in range(60)
+    ]
+    pkg["total_exercises_analyzed"] = 60
+
+    violations = validate(pkg)
+    assert any(v.invariant_id == "G6" for v in violations), (
+        f"G6 must fire for focused+60 exercises; violations: "
+        f"{[(v.invariant_id, v.message) for v in violations]}"
+    )
+    # Must hard-raise as integrity
+    with pytest.raises(DataAgentIntegrityError) as exc_info:
+        _report_violations(violations, "test")
+    assert any(v.invariant_id == "G6" for v in exc_info.value.violations), (
+        "G6 must be in DataAgentIntegrityError.violations"
+    )
+
+
+def test_g6_correct_focused_passes():
+    """scope='focused' with 1 exercise must pass G6."""
+    pkg = _package()
+    pkg["scope"] = "focused"
+    pkg["exercises"] = [_focused_exercise()]
+
+    violations = validate(pkg)
+    g6 = [v for v in violations if v.invariant_id == "G6"]
+    assert not g6, (
+        f"G6 must not fire for a correct focused package (1 exercise); "
+        f"violations: {[(v.invariant_id, v.message) for v in g6]}"
+    )
+
+
+def test_g6_broad_leaked_full_comments_raises():
+    """scope='broad' with full_comments on a non-cardio exercise raises G6 (integrity)."""
+    from src.data_agent import DataAgentIntegrityError, _report_violations
+
+    pkg = _package()
+    pkg["scope"] = "broad"
+    pkg["exercises"] = [_broad_exercise_one_agg()]
+    pkg["exercises"][0]["full_comments"] = [
+        {"date": "2026-06-01", "comment": "test", "set_id": 1}
+    ]
+
+    violations = validate(pkg)
+    assert any(v.invariant_id == "G6" for v in violations), (
+        f"G6 must fire for broad package with leaked full_comments; "
+        f"violations: {[(v.invariant_id, v.message) for v in violations]}"
+    )
+    # G6 is integrity — must hard-raise
+    with pytest.raises(DataAgentIntegrityError) as exc_info:
+        _report_violations(violations, "test")
+    assert any(v.invariant_id == "G6" for v in exc_info.value.violations)

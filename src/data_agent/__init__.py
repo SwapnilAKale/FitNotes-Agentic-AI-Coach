@@ -37,14 +37,58 @@ class DataAgentIntegrityError(Exception):
         super().__init__(f"data integrity check failed [{ids}]: {msgs}")
 
 
-def _derive_scope(exercise_names: Optional[list],
-                  muscle_groups:  Optional[list]) -> str:
-    """Derive trim profile scope from query filters."""
-    if exercise_names and len(exercise_names) <= 3:
-        return "focused"
+def _derive_scope_from_package(
+    package:        dict,
+    exercise_names: Optional[list],
+    muscle_groups:  Optional[list],
+) -> tuple:
+    """
+    Derive scope from EFFECTIVE package contents, not classifier intent.
+
+    Returns (scope: str, unresolved_names: list).
+
+    Rules:
+      - exercise_names filter was applied AND effective exercises <= 3 -> focused
+      - muscle_groups filter was applied AND matched at least one exercise -> group
+      - otherwise (no filter, or any filter that matched nothing) -> broad
+
+    A filter that resolves to zero exercises logs loud and falls back to broad
+    so the broad trim runs — an empty-filter package must never receive
+    scope='focused' and skip trimming.
+    """
+    exercises   = package.get("exercises", [])
+    n_effective = len(exercises)
+    unresolved: list = []
+
+    if exercise_names:
+        effective_lower = {ex["name"].lower() for ex in exercises}
+        unresolved = [n for n in exercise_names if n.lower() not in effective_lower]
+
+        if n_effective == 0:
+            _log.warning(
+                "[data_agent] exercise_names filter resolved to 0 exercises in package. "
+                "Unresolved: %s. Filter list was: %s. Falling back to BROAD scope.",
+                ", ".join(repr(n) for n in unresolved),
+                exercise_names,
+            )
+            return "broad", unresolved
+
+        if n_effective <= 3:
+            return "focused", unresolved
+
+        # >3 effective exercises despite an exercise_names filter — fall through
+
     if muscle_groups:
-        return "group"
-    return "broad"
+        if n_effective > 0:
+            return "group", unresolved
+        _log.warning(
+            "[data_agent] muscle_groups filter %r matched 0 exercises in package. "
+            "Falling back to BROAD scope.",
+            muscle_groups,
+        )
+        return "broad", unresolved
+
+    return "broad", unresolved
 
 
 def _report_violations(violations: list, source: str) -> None:
@@ -133,7 +177,11 @@ def prepare_analysis_package(
         aggregation_level=aggregation_level,
         include_phase2=include_phase2,
     )
-    scope   = _derive_scope(exercise_names, muscle_groups)
+    # Scope is derived from what actually survived filtering, not from
+    # classifier intent. A filter that matched nothing must build as BROAD.
+    scope, unresolved = _derive_scope_from_package(package, exercise_names, muscle_groups)
     trimmed = trim_package(package, scope=scope)
+    if unresolved:
+        trimmed["unresolved_exercise_names"] = unresolved
     _report_violations(validate(trimmed), "prepare_analysis_package")
     return trimmed
