@@ -679,13 +679,14 @@ def _build_sessions_from_rows(rows: list, ctx: dict,
             "total_duration_seconds": total_duration_s,
             "working_sets_count": len(working_sets),
             "warmup_weight":      warmup_sets[0]["weight"] if warmup_sets else None,
+            "warmup_weight_plates_only": True,
             "is_pr_session":      any(s["is_personal_record"] for s in sets),
             "form_quality":       form_quality,
             "form_detail":        form_detail,
             "comment_count":      sum(1 for s in sets if s["comment"]),
             "has_pain_flag":      any(s["is_pain_flag"] for s in sets),
             "failed_attempts":    sum(1 for s in sets if s["is_failed_attempt"]),
-            "technique_variants": list({v for s in sets for v in s["technique_variants"]}),
+            "technique_variants": sorted({v for s in sets for v in s["technique_variants"]}),
             "rep_ranges": {
                 "strength_sets":   strength_sets,
                 "hypertrophy_sets":hypertrophy_sets,
@@ -708,7 +709,8 @@ def _get_aggregation_level(period_days: Optional[int]) -> str:
 
 def _aggregate_weekly(sessions: list) -> list:
     by_week: dict = defaultdict(lambda: {
-        "dates": [], "max_weight": 0.0, "total_volume": 0.0,
+        "dates": [], "max_weight": 0.0,
+        "total_volume_lbs": 0.0, "total_volume_kg": 0.0,
         "session_count": 0, "e1rm_values": [], "form_qualities": [],
         "pain_count": 0, "failed_count": 0,
         "total_distance": 0.0, "total_duration_seconds": 0,
@@ -718,7 +720,10 @@ def _aggregate_weekly(sessions: list) -> list:
         bw   = by_week[week]
         bw["dates"].append(s["date"])
         bw["session_count"]  += 1
-        bw["total_volume"]   += s["total_volume"]
+        # Per-unit volume buckets: a week may span a unit switch (Deadlift
+        # lbs->kg on 2025-12-26) — never add a kg session onto an lbs sum.
+        bw["total_volume_kg" if s.get("unit") == "kg" else "total_volume_lbs"] \
+            += s["total_volume"]
         bw["form_qualities"].append(s["form_quality"])
         bw["pain_count"]     += 1 if s["has_pain_flag"] else 0
         bw["failed_count"]   += s["failed_attempts"]
@@ -734,9 +739,12 @@ def _aggregate_weekly(sessions: list) -> list:
             "session_dates":      d["dates"],
             "session_count":      d["session_count"],
             "max_working_weight": d["max_weight"],
-            "total_volume":       round(d["total_volume"], 1),
+            "total_volume_lbs":   round(d["total_volume_lbs"], 1),
+            "total_volume_kg":    round(d["total_volume_kg"], 1),
             "peak_estimated_1rm": round(max(e1rm), 1) if e1rm else 0.0,
-            "form_quality_mode":  max(set(q), key=q.count) if q else "unknown",
+            # sorted() tie-break: deterministic across processes (set iteration
+            # order is hash-randomized; equal-count modes used to flip randomly)
+            "form_quality_mode":  max(sorted(set(q)), key=q.count) if q else "unknown",
             "pain_sessions":      d["pain_count"],
             "failed_attempts":    d["failed_count"],
             "total_distance":         round(d["total_distance"], 3),
@@ -747,7 +755,8 @@ def _aggregate_weekly(sessions: list) -> list:
 
 def _aggregate_monthly(sessions: list) -> list:
     by_month: dict = defaultdict(lambda: {
-        "dates": [], "max_weight": 0.0, "total_volume": 0.0,
+        "dates": [], "max_weight": 0.0,
+        "total_volume_lbs": 0.0, "total_volume_kg": 0.0,
         "session_count": 0, "e1rm_values": [], "reps_at_max_list": [],
         "pain_count": 0, "failed_count": 0,
         "strength_sets": 0, "hypertrophy_sets": 0, "endurance_sets": 0,
@@ -757,7 +766,8 @@ def _aggregate_monthly(sessions: list) -> list:
         month = s["date"][:7]; bm = by_month[month]
         bm["dates"].append(s["date"])
         bm["session_count"]    += 1
-        bm["total_volume"]     += s["total_volume"]
+        bm["total_volume_kg" if s.get("unit") == "kg" else "total_volume_lbs"] \
+            += s["total_volume"]
         bm["reps_at_max_list"].append(s["reps_at_max"])
         bm["pain_count"]       += 1 if s["has_pain_flag"] else 0
         bm["failed_count"]     += s["failed_attempts"]
@@ -777,7 +787,8 @@ def _aggregate_monthly(sessions: list) -> list:
             "session_dates":      d["dates"],
             "session_count":      d["session_count"],
             "max_working_weight": d["max_weight"],
-            "total_volume":       round(d["total_volume"], 1),
+            "total_volume_lbs":   round(d["total_volume_lbs"], 1),
+            "total_volume_kg":    round(d["total_volume_kg"], 1),
             "peak_estimated_1rm": round(max(e1rm), 1) if e1rm else 0.0,
             "avg_reps_at_max":    round(sum(reps)/len(reps), 1) if reps else 0,
             "pain_sessions":      d["pain_count"],
@@ -795,7 +806,8 @@ def _aggregate_monthly(sessions: list) -> list:
 
 def _aggregate_yearly(sessions: list, unit: str) -> list:
     by_year: dict = defaultdict(lambda: {
-        "months": set(), "max_weight": 0.0, "total_volume": 0.0,
+        "months": set(), "max_weight": 0.0,
+        "total_volume_lbs": 0.0, "total_volume_kg": 0.0,
         "session_count": 0, "e1rm_values": [],
         "first_weight": None, "last_weight": None,
         "pain_count": 0, "pr_count": 0,
@@ -805,7 +817,8 @@ def _aggregate_yearly(sessions: list, unit: str) -> list:
         year = s["date"][:4]; by = by_year[year]
         by["months"].add(s["date"][:7])
         by["session_count"]  += 1
-        by["total_volume"]   += s["total_volume"]
+        by["total_volume_kg" if s.get("unit") == "kg" else "total_volume_lbs"] \
+            += s["total_volume"]
         by["pain_count"]     += 1 if s["has_pain_flag"] else 0
         by["pr_count"]       += 1 if s["is_pr_session"] else 0
         if s["max_working_weight"] > by["max_weight"]: by["max_weight"] = s["max_working_weight"]
@@ -825,7 +838,8 @@ def _aggregate_yearly(sessions: list, unit: str) -> list:
             "session_count":              d["session_count"],
             "months_active":              months_active,
             "max_working_weight":         d["max_weight"],
-            "total_volume":               round(d["total_volume"], 1),
+            "total_volume_lbs":           round(d["total_volume_lbs"], 1),
+            "total_volume_kg":            round(d["total_volume_kg"], 1),
             "peak_estimated_1rm":         round(max(e1rm), 1) if e1rm else 0.0,
             "weight_start":               first_w,
             "weight_end":                 last_w,
@@ -1317,7 +1331,8 @@ def _compute_pain_analysis(sessions: list) -> dict:
     pain_sessions = [s for s in sessions if s["has_pain_flag"]]
     pain_occurrences = [{"date": s["date"], "set_id": st["set_id"], "comment": st["comment"]}
                         for s in sessions for st in s["sets"] if st["is_pain_flag"]]
-    failed_sets = [{"date": s["date"], "weight": st["weight"], "comment": st["comment"]}
+    failed_sets = [{"date": s["date"], "weight": st["weight"],
+                    "weight_plates_only": True, "comment": st["comment"]}
                    for s in sessions for st in s["sets"] if st["is_failed_attempt"]]
     return {
         "pain_session_count":    len(pain_sessions),
@@ -1421,11 +1436,26 @@ def _compute_pr_context(sessions: list, all_dates: list, bw_entries: list) -> li
     return result
 
 
-def _compute_goal_projection(sessions: list, goal: dict, unit: str, today) -> dict:
+def _compute_goal_projection(sessions: list, goal: dict, unit: str, today,
+                             ctx: dict = None) -> dict:
     """today is passed in explicitly — process.py never calls date.today()."""
     if not sessions or not goal: return {}
     target_weight = goal["target_weight"]
-    target_e1rm   = _epley_1rm(target_weight, goal.get("target_reps", 1))
+    # B1a bar-inclusive frame: current_e1rm / current_max come from the last
+    # session as headline values (plates + bar). target_weight is a typed plate
+    # number, so add the exercise's bar (same value + frame the session builder
+    # uses for the last session's date) before computing target_e1rm — otherwise
+    # the gap is understated and is_on_track / months_needed run optimistic.
+    bar_weight = 0.0
+    exercise_name = goal.get("exercise_name", "")
+    if ctx is not None and exercise_name:
+        _last_date = sessions[-1].get("date")
+        if _last_date:
+            _bar_lbs = _get_bar_weight_lbs(ctx, exercise_name, _last_date)
+            bar_weight = (_bar_lbs / 2.2046
+                          if _is_kg_native(ctx, exercise_name, _last_date)
+                          else _bar_lbs)
+    target_e1rm   = _epley_1rm(target_weight + bar_weight, goal.get("target_reps", 1))
     current_e1rm  = sessions[-1]["estimated_1rm"] if sessions else 0
     current_max   = sessions[-1]["max_working_weight"] if sessions else 0
     recent = sessions[-min(12, len(sessions)):]
@@ -1469,12 +1499,13 @@ def _build_daily_workouts(all_rows: list, ctx: dict,
         for row in rows: by_ex[row["exercise_name"]].append(row)
         exercise_order = sorted(by_ex.keys(),
                                 key=lambda ex: min(r["set_id"] for r in by_ex[ex]))
-        exercises_done = []; total_vol = 0.0; total_sets = 0
+        exercises_done = []; total_vol_lbs = 0.0; total_vol_kg = 0.0; total_sets = 0
         for pos, ex_name in enumerate(exercise_order, start=1):
             ex_rows    = by_ex[ex_name]
             offset     = _get_numeric_offset(ctx, ex_name)
             bar_weight_lbs = _get_bar_weight_lbs(ctx, ex_name, training_date)
-            bar_weight     = bar_weight_lbs / 2.2046 if _is_kg_native(ctx, ex_name, training_date) else bar_weight_lbs
+            _ex_is_kg      = _is_kg_native(ctx, ex_name, training_date)
+            bar_weight     = bar_weight_lbs / 2.2046 if _ex_is_kg else bar_weight_lbs
             category   = CATEGORY_NAMES.get(ex_rows[0]["category_id"],
                                              f"Cat_{ex_rows[0]['category_id']}")
             ex_sets = [{"set_id":           r["set_id"],
@@ -1490,13 +1521,21 @@ def _build_daily_workouts(all_rows: list, ctx: dict,
                                  weight_eligible=eligible,
                                  exercise_alltime_max=amax)
             working = [s for s in ex_sets if not s["is_warmup"]] or ex_sets
-            max_w   = max(s["weight"] for s in working)
+            # Bar-inclusive (B1a): max_weight and estimated_1rm are headline
+            # (plates + bar), matching the per-session values. bar_weight is in
+            # the typed/kg-native frame already (same value the .volume line uses).
+            max_w   = max(s["weight"] + bar_weight for s in working)
             vol     = sum((s["weight"] + bar_weight) * s["reps"] for s in ex_sets)
-            e1rm    = max((_epley_1rm(s["weight"], s["reps"]) for s in working
+            e1rm    = max((_epley_1rm(s["weight"] + bar_weight, s["reps"]) for s in working
                            if s["reps"] > 0), default=0.0)
-            total_vol  += vol; total_sets += len(working)
+            if _ex_is_kg:
+                total_vol_kg += vol
+            else:
+                total_vol_lbs += vol
+            total_sets += len(working)
             exercises_done.append({
                 "position": pos, "exercise_name": ex_name, "category": category,
+                "unit": "kg" if _ex_is_kg else "lbs",
                 "working_sets": len(working), "max_weight": max_w,
                 "volume": round(vol, 1), "estimated_1rm": round(e1rm, 1),
                 "total_distance":         round(sum(s.get("distance", 0) for s in ex_sets), 3),
@@ -1507,9 +1546,10 @@ def _build_daily_workouts(all_rows: list, ctx: dict,
             "day_of_week":       datetime.strptime(training_date, "%Y-%m-%d").strftime("%A"),
             "exercises_count":   len(exercise_order),
             "total_sets":        total_sets,
-            "total_volume":      round(total_vol, 1),
+            "total_volume_lbs":  round(total_vol_lbs, 1),
+            "total_volume_kg":   round(total_vol_kg, 1),
             "exercises":         exercises_done,
-            "categories_trained":list({e["category"] for e in exercises_done}),
+            "categories_trained":sorted({e["category"] for e in exercises_done}),
         })
     return daily
 
@@ -1611,7 +1651,10 @@ def _compute_inter_exercise_correlation(sessions: list, exercise_name: str,
             "confidence_label":         _effect_label(d, min(sp["n"], snp["n"])),
             "effect":                   effect,
         })
-    return sorted(result, key=lambda x: abs(x["mean_diff_e1rm"]), reverse=True)
+    # Secondary key makes tie order deterministic (result is built from set
+    # iteration, which is hash-randomized across processes)
+    return sorted(result,
+                  key=lambda x: (-abs(x["mean_diff_e1rm"]), x["preceding_exercise"]))
 
 
 # ── Global analytics ───────────────────────────────────────────────────────────
@@ -1687,13 +1730,14 @@ def _compute_seasonal_patterns(all_dates: list) -> list:
 
 
 def _compute_alltime_summary(all_dates: list, alltime_rows: list,
-                              pr_history: list, today) -> dict:
+                              pr_history: list, today, ctx: dict = None) -> dict:
     """
     All-time summary stats.
 
     today       — passed in explicitly (facade supplies date.today()).
     alltime_rows — all raw set rows; total_sets and total_volume are
                    computed in Python to avoid a second DB round-trip.
+    ctx         — user context; used to bucket typed volume per unit frame.
     """
     if not all_dates: return {}
     date_objs = sorted(datetime.strptime(d, "%Y-%m-%d").date() for d in all_dates)
@@ -1711,15 +1755,29 @@ def _compute_alltime_summary(all_dates: list, alltime_rows: list,
     # Derived from alltime_rows — same filter as the original SQL (excluded categories
     # already removed at fetch time, so no extra WHERE clause needed here).
     total_sets = len(alltime_rows)
-    total_volume_raw = round(
-        sum(r["metric_weight"] * 2.2046 * r["reps"] for r in alltime_rows), 0
-    )
+    # Typed volume per unit frame: metric_weight × 2.2046 recovers the number
+    # the user TYPED; for kg-typed exercises that number is kg, for lbs-typed
+    # it is lbs. Bucket by frame — never add the two.
+    vol_lbs = vol_kg = 0.0
+    for r in alltime_rows:
+        typed = r["metric_weight"] * 2.2046 * r["reps"]
+        if ctx is not None and _is_kg_native(ctx, r["exercise_name"], r["date"]):
+            vol_kg += typed
+        else:
+            vol_lbs += typed
     return {
         "first_training_date":   all_dates[0],
         "last_training_date":    all_dates[-1],
         "total_training_days":   len(set(all_dates)),
         "total_sets":            total_sets,
-        "total_volume_raw_lbs":  total_volume_raw,
+        "total_volume_raw_typed_lbs": round(vol_lbs, 0),
+        "total_volume_raw_typed_kg":  round(vol_kg, 0),
+        "total_volume_raw_note": (
+            "sum of typed plate weight × reps per typed-unit frame; excludes "
+            "bar weight and numeric offsets. _lbs is the lbs-typed frame and "
+            "_kg the kg-typed frame — separate frames, never add them. "
+            "Plates-only and NOT bar-inclusive."
+        ),
         "longest_streak_days":   max_streak,
         "longest_gap_days":      max_gap,
         "current_streak_days":   cur_now,
@@ -1775,21 +1833,43 @@ def _compute_exercise_lifecycle(lifecycle_rows: list, end_date: str) -> dict:
 
 
 def _compute_muscle_group_balance(mg_summary: list) -> dict:
-    vol_by_group = {mg["muscle_group"]: mg["total_volume"] for mg in mg_summary}
-    push_vol = sum(vol_by_group.get(g, 0) for g in PUSH_CATEGORIES)
-    pull_vol = sum(vol_by_group.get(g, 0) for g in PULL_CATEGORIES)
-    total    = sum(vol_by_group.values())
+    # Per typed-unit frame (lbs / kg): ratios and percentages are computed
+    # within one frame only — lbs and kg contributions are never added.
+    vol_by_group = {mg["muscle_group"]: (mg["total_volume_lbs"], mg["total_volume_kg"])
+                    for mg in mg_summary}
+    push_lbs = sum(vol_by_group.get(g, (0, 0))[0] for g in PUSH_CATEGORIES)
+    pull_lbs = sum(vol_by_group.get(g, (0, 0))[0] for g in PULL_CATEGORIES)
+    push_kg  = sum(vol_by_group.get(g, (0, 0))[1] for g in PUSH_CATEGORIES)
+    pull_kg  = sum(vol_by_group.get(g, (0, 0))[1] for g in PULL_CATEGORIES)
+    total_lbs = sum(v[0] for v in vol_by_group.values())
+    total_kg  = sum(v[1] for v in vol_by_group.values())
+
+    def _dominant(push, pull):
+        if push == 0 and pull == 0: return None
+        return ("push" if push > pull else
+                "pull" if pull > push else "balanced")
+
     return {
-        "push_volume":     round(push_vol, 1),
-        "pull_volume":     round(pull_vol, 1),
-        "push_pull_ratio": round(push_vol/pull_vol, 2) if pull_vol > 0 else None,
-        "dominant_type":   ("push" if push_vol > pull_vol else
-                            "pull" if pull_vol > push_vol else "balanced"),
-        "total_volume":    round(total, 1),
-        "distribution":    sorted([{"muscle_group": mg, "volume": vol,
-                                    "pct_of_total": round(vol/total*100, 1) if total else 0}
-                                   for mg, vol in vol_by_group.items()],
-                                  key=lambda x: x["volume"], reverse=True),
+        "push_volume_lbs":     round(push_lbs, 1),
+        "pull_volume_lbs":     round(pull_lbs, 1),
+        "push_volume_kg":      round(push_kg, 1),
+        "pull_volume_kg":      round(pull_kg, 1),
+        "push_pull_ratio_lbs": round(push_lbs/pull_lbs, 2) if pull_lbs > 0 else None,
+        "push_pull_ratio_kg":  round(push_kg/pull_kg, 2)   if pull_kg  > 0 else None,
+        "dominant_type_lbs":   _dominant(push_lbs, pull_lbs),
+        "dominant_type_kg":    _dominant(push_kg, pull_kg),
+        "total_volume_lbs":    round(total_lbs, 1),
+        "total_volume_kg":     round(total_kg, 1),
+        "note": ("volumes are reported per typed-unit frame; _lbs and _kg are "
+                 "separate frames and must never be added together"),
+        "distribution":    sorted([{"muscle_group": mg,
+                                    "volume_lbs": round(v[0], 1),
+                                    "volume_kg":  round(v[1], 1),
+                                    "pct_of_lbs_total": round(v[0]/total_lbs*100, 1) if total_lbs else 0,
+                                    "pct_of_kg_total":  round(v[1]/total_kg*100, 1)  if total_kg  else 0}
+                                   for mg, v in vol_by_group.items()],
+                                  key=lambda x: (x["volume_lbs"], x["volume_kg"]),
+                                  reverse=True),
     }
 
 
@@ -1819,17 +1899,21 @@ def _compute_training_consistency(all_dates: list, start_date: str, end_date: st
 
 def _compute_training_density(daily_workouts: list) -> dict:
     if not daily_workouts: return {}
-    ex_c  = [d["exercises_count"] for d in daily_workouts]
-    set_c = [d["total_sets"]      for d in daily_workouts]
-    vol_c = [d["total_volume"]    for d in daily_workouts]
+    ex_c    = [d["exercises_count"]  for d in daily_workouts]
+    set_c   = [d["total_sets"]       for d in daily_workouts]
+    vol_lbs = [d["total_volume_lbs"] for d in daily_workouts]
+    vol_kg  = [d["total_volume_kg"]  for d in daily_workouts]
     return {
-        "avg_exercises_per_session": round(sum(ex_c)/len(ex_c),   1),
-        "avg_sets_per_session":      round(sum(set_c)/len(set_c), 1),
-        "avg_volume_per_session":    round(sum(vol_c)/len(vol_c), 1),
-        "max_exercises_session":     max(ex_c),
-        "min_exercises_session":     min(ex_c),
-        "exercises_count_trend":     _trend(ex_c),
-        "volume_trend":              _trend(vol_c),
+        "avg_exercises_per_session":     round(sum(ex_c)/len(ex_c),   1),
+        "avg_sets_per_session":          round(sum(set_c)/len(set_c), 1),
+        # Per typed-unit frame — day totals never mix lbs and kg contributions
+        "avg_volume_per_session_lbs":    round(sum(vol_lbs)/len(vol_lbs), 1),
+        "avg_volume_per_session_kg":     round(sum(vol_kg)/len(vol_kg), 1),
+        "max_exercises_session":         max(ex_c),
+        "min_exercises_session":         min(ex_c),
+        "exercises_count_trend":         _trend(ex_c),
+        "volume_trend_lbs":              _trend(vol_lbs) if any(vol_lbs) else "insufficient_data",
+        "volume_trend_kg":               _trend(vol_kg)  if any(vol_kg)  else "insufficient_data",
     }
 
 
@@ -1903,6 +1987,7 @@ def _process_goals(raw_goals: list, ctx: dict) -> list:
         "exercise_name": g["exercise_name"],
         "target_weight": _recover_typed_weight(g["metric_weight"],
                                                _get_numeric_offset(ctx, g["exercise_name"])),
+        "target_weight_plates_only": True,
         "target_reps":   g["reps"],
         "target_date":   g["target_date"],
         "unit":          "kg" if _is_kg_native(ctx, g["exercise_name"]) else "lbs",
@@ -1911,32 +1996,46 @@ def _process_goals(raw_goals: list, ctx: dict) -> list:
 
 
 def _compute_muscle_group_summary(exercise_results: list) -> list:
+    # Volumes are kept per typed-unit frame (lbs / kg) — a group mixing
+    # lbs-typed exercises with kg-typed sessions (e.g. Back with post-switch
+    # Deadlift) must never add raw kg numbers onto an lbs sum.
     by_g: dict = defaultdict(lambda: {
-        "exercise_count": 0, "total_sets": 0, "total_volume": 0.0,
-        "weekly_volumes": defaultdict(float),
+        "exercise_count": 0, "total_sets": 0,
+        "total_volume_lbs": 0.0, "total_volume_kg": 0.0,
+        "weekly_volumes": defaultdict(lambda: [0.0, 0.0]),   # [lbs, kg]
         "strength_sets": 0, "hypertrophy_sets": 0, "endurance_sets": 0, "pain_sessions": 0,
     })
     for ex in exercise_results:
         g = ex["category"]; by_g[g]["exercise_count"] += 1
         for s in ex.get("sessions", []):
+            _is_kg = s.get("unit") == "kg"
             by_g[g]["total_sets"]      += s["working_sets_count"]
-            by_g[g]["total_volume"]    += s["total_volume"]
+            by_g[g]["total_volume_kg" if _is_kg else "total_volume_lbs"] \
+                += s["total_volume"]
             by_g[g]["pain_sessions"]   += 1 if s["has_pain_flag"] else 0
             by_g[g]["strength_sets"]   += s["rep_ranges"]["strength_sets"]
             by_g[g]["hypertrophy_sets"]+= s["rep_ranges"]["hypertrophy_sets"]
             by_g[g]["endurance_sets"]  += s["rep_ranges"]["endurance_sets"]
-            by_g[g]["weekly_volumes"][_iso_week_key(s["date"])] += s["total_volume"]
+            by_g[g]["weekly_volumes"][_iso_week_key(s["date"])][1 if _is_kg else 0] \
+                += s["total_volume"]
     summary = []
     for group, d in sorted(by_g.items()):
-        weekly = sorted([{"week": w, "volume": round(v, 1)} for w, v in d["weekly_volumes"].items()], key=lambda x: x["week"])
+        weekly = sorted([{"week": w, "volume_lbs": round(v[0], 1),
+                          "volume_kg": round(v[1], 1)}
+                         for w, v in d["weekly_volumes"].items()],
+                        key=lambda x: x["week"])
+        lbs_series = [w["volume_lbs"] for w in weekly]
+        kg_series  = [w["volume_kg"]  for w in weekly]
         total  = d["strength_sets"] + d["hypertrophy_sets"] + d["endurance_sets"]
         summary.append({
             "muscle_group":   group,
             "exercise_count": d["exercise_count"],
             "total_sets":     d["total_sets"],
-            "total_volume":   round(d["total_volume"], 1),
+            "total_volume_lbs": round(d["total_volume_lbs"], 1),
+            "total_volume_kg":  round(d["total_volume_kg"], 1),
             "weekly_volumes": weekly,
-            "trend":          _trend([w["volume"] for w in weekly]),
+            "trend_lbs":      _trend(lbs_series) if any(lbs_series) else "insufficient_data",
+            "trend_kg":       _trend(kg_series)  if any(kg_series)  else "insufficient_data",
             "pain_sessions":  d["pain_sessions"],
             "rep_ranges": {
                 "strength_pct":    round(d["strength_sets"]    / total * 100, 1) if total else 0,
@@ -1969,10 +2068,28 @@ def _compute_rankings(exercise_results: list) -> dict:
                   and (ex.get("pr") or {}).get("weight", 0) > 0]
         return [{"exercise": n, "value": v}
                 for n, v in sorted(scored, key=lambda x: x[1], reverse=reverse)]
+    def rank_volume_per_unit():
+        """
+        Per-unit volume ranking. Reports volume_lbs / volume_kg per exercise
+        (typed frames, never added together). Ordering uses a kg-equivalent
+        key INTERNALLY only — the blended number is never emitted.
+        Reads period_volume_* (computed before any session wipe) so long
+        windows rank correctly too.
+        """
+        scored = [(ex["name"],
+                   ex.get("period_volume_lbs") or 0.0,
+                   ex.get("period_volume_kg") or 0.0)
+                  for ex in exercise_results
+                  if ex.get("category") not in non_strength_names
+                  and (ex.get("pr") or {}).get("weight", 0) > 0]
+        return [{"exercise": n, "volume_lbs": lbs, "volume_kg": kg}
+                for n, lbs, kg in sorted(scored,
+                                         key=lambda x: x[1] / 2.2046 + x[2],
+                                         reverse=True)]
     return {
         "fastest_improving":    rank_weight_based(lambda ex: safe(ex, "progression", "weight_change_pct")),
         "most_stagnant":        rank_weight_based(lambda ex: ex.get("plateau_days")),
-        "highest_volume":       rank_weight_based(lambda ex: sum(s["total_volume"] for s in ex.get("sessions", []))),
+        "highest_volume":       rank_volume_per_unit(),
         "most_frequent":        rank(lambda ex: safe(ex, "training_frequency", "session_count")),
         "best_e1rm":            rank_weight_based(lambda ex: safe(ex, "pr", "estimated_1rm")),
         "most_pain_sessions":   rank(lambda ex: safe(ex, "pain_analysis", "pain_session_count")),
@@ -2177,8 +2294,17 @@ def process_data(
             "pr_context":            _safe_compute(_compute_pr_context,  sessions, all_training_dates, all_bw_entries, default=[],   label="pr_context"),
             "pr_velocity":           _safe_compute(_compute_pr_velocity, pr_history, ex_name,                        default={"total_prs": 0, "monthly_counts": [], "velocity_trend": "none"}, label="pr_velocity"),
 
-            # Trends
-            "volume_trend":          _safe_compute(_trend, [s["total_volume"]  for s in sessions],                          default="insufficient_data", label="volume_trend"),
+            # Period volume per typed-unit frame (computed from sessions BEFORE
+            # any session wipe; lbs and kg are separate frames, never added)
+            "period_volume_lbs":     round(sum(s["total_volume"] for s in sessions
+                                               if s.get("unit") != "kg"), 1),
+            "period_volume_kg":      round(sum(s["total_volume"] for s in sessions
+                                               if s.get("unit") == "kg"), 1),
+
+            # Trends (volume trend per unit frame — a mixed lbs->kg series
+            # would otherwise read as a spurious "decreasing")
+            "volume_trend_lbs":      _safe_compute(_trend, [s["total_volume"]  for s in sessions if s.get("unit") != "kg"], default="insufficient_data", label="volume_trend_lbs"),
+            "volume_trend_kg":       _safe_compute(_trend, [s["total_volume"]  for s in sessions if s.get("unit") == "kg"], default="insufficient_data", label="volume_trend_kg"),
             "e1rm_trend":            _safe_compute(_trend, [s["estimated_1rm"] for s in sessions if s["estimated_1rm"] > 0], 0.05, 0.05, default="insufficient_data", label="e1rm_trend"),
             "form_trend":            _safe_compute(_compute_form_trend,             sessions,       default="insufficient_data", label="form_trend"),
             "comment_keyword_trends":_safe_compute(_compute_comment_keyword_trends, sessions,       default={},                  label="comment_keyword_trends"),
@@ -2262,7 +2388,7 @@ def process_data(
                  for m in (ex["monthly_aggregations"] if ex else [])]) if ex else []
         goal_projs.append({
             **g,
-            "projection": _compute_goal_projection(sess, g, g["unit"], today) if sess else None
+            "projection": _compute_goal_projection(sess, g, g["unit"], today, ctx) if sess else None
         })
 
     return {
@@ -2273,7 +2399,7 @@ def process_data(
         "total_exercises_analyzed": len(exercise_results),
         "units_review_log":         units_review_log,
         "counterbalance_review_log": counterbalance_review_log,
-        "all_time_summary":         _safe_compute(_compute_alltime_summary,    all_training_dates, alltime_rows, pr_history, today,      default={},  label="alltime_summary"),
+        "all_time_summary":         _safe_compute(_compute_alltime_summary,    all_training_dates, alltime_rows, pr_history, today, ctx, default={},  label="alltime_summary"),
         "muscle_group_summary":     mg_summary,
         "muscle_group_balance":     _safe_compute(_compute_muscle_group_balance, mg_summary,                               default={},  label="mg_balance"),
         "training_consistency":     _safe_compute(_compute_training_consistency, all_training_dates, start_str, end_str,   default={},  label="training_consistency"),

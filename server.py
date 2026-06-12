@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import datetime
 import hashlib
 import json
 import os
@@ -398,6 +399,11 @@ class ConfirmRequest(BaseModel):
 
 def _parse_retry_seconds(msg: str) -> int | None:
     msg = msg.lower()
+    # google.genai ClientError carries the delay as JSON ('retryDelay': '26s'),
+    # not the api_core "try again in 26.5s" phrasing — match it explicitly.
+    m = re.search(r"retrydelay['\"]?\s*:\s*['\"]?(\d+\.?\d*)s", msg)
+    if m:
+        return int(float(m.group(1)))
     patterns = [
         r'in (\d+)h\s*(\d+)m',       # Xh Ym
         r'in (\d+)h',                 # Xh only
@@ -495,6 +501,12 @@ async def chat(body: ChatRequest):
                 print(f"[DEBUG] Exception in /chat:")
                 traceback.print_exc()
             return _error_response(exc)
+        # Analytical turns bypass session.answer(), so they are not recorded in
+        # session.chat_history automatically.  Mirror the same shape agent.py writes.
+        if result.get("route") == "analytical" and session is not None:
+            _now = datetime.datetime.now().isoformat()
+            session.chat_history.append({"role": "user",      "text": body.message,               "timestamp": _now})
+            session.chat_history.append({"role": "assistant", "text": result.get("answer", ""),   "timestamp": _now})
         if _state["pending_confirmation"]:
             _state["pending_confirmation"] = False
             return JSONResponse(content={

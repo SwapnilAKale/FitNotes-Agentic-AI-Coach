@@ -403,7 +403,9 @@ def _build_user_message(
     custom_query:         Optional[dict] = None,
 ) -> str:
     try:
-        package_json = json.dumps(package, indent=2)
+        # Compact serialization — this is LLM input, not human-read; indent=2
+        # was ~34% wasted input tokens on a broad package.
+        package_json = json.dumps(package, separators=(",", ":"))
     except Exception as e:
         logger.warning("[analysis_agent] package serialisation failed: %s", e)
         package_json = "{}"
@@ -493,8 +495,12 @@ async def ground_check(
     if not draft.strip():
         return draft, []
 
+    # Full compact package for ALL scopes — sending the complete package (not
+    # a subset) means every fact the draft drew on is findable, so the REMOVE
+    # rule can never strip a true claim for a missing source field. Compact
+    # serialization keeps a broad grounding input at ~366 KB (~92k tokens).
     try:
-        package_json = json.dumps(package, indent=2)
+        package_json = json.dumps(package, separators=(",", ":"))
     except Exception:
         package_json = "{}"
 

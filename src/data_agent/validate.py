@@ -350,29 +350,39 @@ def _check_temporal(ex: dict, v: list, start_str: str, end_str: str,
 
 
 def _check_aggregation_consistency(ex: dict, v: list) -> None:
-    """E3 — weekly/monthly volume totals reconcile to member-session sums."""
+    """
+    E3 — weekly/monthly per-unit volume buckets reconcile to member-session
+    sums of the same typed-unit frame (lbs sessions sum to total_volume_lbs,
+    kg sessions to total_volume_kg — frames are never added together).
+    """
     name = ex.get("name", "?")
     sessions = ex.get("sessions", [])
     if not sessions:
         return  # sessions stripped — can't check
 
-    by_date = {s["date"]: (s.get("total_volume") or 0) for s in sessions}
+    # date -> (unit, volume); sessions are single-date, single-unit
+    by_date = {s["date"]: (s.get("unit") or "lbs", s.get("total_volume") or 0)
+               for s in sessions}
 
-    for w in ex.get("weekly_aggregations", []):
-        expected = round(sum(by_date.get(d, 0) for d in w.get("session_dates", [])), 1)
-        actual   = round(w.get("total_volume") or 0, 1)
-        if abs(expected - actual) > 0.5:
-            v.append(_viol("E3",
-                f"{name} week {w.get('week')}: total_volume={actual} "
-                f"but sum of member-session volumes={expected} (diff={abs(expected-actual):.1f})"))
+    def _expected(dates: list, unit: str) -> float:
+        return round(sum(vol for d in dates
+                         for u, vol in [by_date.get(d, ("lbs", 0))]
+                         if u == unit), 1)
 
-    for m in ex.get("monthly_aggregations", []):
-        expected = round(sum(by_date.get(d, 0) for d in m.get("session_dates", [])), 1)
-        actual   = round(m.get("total_volume") or 0, 1)
-        if abs(expected - actual) > 0.5:
-            v.append(_viol("E3",
-                f"{name} month {m.get('month')}: total_volume={actual} "
-                f"but sum of member-session volumes={expected} (diff={abs(expected-actual):.1f})"))
+    for label, key, aggs in (
+        ("week",  "week",  ex.get("weekly_aggregations", [])),
+        ("month", "month", ex.get("monthly_aggregations", [])),
+    ):
+        for a in aggs:
+            for unit, vol_key in (("lbs", "total_volume_lbs"),
+                                  ("kg",  "total_volume_kg")):
+                expected = _expected(a.get("session_dates", []), unit)
+                actual   = round(a.get(vol_key) or 0, 1)
+                if abs(expected - actual) > 0.5:
+                    v.append(_viol("E3",
+                        f"{name} {label} {a.get(key)}: {vol_key}={actual} "
+                        f"but sum of member-session volumes ({unit})={expected} "
+                        f"(diff={abs(expected-actual):.1f})"))
 
 
 def _check_stat_block(name: str, context: str, block: dict, v: list) -> None:
@@ -539,15 +549,25 @@ def _check_g3(package: dict, v: list) -> None:
 def _check_g4(package: dict, v: list) -> None:
     """G4 (soft) — per-scope size ceiling: BROAD 500 KB, GROUP 400 KB, FOCUSED 250 KB."""
     try:
-        scope   = package.get("scope", "focused")
-        ceiling = _G4_THRESHOLDS.get(scope, 250)
-        size_kb = len(json.dumps(package, default=str).encode()) / 1024
+        has_scope = "scope" in package
+        scope     = package.get("scope", "focused")
+        ceiling   = _G4_THRESHOLDS.get(scope, 250)
+        size_kb   = len(json.dumps(package, default=str).encode()) / 1024
         if size_kb > ceiling:
             n_ex = package.get("total_exercises_analyzed", "?")
-            v.append(_soft("G4",
-                f"Package size is {size_kb:.0f} KB "
-                f"(>{ceiling} KB ceiling for scope={scope!r}); "
-                f"exercises={n_ex}. Consider narrowing the query scope."))
+            if has_scope:
+                v.append(_soft("G4",
+                    f"Package size is {size_kb:.0f} KB "
+                    f"(>{ceiling} KB ceiling for scope={scope!r}); "
+                    f"exercises={n_ex}. Consider narrowing the query scope."))
+            else:
+                # No scope key yet — this is the pre-trim intermediate package
+                # inside collect(). Naming a scope it doesn't have made this
+                # line read as if an untrimmed package shipped to the LLM.
+                v.append(_soft("G4",
+                    f"pre-trim package is {size_kb:.0f} KB "
+                    f"({n_ex} exercises) — informational, "
+                    f"trimming runs next"))
     except Exception:
         pass
 

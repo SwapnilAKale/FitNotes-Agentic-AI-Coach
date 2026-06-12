@@ -101,7 +101,8 @@ def _exercise() -> dict:
             "week": "2026-W22",
             "session_dates": ["2026-06-01"],
             "session_count": 1, "max_working_weight": 100.0,
-            "total_volume": 500.0, "peak_estimated_1rm": 116.7,
+            "total_volume_lbs": 500.0, "total_volume_kg": 0.0,
+            "peak_estimated_1rm": 116.7,
             "form_quality_mode": "unknown", "pain_sessions": 0,
             "failed_attempts": 0, "total_distance": 0.0,
             "total_duration_seconds": 0,
@@ -110,7 +111,8 @@ def _exercise() -> dict:
             "month": "2026-06",
             "session_dates": ["2026-06-01"],
             "session_count": 1, "max_working_weight": 100.0,
-            "total_volume": 500.0, "peak_estimated_1rm": 116.7,
+            "total_volume_lbs": 500.0, "total_volume_kg": 0.0,
+            "peak_estimated_1rm": 116.7,
             "avg_reps_at_max": 5, "pain_sessions": 0,
             "failed_attempts": 0, "total_distance": 0.0,
             "total_duration_seconds": 0,
@@ -119,7 +121,8 @@ def _exercise() -> dict:
         }],
         "yearly_aggregations": [{
             "year": "2026", "session_count": 1, "months_active": 1,
-            "max_working_weight": 100.0, "total_volume": 500.0,
+            "max_working_weight": 100.0,
+            "total_volume_lbs": 500.0, "total_volume_kg": 0.0,
             "peak_estimated_1rm": 116.7, "weight_start": 100.0,
             "weight_end": 100.0, "progression_rate_per_month": 0.0,
             "pr_count": 0, "pain_sessions": 0,
@@ -148,7 +151,9 @@ def _exercise() -> dict:
         },
         "technique_variants": [],
         "e1rm_history": [{"date": "2026-06-01", "estimated_1rm": 116.7}],
-        "e1rm_projection": {}, "volume_trend": "insufficient_data",
+        "e1rm_projection": {},
+        "volume_trend_lbs": "insufficient_data",
+        "volume_trend_kg": "insufficient_data",
         "e1rm_trend": "insufficient_data", "form_trend": "insufficient_data",
         "comment_keyword_trends": {}, "pr_context": [],
         "pr_velocity": {"total_prs": 0, "monthly_counts": [],
@@ -175,7 +180,8 @@ def _package() -> dict:
             "first_training_date": "2026-06-01",
             "last_training_date":  "2026-06-01",
             "total_training_days": 1, "total_sets": 1,
-            "total_volume_raw_lbs": 500.0, "longest_streak_days": 1,
+            "total_volume_raw_typed_lbs": 500.0,
+            "total_volume_raw_typed_kg": 0.0, "longest_streak_days": 1,
             "longest_gap_days": 0, "current_streak_days": 0,
             "total_prs_alltime": 0, "prs_per_month_alltime": 0.0,
         },
@@ -567,15 +573,25 @@ def test_e2_future_session_date():
 
 def test_e3_weekly_volume_mismatch():
     pkg = _package()
-    # Session total_volume = 500; weekly says 999
-    pkg["exercises"][0]["weekly_aggregations"][0]["total_volume"] = 999.0
+    # Session total_volume = 500 (lbs frame); weekly lbs bucket says 999
+    pkg["exercises"][0]["weekly_aggregations"][0]["total_volume_lbs"] = 999.0
     v = validate(pkg)
     _only(v, "E3")
 
 
 def test_e3_monthly_volume_mismatch():
     pkg = _package()
-    pkg["exercises"][0]["monthly_aggregations"][0]["total_volume"] = 1500.0
+    pkg["exercises"][0]["monthly_aggregations"][0]["total_volume_lbs"] = 1500.0
+    v = validate(pkg)
+    _only(v, "E3")
+
+
+def test_e3_kg_bucket_mismatch():
+    # kg bucket must reconcile against kg-frame member sessions only:
+    # the lone session is lbs, so a non-zero kg bucket has no kg sessions
+    # backing it -> E3.
+    pkg = _package()
+    pkg["exercises"][0]["weekly_aggregations"][0]["total_volume_kg"] = 100.0
     v = validate(pkg)
     _only(v, "E3")
 

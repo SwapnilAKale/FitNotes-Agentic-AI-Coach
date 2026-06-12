@@ -665,6 +665,6 @@ The frontend chatbox is disabled the moment a file is selected for upload and st
 - RAG (`search_fitness_knowledge`) fires on personal-data questions when research context is irrelevant — burns API tokens with no benefit.
 - `/history` returns only the single agent's history; analytical turns live in `Coordinator._history` and are lost on browser session restore.
 - Multi-candidate name resolution picks the first candidate without asking — single-agent path asks for clarification; the analytical path should too.
-- `daily_workouts` e1RM/max_weight is plates-only (no bar), inconsistent with session values; `workout_position_effect` derives from it.
-- `all_time_summary.total_volume_raw_lbs` applies ×2.2046 to kg-native rows — labeled "raw" but the Analysis Agent could quote it without the caveat.
+- `daily_workouts` e1RM/max_weight is bar-inclusive (headline), consistent with the per-session values; `workout_position_effect` derives from it.
+- Volume is reported per typed-unit frame everywhere it crosses exercises/sessions: `*_lbs` and `*_kg` buckets (weekly/monthly/yearly aggregations, muscle_group_summary/balance, rankings.highest_volume, all_time_summary.total_volume_raw_typed_lbs/_kg, training_density). The two frames are never added together — switch-proof across lbs↔kg gym moves. `all_time_summary` volume remains plates-only (excludes bar + offsets) per its `total_volume_raw_note`.
 - `cli.py` 429 handling catches `ClientError` from a different code path than the server's string-match guard — rate limits may not surface correctly on all error shapes.

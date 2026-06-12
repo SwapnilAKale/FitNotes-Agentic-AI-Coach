@@ -52,15 +52,20 @@ def _print_summary(data: dict) -> None:
     print(f"  {'-'*68}")
     for mg in data["muscle_group_summary"]:
         rr = mg["rep_ranges"]
+        kg_part = f" +{mg['total_volume_kg']:.0f}kg" if mg.get("total_volume_kg") else ""
         print(f"  {mg['muscle_group']:12s}  ex={mg['exercise_count']:2d}  "
-              f"sets={mg['total_sets']:4d}  vol={mg['total_volume']:10.0f}  "
-              f"trend={mg['trend']:20s}  "
+              f"sets={mg['total_sets']:4d}  vol={mg['total_volume_lbs']:10.0f}lbs{kg_part}  "
+              f"trend={mg['trend_lbs']:20s}  "
               f"S={rr['strength_pct']}% H={rr['hypertrophy_pct']}% E={rr['endurance_pct']}%")
     bal = data["muscle_group_balance"]
     if bal:
-        print(f"\n  PUSH/PULL  push={bal['push_volume']:.0f}  "
-              f"pull={bal['pull_volume']:.0f}  ratio={bal['push_pull_ratio']}  "
-              f"dominant={bal['dominant_type']}")
+        print(f"\n  PUSH/PULL (lbs frame)  push={bal['push_volume_lbs']:.0f}  "
+              f"pull={bal['pull_volume_lbs']:.0f}  ratio={bal['push_pull_ratio_lbs']}  "
+              f"dominant={bal['dominant_type_lbs']}")
+        if bal.get("push_volume_kg") or bal.get("pull_volume_kg"):
+            print(f"  PUSH/PULL (kg frame)   push={bal['push_volume_kg']:.0f}  "
+                  f"pull={bal['pull_volume_kg']:.0f}  ratio={bal['push_pull_ratio_kg']}  "
+                  f"dominant={bal['dominant_type_kg']}")
     dow = data["day_of_week_patterns"]
     if dow:
         counts = {d["day"]: d["count"] for d in dow["distribution"]}
@@ -204,16 +209,18 @@ def _print_exercise(data: dict, exercise_name: str) -> None:
         for m in ex["monthly_aggregations"]:
             dist_str = f"  dist={m['total_distance']}km" if m.get('total_distance', 0) > 0 else ""
             dur_str  = f"  dur={m['total_duration_seconds']}s" if m.get('total_duration_seconds', 0) > 0 else ""
+            kg_part = f"+{m['total_volume_kg']}kg" if m.get("total_volume_kg") else ""
             print(f"    {m['month']}  max={m['max_working_weight']} {ex['unit']}  "
-                  f"e1RM={m['peak_estimated_1rm']}  vol={m['total_volume']}  "
+                  f"e1RM={m['peak_estimated_1rm']}  vol={m['total_volume_lbs']}lbs{kg_part}  "
                   f"sessions={m['session_count']}{dist_str}{dur_str}")
     elif agg == "weekly" and ex["weekly_aggregations"]:
         print(f"\n  WEEKLY")
         for w in ex["weekly_aggregations"]:
             dist_str = f"  dist={w['total_distance']}km" if w.get('total_distance', 0) > 0 else ""
             dur_str  = f"  dur={w['total_duration_seconds']}s" if w.get('total_duration_seconds', 0) > 0 else ""
+            kg_part = f"+{w['total_volume_kg']}kg" if w.get("total_volume_kg") else ""
             print(f"    {w['week']}  max={w['max_working_weight']} {ex['unit']}  "
-                  f"e1RM={w['peak_estimated_1rm']}  vol={w['total_volume']}  "
+                  f"e1RM={w['peak_estimated_1rm']}  vol={w['total_volume_lbs']}lbs{kg_part}  "
                   f"sessions={w['session_count']}{dist_str}{dur_str}")
 
 

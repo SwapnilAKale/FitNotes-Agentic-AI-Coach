@@ -13,11 +13,27 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from src.agent import AgentSession
 from src.coordinator import Coordinator
 
-# Gemini ResourceExhausted (429) re-raised by Coordinator when quota is exhausted
+# Rate-limit errors re-raised by Coordinator — mirror _is_rate_limit from coordinator.py
 try:
     from google.api_core.exceptions import ResourceExhausted as _GeminiResourceExhausted
 except ImportError:
     class _GeminiResourceExhausted(Exception): pass  # type: ignore[misc]
+
+try:
+    from google.genai import errors as _genai_errors
+    _GenaiClientError = _genai_errors.ClientError
+except (ImportError, AttributeError):
+    _GenaiClientError = None
+
+
+def _is_rate_limit(exc: Exception) -> bool:
+    """True if exc is a Gemini/google-api 429 / ResourceExhausted error."""
+    if isinstance(exc, _GeminiResourceExhausted):
+        return True
+    if _GenaiClientError is not None and isinstance(exc, _GenaiClientError):
+        return getattr(exc, "code", None) == 429
+    msg = str(exc)
+    return "429" in msg or "RESOURCE_EXHAUSTED" in msg
 
 DB_PATH = os.environ.get("FITNOTES_DB_PATH", "./data/FitNotes_Backup.fitnotes")
 memory_only = "--memory-only" in sys.argv
@@ -103,21 +119,15 @@ async def main() -> None:
                     if result.get("route"):
                         print(f"\x1b[2m[route: {result['route']}]\x1b[0m")
                     print(f"\n{result['answer']}\n")
-            except _GeminiResourceExhausted as e:
-                wait_msg = ""
-                if "Please try again in" in str(e):
-                    wait_msg = str(e).split("Please try again in")[1].split(".")[0].strip()
-                print(f"\n[Rate limit reached. Reset in {wait_msg if wait_msg else 'some time'}. Type 'exit' to quit or wait and try again.]\n")
-                continue
             except Exception as e:
                 error_str = str(e)
-                if "503" in error_str or "UNAVAILABLE" in error_str:
-                    print("\n[Gemini is under high demand right now. Wait a few minutes and try again.]\n")
-                elif "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+                if _is_rate_limit(e):
                     wait_msg = ""
                     if "Please try again in" in error_str:
                         wait_msg = error_str.split("Please try again in")[1].split(".")[0].strip()
                     print(f"\n[Rate limit reached. Reset in {wait_msg if wait_msg else 'some time'}. Type 'exit' to quit or wait and try again.]\n")
+                elif "503" in error_str or "UNAVAILABLE" in error_str:
+                    print("\n[Gemini is under high demand right now. Wait a few minutes and try again.]\n")
                 else:
                     print(f"\n[Error: {e}]\n")
                 continue

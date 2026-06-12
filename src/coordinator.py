@@ -399,14 +399,26 @@ class Coordinator:
             resolved = []
             for name in exercise_names:
                 result = resolve_exercise_name(name, db_path)
-                match = result.get("match") or (result.get("candidates") or [None])[0]
-                # Keep the original name when resolution fails entirely —
-                # the package filter then reports it in
-                # unresolved_exercise_names and the user is told it wasn't
-                # found. Dropping it here made the name vanish silently:
-                # the answer covered the other exercises with no mention
-                # of the one that didn't exist.
-                resolved.append(match or name)
+                match = result.get("match")
+                candidates = result.get("candidates") or []
+                if match:
+                    resolved.append(match)
+                elif len(candidates) == 1:
+                    # One clear best match — use it (same as before for single-candidate case)
+                    resolved.append(candidates[0])
+                elif len(candidates) >= 2:
+                    # Genuine ambiguity: surface candidates so the user can clarify
+                    # rather than silently guessing the first one.
+                    names_list = "\n".join(f"- {c}" for c in candidates[:5])
+                    return (
+                        f"I found multiple exercises matching **{name}**. "
+                        f"Which one did you mean?\n\n{names_list}\n\n"
+                        f"Please let me know and I'll answer your question.",
+                        [],
+                    )
+                else:
+                    # No match — keep original so the package reports it as unresolved
+                    resolved.append(name)
             exercise_names = resolved
         muscle_groups     = params.get("muscle_groups")
         query_period_days = params.get("query_period_days", 90)
@@ -480,12 +492,10 @@ class Coordinator:
         else:
             scoped_question = question
 
-        # Best-effort enrichment — research and memories never block the pipeline
-        try:
-            from src.shared.rag import search_fitness_knowledge
-            research = search_fitness_knowledge(question) or None
-        except Exception:
-            research = None
+        # Analytical path is for personal workout data — RAG (fitness science knowledge
+        # base) is irrelevant here and would burn Gemini calls unnecessarily.
+        # search_fitness_knowledge only fires on the operational path (agent ReAct loop).
+        research = None
         try:
             from src.shared.memory import retrieve_relevant_memories
             memories = retrieve_relevant_memories(question) or None
