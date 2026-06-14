@@ -319,10 +319,63 @@ function handleOverloadError() {
   }, 1000);
 }
 
-function handleRateLimitError(retryAfterSeconds) {
+function handleRateLimitError(data) {
+  // Per-minute 429s are absorbed by the backend (request held open) and never
+  // reach here. A 429 that DOES reach here is the daily wall: show the server's
+  // own status message, and — only when a checkpoint was saved — a Resume button
+  // that finishes the saved question without re-paying completed stages.
   if (autoRetryTimer) { clearInterval(autoRetryTimer); autoRetryTimer = null; }
-  addMsg('error', 'Daily quota reached. Come back after 12:30 PM IST when quota resets.');
+  const message = (data && data.message) || 'Rate limit reached.';
+  if (data && data.checkpoint_saved) {
+    renderResumeNotice(message);
+  } else {
+    addMsg('error', esc(message));
+  }
   setBusy(false);
+}
+
+function renderResumeNotice(message) {
+  const inner = chatInner();
+  const row = document.createElement('div');
+  row.className = 'flex justify-start mb-3';
+  row.innerHTML = `
+    <div class="flex flex-col gap-2 max-w-sm">
+      <div class="bubble-error rounded-2xl px-4 py-2.5 text-sm">${esc(message)}</div>
+      <div class="flex gap-2">
+        <button id="resume-btn" class="px-3 py-1 bg-green-700 hover:bg-green-600 text-white text-xs rounded-lg">Resume</button>
+      </div>
+      <div class="text-xs text-gray-500">${nowTime()}</div>
+    </div>`;
+  inner.appendChild(row);
+  scrollBottom();
+
+  document.getElementById('resume-btn').addEventListener('click', async () => {
+    row.remove();                 // one-shot: remove the button on click
+    setBusy(true);
+    addThinking();
+    try {
+      const res = await fetch(`${API}/resume`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: '{}',
+      });
+      const data = await res.json();
+      removeThinking();
+      if (res.status === 429 && data.error === 'rate_limit') {
+        handleRateLimitError(data);          // quota still down — re-offer Resume
+      } else if (data.type === 'error') {
+        addMsg('error', esc(data.text || 'An error occurred.'));
+        setBusy(false);
+      } else {
+        addMsg('agent', esc(data.text || ''));
+        setBusy(false);
+      }
+    } catch (e) {
+      removeThinking();
+      addMsg('error', 'Could not reach the server to resume.');
+      setBusy(false);
+    }
+  });
 }
 
 // ── History restore ───────────────────────────────────────────────────────────
@@ -417,7 +470,7 @@ async function sendMessage(forcedText) {
     removeThinking();
 
     if (res.status === 429) {
-      if (data.error === 'rate_limit') handleRateLimitError(data.retry_after_seconds);
+      if (data.error === 'rate_limit') handleRateLimitError(data);
       else setBusy(false);
     } else if (data.error === 'overload') {
       handleOverloadError();

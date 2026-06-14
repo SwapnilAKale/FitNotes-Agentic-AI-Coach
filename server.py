@@ -488,8 +488,13 @@ async def checkpoint_status():
     })
 
 
-@app.post("/chat")
-async def chat(body: ChatRequest):
+async def _process_turn(message: str) -> JSONResponse:
+    """
+    Shared turn handler for /chat and /resume — same guards, locking, history
+    recording, and response shape. /resume passes a continue-intent message so
+    the Coordinator runs its checkpoint-resume path (or the nothing-to-resume
+    notice) without duplicating that logic here.
+    """
     # A chat turn can reach an execute_* MCP tool and write the DB file that
     # upload+replay is mid-way through replacing. Reject with a clear message
     # instead of letting it surface as a SQLite lock error or silent loss.
@@ -512,25 +517,25 @@ async def chat(body: ChatRequest):
         )
     async with agent_lock:
         if DEBUG:
-            print(f"\n[DEBUG] Question: {body.message}")
+            print(f"\n[DEBUG] Question: {message}")
         _state["pending_confirmation"] = False
         _state["allow_execute"] = False
         _state["staging_preview"] = ""
         try:
-            result = await coordinator.route(body.message)
+            result = await coordinator.route(message)
             if DEBUG:
                 print(f"[DEBUG] Result: {json.dumps({k: v for k, v in result.items() if k != 'flagged_claims'}, indent=2)}")
         except Exception as exc:
             if DEBUG:
                 import traceback
-                print(f"[DEBUG] Exception in /chat:")
+                print(f"[DEBUG] Exception in turn:")
                 traceback.print_exc()
             return _error_response(exc)
         # Analytical turns bypass session.answer(), so they are not recorded in
         # session.chat_history automatically.  Mirror the same shape agent.py writes.
         if result.get("route") == "analytical" and session is not None:
             _now = datetime.datetime.now().isoformat()
-            session.chat_history.append({"role": "user",      "text": body.message,               "timestamp": _now})
+            session.chat_history.append({"role": "user",      "text": message,                    "timestamp": _now})
             session.chat_history.append({"role": "assistant", "text": result.get("answer", ""),   "timestamp": _now})
         if _state["pending_confirmation"]:
             _state["pending_confirmation"] = False
@@ -541,6 +546,18 @@ async def chat(body: ChatRequest):
         if result.get("error") and result["error"] != "max_iterations_reached":
             return JSONResponse(content={"type": "error", "text": result["error"]})
         return JSONResponse(content={"type": "answer", "text": result.get("answer", ""), "route": result.get("route")})
+
+
+@app.post("/chat")
+async def chat(body: ChatRequest):
+    return await _process_turn(body.message)
+
+
+@app.post("/resume")
+async def resume():
+    # The "Resume" button calls this. Reuse the Coordinator's continue-intent
+    # path: load the slot → _resume, or the nothing-to-resume notice if empty.
+    return await _process_turn("continue")
 
 
 @app.post("/confirm")

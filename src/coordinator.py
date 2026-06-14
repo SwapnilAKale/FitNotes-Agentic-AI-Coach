@@ -58,6 +58,14 @@ _GEMINI_API_KEY    = os.environ.get("GEMINI_API_KEY", "")
 COORDINATOR_MODEL  = "gemini-3.1-flash-lite"
 CONTEXT_WINDOW     = 6     # number of recent turns passed to Analysis Agent
 
+# ── Per-minute 429 silent-retry tuning ────────────────────────────────────────
+# A per-minute quota refills in ~60s, so a brief in-request wait clears it
+# without checkpointing. Diagnosis confirmed /chat has no server timeout and the
+# frontend fetch has no client timeout, so holding the request open is safe.
+PER_MINUTE_WAIT_CAP    = 70   # s — cap on ONE wait; bounds the held request even if retryDelay is large
+PER_MINUTE_MAX_RETRIES = 2    # per stage — 2 waits clear all but pathological bursts before the daily fallback
+PER_MINUTE_BUFFER      = 2    # s added to retryDelay so we retry just AFTER the window resets
+
 # Write-intent guard: questions matching this are routed OPERATIONAL without
 # calling the classifier so a write can never reach the analytical path.
 _WRITE_INTENT_RE = re.compile(
@@ -247,7 +255,10 @@ class Coordinator:
         if _ckpt.is_continue_intent(question):
             if cp is not None:
                 return await self._resume(cp)
-            # continue with no live slot: fall through to normal routing
+            # Nothing-to-resume guard: a resume request with no live slot must
+            # NOT fall through to classification and run a fresh, expensive
+            # question. Return a plain notice — no LLM call.
+            return self._no_resume_response()
         elif cp is not None:
             if cp.get("awaiting_discard_confirm"):
                 # This message answers the discard prompt for the live slot.
@@ -270,6 +281,15 @@ class Coordinator:
                 _ckpt.mark_awaiting_discard(cp, question)
                 return self._confirm_response(_ckpt.discard_confirm_prompt(cp))
 
+        return await self._route_fresh(question)
+
+    async def _route_fresh(self, question: str) -> dict:
+        """
+        Classify and dispatch a NEW (or classify-resumed) question. Separated
+        from route()'s checkpoint handling so a resume from
+        completed_stage='classify' can re-enter here directly (re-running the
+        cheap classify call) without re-triggering checkpoint logic.
+        """
         # ── 1. Classify (or short-circuit for obvious write operations) ──────
         # Misrouting a write to analytical bypasses the confirmation gate.
         if _WRITE_INTENT_RE.search(question):
@@ -282,7 +302,21 @@ class Coordinator:
                 "custom_sql_intent": None,
             }
         else:
-            params = await self._classify(question)
+            # Per-minute 429s retry silently in-request; a DAILY 429 (or
+            # exhausted per-minute retries) closes the classify-stage gap by
+            # checkpointing at 'classify' (nothing paid → draft=null) and
+            # surfacing the resume status, instead of re-raising unprotected.
+            try:
+                params = await self._call_with_per_minute_retry(
+                    self._classify, question)
+            except Exception as e:
+                if _is_rate_limit(e):
+                    _ckpt.save_checkpoint(
+                        route="analytical", question=question,
+                        params=None, completed_stage="classify",
+                    )
+                    raise _ckpt.QuotaInterrupted(e, _ckpt.msg_draft_interrupted(e))
+                raise
         route  = params.get("route", "operational")
 
         # ── 2. Route ──────────────────────────────────────────────────────────
@@ -333,7 +367,49 @@ class Coordinator:
             "error":          error,
         }
 
+    # ── Per-minute silent retry ───────────────────────────────────────────────
+
+    async def _call_with_per_minute_retry(self, fn, *args, **kwargs):
+        """
+        Run an async LLM stage, absorbing PER-MINUTE 429s silently: wait the
+        provider's retryDelay (capped at PER_MINUTE_WAIT_CAP) and retry the SAME
+        call up to PER_MINUTE_MAX_RETRIES, holding the request open — no
+        checkpoint, no message, the user keeps seeing 'thinking…'. A DAILY 429,
+        or exhausted per-minute retries, propagates unchanged so the caller's
+        daily path (checkpoint + QuotaInterrupted) runs.
+
+        NOTE: agent_lock is held for the duration of the wait (single-user
+        assumption — a concurrent /chat gets the existing 'busy' 429).
+        """
+        attempt = 0
+        while True:
+            try:
+                return await fn(*args, **kwargs)
+            except Exception as e:
+                if (_is_rate_limit(e) and _ckpt.is_per_minute_quota(e)
+                        and attempt < PER_MINUTE_MAX_RETRIES):
+                    wait = min(_ckpt.retry_delay_seconds(e) or 55,
+                               PER_MINUTE_WAIT_CAP) + PER_MINUTE_BUFFER
+                    logger.warning(
+                        "[coordinator] per-minute 429 — waiting %ds then retrying "
+                        "(attempt %d/%d), request held open",
+                        wait, attempt + 1, PER_MINUTE_MAX_RETRIES,
+                    )
+                    await asyncio.sleep(wait)
+                    attempt += 1
+                    continue
+                raise
+
     # ── Checkpoint resume ─────────────────────────────────────────────────────
+
+    def _no_resume_response(self) -> dict:
+        """Resume requested but no live slot — plain notice, no LLM call."""
+        return {
+            "answer":         "There's no saved question to resume.",
+            "route":          "none",
+            "flagged_claims": [],
+            "error":          None,
+        }
 
     def _confirm_response(self, text: str) -> dict:
         """
@@ -368,6 +444,15 @@ class Coordinator:
             "[coordinator] resuming checkpoint: route=%s completed_stage=%s",
             route, cp.get("completed_stage"),
         )
+
+        # True classify-stage gap: classify itself was interrupted, so the route
+        # is not yet known and no params exist. Re-run the cheap classify+dispatch
+        # path. (A draft-stage interruption also records completed_stage="classify"
+        # but carries real params — that one resumes into _run_analytical below to
+        # re-run only the draft, without re-classifying.)
+        if cp.get("completed_stage") == "classify" and not cp.get("params"):
+            _ckpt.clear_checkpoint()
+            return await self._route_fresh(orig_q)
 
         if route == "operational":
             if self._agent is None:
@@ -640,10 +725,12 @@ class Coordinator:
                 # Custom SQL generation is an LLM call — it belongs to the
                 # draft stage (nothing paid for yet if it 429s).
                 if params.get("needs_custom_sql") and params.get("custom_sql_intent"):
-                    custom_query = await self._generate_custom_sql(
-                        question, params["custom_sql_intent"]
+                    custom_query = await self._call_with_per_minute_retry(
+                        self._generate_custom_sql,
+                        question, params["custom_sql_intent"],
                     )
-                draft = await analysis_agent.analyze(
+                draft = await self._call_with_per_minute_retry(
+                    analysis_agent.analyze,
                     pkg, scoped_question, research, memories,
                     conversation_context, custom_query,
                 )
@@ -666,7 +753,8 @@ class Coordinator:
             answer = draft
         else:
             try:
-                answer, flagged = await analysis_agent.ground_check(draft, pkg)
+                answer, flagged = await self._call_with_per_minute_retry(
+                    analysis_agent.ground_check, draft, pkg)
             except Exception as e:
                 if _is_rate_limit(e):
                     _ckpt.save_checkpoint(
@@ -678,7 +766,8 @@ class Coordinator:
 
         # ── Stage: COVERAGE (question + answer only, no data; 1 retry) ────────
         try:
-            answer, complete = await self._coverage_check(question, answer)
+            answer, complete = await self._call_with_per_minute_retry(
+                self._coverage_check, question, answer)
 
             if not complete:
                 # One retry: add first draft + gaps to context, re-run analysis
@@ -693,10 +782,11 @@ class Coordinator:
                         ),
                     },
                 ]
-                retry_draft = await analysis_agent.analyze(
-                    pkg, scoped_question, research, memories, retry_context, custom_query
-                )
-                answer, flagged2 = await analysis_agent.ground_check(retry_draft, pkg)
+                retry_draft = await self._call_with_per_minute_retry(
+                    analysis_agent.analyze,
+                    pkg, scoped_question, research, memories, retry_context, custom_query)
+                answer, flagged2 = await self._call_with_per_minute_retry(
+                    analysis_agent.ground_check, retry_draft, pkg)
                 flagged.extend(flagged2)
                 # No second coverage check — return best effort
         except Exception as e:

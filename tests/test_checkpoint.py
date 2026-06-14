@@ -320,13 +320,20 @@ def test_d_c_stale_slot_no_prompt_processes_directly(slot, coord, monkeypatch):
     assert not slot.exists()                      # stale slot dropped on load
 
 
-def test_d2_continue_without_checkpoint_falls_through(slot, coord, monkeypatch):
+def test_d2_continue_without_checkpoint_is_nothing_to_resume(slot, coord, monkeypatch):
+    # Nothing-to-resume guard (replaces the old fall-through): "continue" with
+    # no live slot must NOT classify/run a fresh question — it returns a notice.
+    called = {"classify": 0}
+
     async def fake_classify(question):
+        called["classify"] += 1
         return {**ANALYTICAL_PARAMS, "route": "operational"}
     monkeypatch.setattr(coord, "_classify", fake_classify)
 
     result = asyncio.run(coord.route("continue"))
-    assert result["route"] == "operational"   # normal routing, no crash
+    assert result["route"] == "none"
+    assert "no saved question" in result["answer"].lower()
+    assert called["classify"] == 0            # no LLM call — no double-pay
 
 
 # ── e. Stale checkpoint discarded on load ─────────────────────────────────────
@@ -389,3 +396,175 @@ def test_continue_intent_matcher():
     for msg in ("continue my bench analysis please and also add a set",
                 "how is my bench?", "", "log 130 lbs", "carry the bar on"):
         assert not ckpt.is_continue_intent(msg), msg
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Per-minute vs daily 429 — silent retry, classify-gap closure, nothing-to-resume
+# ══════════════════════════════════════════════════════════════════════════════
+
+_PER_MINUTE_BODY = (
+    "429 RESOURCE_EXHAUSTED. {'quotaId': "
+    "'GenerateContentInputTokensPerModelPerMinute-FreeTier', 'retryDelay': '53s'}"
+)
+_DAILY_BODY = (
+    "429 RESOURCE_EXHAUSTED. {'quotaId': "
+    "'GenerateRequestsPerDayPerProjectPerModel-FreeTier', 'retryDelay': '30s'}"
+)
+
+
+class _Fake429(Exception):
+    pass
+
+
+def _per_minute_exc():
+    return _Fake429(_PER_MINUTE_BODY)
+
+
+def _daily_exc():
+    return _Fake429(_DAILY_BODY)
+
+
+def _no_sleep(monkeypatch):
+    """Patch asyncio.sleep in the coordinator to a recording no-op."""
+    waits = []
+    async def fake_sleep(s):
+        waits.append(s)
+    monkeypatch.setattr(coordinator_mod.asyncio, "sleep", fake_sleep)
+    return waits
+
+
+# ── classifier: is_per_minute_quota / retry_delay_seconds ─────────────────────
+
+def test_per_minute_classifier_and_delay():
+    pm, dy = _per_minute_exc(), _daily_exc()
+    assert ckpt.is_per_minute_quota(pm) is True
+    assert ckpt.is_per_minute_quota(dy) is False        # daily → not per-minute
+    assert ckpt.retry_delay_seconds(pm) == 53
+    assert ckpt.retry_delay_seconds(dy) == 30
+    # structured exc.details path: 'PerMinute' only in details, not in str(e)
+    e = _Fake429("429 RESOURCE_EXHAUSTED")
+    e.details = {"error": {"details": [{"violations": [{"quotaId": "FooPerMinuteBar"}]}]}}
+    assert ckpt.is_per_minute_quota(e) is True
+
+
+# ── per-minute 429 → silent retry, no checkpoint, no QuotaInterrupted ─────────
+
+def test_per_minute_429_retries_silently(slot, coord, monkeypatch):
+    waits = _no_sleep(monkeypatch)
+    calls = {"n": 0}
+
+    async def flaky_analyze(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _per_minute_exc()
+        return DRAFT_TEXT
+
+    async def ok_ground(draft, pkg):
+        return draft, []
+
+    _patch_stages(monkeypatch, flaky_analyze, ok_ground)
+
+    async def fake_coverage(q, a):
+        return a, True
+    monkeypatch.setattr(coord, "_coverage_check", fake_coverage)
+
+    result = asyncio.run(coord.route("how is my bench progressing?"))
+
+    assert calls["n"] == 2                       # 429 once, retried once, succeeded
+    assert result["answer"] == DRAFT_TEXT
+    assert not slot.exists()                     # NO checkpoint written
+    assert waits == [55]                         # retryDelay 53 + buffer 2, under cap 70
+
+
+# ── per-minute 429 beyond max retries → falls through to daily checkpoint ─────
+
+def test_per_minute_429_exhausts_to_daily_path(slot, coord, monkeypatch):
+    _no_sleep(monkeypatch)
+    calls = {"n": 0}
+
+    async def always_per_minute(*a, **k):
+        calls["n"] += 1
+        raise _per_minute_exc()
+
+    _patch_stages(monkeypatch, analyze=always_per_minute)
+
+    with pytest.raises(ckpt.QuotaInterrupted):
+        asyncio.run(coord.route("how is my bench progressing?"))
+
+    # initial + PER_MINUTE_MAX_RETRIES attempts, then daily fallback
+    assert calls["n"] == 1 + coordinator_mod.PER_MINUTE_MAX_RETRIES
+    cp = _read_slot(slot)
+    assert cp["completed_stage"] == "draft" or cp["completed_stage"] == "classify"
+    # draft stage failed before producing text → no verbatim draft stored
+    assert cp["draft"] is None
+
+
+# ── classify-stage DAILY 429 → gap closed (checkpoint classify, draft null) ───
+
+def test_classify_daily_429_checkpoints_and_resumes(slot, coord, monkeypatch):
+    _no_sleep(monkeypatch)
+
+    async def failing_classify(q):
+        raise _daily_exc()
+    monkeypatch.setattr(coord, "_classify", failing_classify)
+
+    with pytest.raises(ckpt.QuotaInterrupted) as ei:
+        asyncio.run(coord.route("how is my bench progressing?"))
+    assert "your question is saved" in ei.value.user_message.lower()
+
+    cp = _read_slot(slot)
+    assert cp["completed_stage"] == "classify"
+    assert cp["draft"] is None
+    assert cp["params"] is None                  # true classify gap (route unknown)
+
+    # Resume re-runs classify (cheap) then the rest of the pipeline.
+    calls = {"classify": 0, "analyze": 0}
+
+    async def ok_classify(q):
+        calls["classify"] += 1
+        return dict(ANALYTICAL_PARAMS)
+    monkeypatch.setattr(coord, "_classify", ok_classify)
+
+    async def ok_analyze(*a, **k):
+        calls["analyze"] += 1
+        return DRAFT_TEXT
+
+    async def ok_ground(draft, pkg):
+        return draft, []
+    _patch_stages(monkeypatch, ok_analyze, ok_ground)
+
+    async def fake_coverage(q, a):
+        return a, True
+    monkeypatch.setattr(coord, "_coverage_check", fake_coverage)
+
+    result = asyncio.run(coord.route("continue"))
+    assert calls["classify"] == 1 and calls["analyze"] == 1
+    assert result["answer"] == DRAFT_TEXT
+    assert not slot.exists()
+
+
+# ── /resume path: nothing-to-resume guard (route('continue') with no slot) ────
+
+def test_resume_with_no_slot_returns_notice(slot, coord, monkeypatch):
+    spy = {"classify": 0, "analytical": 0, "operational": 0}
+
+    async def spy_classify(q):
+        spy["classify"] += 1
+        return dict(ANALYTICAL_PARAMS)
+    monkeypatch.setattr(coord, "_classify", spy_classify)
+
+    async def spy_an(q, p, resume=None):
+        spy["analytical"] += 1
+        return "X", []
+    monkeypatch.setattr(coord, "_run_analytical", spy_an)
+
+    async def spy_op(q):
+        spy["operational"] += 1
+        return "Y"
+    monkeypatch.setattr(coord, "_run_operational", spy_op)
+
+    result = asyncio.run(coord.route("continue"))      # what POST /resume sends
+
+    assert result["route"] == "none"
+    assert "no saved question" in result["answer"].lower()
+    assert spy == {"classify": 0, "analytical": 0, "operational": 0}  # no LLM/work

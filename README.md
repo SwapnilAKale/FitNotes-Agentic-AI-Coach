@@ -802,12 +802,102 @@ dropped silently on load). `/chat` 429 responses carry `checkpoint_saved` and
 `retry_after_seconds`; `GET /checkpoint-status` exposes the slot for debugging
 (never the draft text).
 
+### Plateau / regression / current-ability — rep-aware, cadence-scaled
+
+The progression detector was rewritten (`_compute_progression`) after it
+reported a false **89-day plateau** and a false **7.7% regression** on a Lat
+Pulldown that was actually progressing (130×5 → 130×9 with a lighter back-off
+day last). Root cause: it anchored "current" on the single latest session and
+compared `max_working_weight` only, so rep gains at the same weight were
+invisible and a back-off day redefined current ability downward.
+
+- **"New best" = literal weight → reps, never e1RM.** A session is a new best
+  iff its top working weight is heavier, or the same weight with more reps —
+  matching the PR rule. e1RM is deliberately *not* the basis: Epley inflates
+  light high-rep sets (a 20×15 warmup outscores a real 25×3 PR by e1RM), which
+  would crown a warmup as the best.
+- **"Current ability" = robust recent best**, the best (weight→reps) over the
+  exercise's last `CURRENT_ABILITY_SESSIONS` sessions — a lone back-off/high-rep
+  day can't lower it.
+- **Plateau** is declared only when all of: `sessions_since_best ≥
+  PLATEAU_MIN_SESSIONS_SINCE_BEST` (scaled to the exercise's own session
+  cadence), the recent e1RM slope is *not* rising (trend gate over
+  `PLATEAU_SLOPE_WINDOW` sessions), and there are `≥ MIN_SESSIONS_FOR_TREND`
+  sessions; otherwise it reports the observed facts or refuses to opine (thin
+  data). e1RM is used *only* as this trend-direction gate, never to pick the best.
+
+Named constants (`process.py`): `CURRENT_ABILITY_SESSIONS = 3`,
+`PLATEAU_MIN_SESSIONS_SINCE_BEST = 5`, `PLATEAU_SLOPE_WINDOW = 6`,
+`MIN_SESSIONS_FOR_TREND = 4`, `NEW_BEST_WEIGHT_TOL_KG = 0.05`.
+
+### Comment binding at source (D5)
+
+Each set's comment is bound to its row by the DB foreign key
+(`Comment.owner_id = training_log._id`) at **fetch time** and carried as
+`set["comment"]` / `set["set_db_id"]` — never re-matched downstream. The binding
+is 1:1 (no set has >1 comment); ~46% of sets have no comment, which stays `None`
+and is never inferred. The operational chat path (`combined_server.py`) had a
+reps/weight heuristic that re-fetched comments and matched them by `reps ==
+reps AND |weight−offset−typed| < 1.0` — first-match-wins, which **swapped
+comments between same-weight×reps sets** (the live-chat misattribution that
+quoted one set's notes against another). That heuristic is removed; the bound
+comment is read directly. Validator invariant **D5** independently verifies every
+set's carried comment against its own `Comment` row and **raises** on a mismatch.
+
+### Operational-path per-unit volume
+
+`get_weekly_volume` (the chat tool) now returns `total_volume_lbs` /
+`total_volume_kg` per muscle group instead of one blended
+`SUM(metric_weight * 2.2046 * reps)` — the same cross-unit bug as Pass 2, on the
+chat-tool surface (Back, Forearms, Biceps were blending kg-native exercises'
+kilograms into pounds). It reuses the kg-native rule from the existing
+`KG_NATIVE` constant + `DEADLIFT_KG_SWITCH = "2025-12-26"`. Per category,
+`lbs + kg` reconciles to the old blended sum (no volume created or lost; only
+split). `run_read_only_sql` passes agent SQL through verbatim — it can't be
+bucketed, so its response now carries a caveat that kg-native typed values are
+kilograms and must not be summed across frames.
+
+### Per-minute vs daily 429 handling
+
+A 429's `quotaId` distinguishes the two (read structurally from `exc.details`,
+falling back to `str(exc)`):
+
+- **Per-minute** 429 (`…PerMinute…`, `retryDelay` ~53s) is absorbed
+  **silently** — the backend waits the `retryDelay` and retries the same stage
+  in place (`PER_MINUTE_MAX_RETRIES = 2`, each wait capped at
+  `PER_MINUTE_WAIT_CAP = 70s` + a 2s buffer), holding the request open with no
+  checkpoint and no message; the "thinking…" spinner persists. Diagnosis
+  confirmed `/chat` has no server timeout and the frontend fetch has none, so a
+  ~70s hold is safe.
+- **Daily** 429 (or exhausted per-minute retries) checkpoints and surfaces a
+  status. The frontend now consumes the server's `message` and renders a
+  **Resume** button only when `checkpoint_saved` is true (it POSTs `/resume`,
+  which reuses the Coordinator's continue-intent path) — the hardcoded "Daily
+  quota reached… 12:30 PM IST" string is gone.
+- **Classify-stage gap closed:** the first (classify) call of a question is now
+  wrapped too — a daily 429 there checkpoints `completed_stage="classify"`
+  (`draft=null`, `params=null`) and resume re-runs the cheap classify.
+- **Nothing-to-resume guard:** a resume request with no live slot returns
+  `route="none"` ("There's no saved question to resume.") with zero downstream
+  LLM calls, instead of running a fresh expensive question.
+
 ### Known open gaps (updated)
 
-- **Operational-path SQL `total_volume`** (`mcp_servers/*.py`) still computes
-  `SUM(metric_weight * 2.2046 * reps)` uniformly — the same kg-as-lbs conversion
-  the analytical package now buckets per-unit. The cross-unit bug's second
-  surface, not yet fixed.
+- **Bar weight in operational volume** — `get_weekly_volume` is now per-unit but
+  still **plates-only** (`metric_weight * 2.2046 * reps`, no bar), inconsistent
+  with the analytical path's bar-inclusive volume. Deliberately out of scope for
+  the cross-unit fix; tracked separately.
+- **`run_read_only_sql` blend edge** — arbitrary agent SQL can still emit a
+  blended `SUM(...*2.2046)` across kg-native and lbs exercises. It can't be
+  bucketed (verbatim passthrough), so it's only **annotated** with a unit
+  caveat, not corrected.
+- **kg-native predicate duplication** — the rule (`KG_NATIVE` +
+  `DEADLIFT_KG_SWITCH` / `validate._KG_NATIVE` / `process._is_kg_native`) is
+  copied across `process.py`, `validate.py`, and both MCP servers; flagged
+  in-code to unify into one shared helper.
+- **`agent_lock` held during a per-minute wait** — the silent retry holds the
+  single agent lock for up to ~2×70s, so a concurrent `/chat` gets the existing
+  "busy" 429. Acceptable under the single-user assumption; flagged for multi-user.
 - **Warmup 0-opener gate** (`process.py` ~342) compares a plates-only working max
   against the bar-inclusive `exercise_alltime_max` — an internal cross-frame
   heuristic (not a shipped value), left as-is.
@@ -815,5 +905,7 @@ dropped silently on load). `/chat` 429 responses carry `checkpoint_saved` and
   long answers have no progressive render.
 - **Research / paper fetcher** (PubMed / RAG) is best-effort and uncached — it can
   be slow or empty and still spends an API call on the operational path.
+- **No LangGraph / graph orchestration** — routing and the stage pipeline are
+  hand-rolled in the Coordinator; a graph framework is not used.
 - `cli.py` 429 handling catches `ClientError` from a different code path than the
   server's string-match guard — some error shapes may not surface as rate limits.

@@ -52,6 +52,35 @@ def is_rate_limit(exc: Exception) -> bool:
     return "429" in msg or "RESOURCE_EXHAUSTED" in msg
 
 
+def _error_text(exc: Exception) -> str:
+    """
+    All searchable text for a 429: the structured error body (exc.details,
+    set by google.genai APIError to the parsed JSON) plus str(exc). quotaId /
+    quotaMetric / retryDelay live in details[] but are also embedded in str().
+    """
+    parts = [str(exc)]
+    details = getattr(exc, "details", None)
+    if details is not None:
+        parts.append(str(details))
+    return " ".join(parts)
+
+
+def is_per_minute_quota(exc: Exception) -> bool:
+    """
+    True for a PER-MINUTE 429 (transient — absorb silently and retry).
+    A per-minute quota carries a quotaId/quotaMetric containing 'PerMinute'
+    (e.g. 'GenerateContentInputTokensPerModelPerMinute-FreeTier'). A daily
+    quota ('PerDay') or any 429 without a per-minute marker → False, so it
+    falls through to the daily checkpoint path.
+    """
+    return "perminute" in _error_text(exc).lower()
+
+
+def retry_delay_seconds(exc: Exception) -> int | None:
+    """Seconds to wait before retrying — the provider's retryDelay (or None)."""
+    return _retry_seconds(exc)
+
+
 class QuotaInterrupted(Exception):
     """
     Raised AFTER a 429 has been checkpoint-saved.
