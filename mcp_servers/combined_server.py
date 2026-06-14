@@ -98,7 +98,7 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="get_weekly_volume",
-            description="get_weekly_volume(muscle_group, weeks) -> [{week, sets, volume}] — volume over time by muscle group",
+            description="get_weekly_volume(days) -> [{muscle_group, total_sets, total_volume_lbs, total_volume_kg}] — training volume by muscle group, split per unit frame (lbs vs kg-native); never add the two buckets",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -806,6 +806,30 @@ async def _query_workout_data(question: str) -> str:
 
 KG_NATIVE = {"Deadlift", "Seated Machine Curl (Kg)", "Machine Wrist Extension", "Hand Gripper"}
 
+# Deadlift switched from lbs to kg logging on this date; the other kg-native
+# exercises log kg for all of history. Mirrors validate._DEADLIFT_KG_SWITCH /
+# process.DEADLIFT_KG_SWITCH_DATE. NOTE: duplicated here so the SQL volume split
+# stays self-contained in this MCP subprocess — unify into one shared helper later.
+DEADLIFT_KG_SWITCH = "2025-12-26"
+
+
+def _kg_native_volume_case(expr: str) -> tuple:
+    """
+    Build (lbs_sum_sql, kg_sum_sql) for a volume expression, split by the
+    kg-native rule so kilograms are never summed into pounds. Reuses KG_NATIVE
+    (the always-kg names) + DEADLIFT_KG_SWITCH (Deadlift's date-conditioned
+    switch). Inputs are internal constants, not user data — safe to interpolate.
+    The two buckets are different UNITS and must never be added together.
+    """
+    always_kg = sorted(n for n in KG_NATIVE if n != "Deadlift")
+    in_list = ", ".join("'" + n.replace("'", "''") + "'" for n in always_kg)
+    kg_pred = (f"(e.name IN ({in_list}) "
+               f"OR (e.name = 'Deadlift' AND tl.date >= '{DEADLIFT_KG_SWITCH}'))")
+    lbs_sum = f"SUM(CASE WHEN NOT {kg_pred} THEN {expr} ELSE 0 END)"
+    kg_sum  = f"SUM(CASE WHEN {kg_pred} THEN {expr} ELSE 0 END)"
+    return lbs_sum, kg_sum
+
+
 BAR_EXERCISE_NOTES = {
     "Deadlift": "Weights shown are plate weights only (kg). Add 20kg bar for total weight.",
     "Barbell Row": "Weights shown are plate weights only (lbs). Add 44.09 lbs bar for total weight.",
@@ -1004,10 +1028,16 @@ async def _get_exercise_history(exercise_name: str, days: int = 30) -> str:
 def _get_weekly_volume_sync(days: int = 30) -> str:
     from src.db import get_connection, run_query
 
+    # Per-unit volume: metric_weight * 2.2046 recovers the TYPED number, which is
+    # kilograms for kg-native exercises and pounds otherwise. Bucket by frame so
+    # a kg-native exercise (e.g. post-2025-12-26 Deadlift) is never summed into a
+    # category's pounds total. Mirrors the analytical path's _lbs/_kg fields.
+    _lbs_sum, _kg_sum = _kg_native_volume_case("tl.metric_weight * 2.2046 * tl.reps")
     sql = f"""
         SELECT c.name AS muscle_group,
                COUNT(*) AS total_sets,
-               ROUND(SUM(tl.metric_weight * 2.2046 * tl.reps), 1) AS total_volume
+               ROUND({_lbs_sum}, 1) AS total_volume_lbs,
+               ROUND({_kg_sum}, 1) AS total_volume_kg
         FROM training_log tl
         JOIN exercise e ON tl.exercise_id = e._id
         JOIN Category c ON e.category_id = c._id
@@ -1021,7 +1051,14 @@ def _get_weekly_volume_sync(days: int = 30) -> str:
         return json.dumps(
             {
                 "days": days,
-                "note": "total_volume uses typed_value (metric_weight * 2.2046) x reps.",
+                "note": (
+                    "Volume is split per UNIT FRAME: total_volume_lbs (pounds-typed "
+                    "exercises) and total_volume_kg (kg-native exercises: post-2025-12-26 "
+                    "Deadlift, Seated Machine Curl (Kg), Machine Wrist Extension, Hand "
+                    "Gripper). Each is typed_value (metric_weight * 2.2046) x reps, "
+                    "plates only (no bar weight). The two are DIFFERENT UNITS — never "
+                    "add total_volume_lbs and total_volume_kg together."
+                ),
                 "volume_by_muscle_group": rows,
             }
         )
@@ -1056,7 +1093,20 @@ async def _run_read_only_sql(sql: str) -> str:
 
     try:
         rows = await asyncio.to_thread(_execute)
-        return json.dumps({"rows": rows, "rows_returned": len(rows)})
+        return json.dumps({
+            "rows": rows,
+            "rows_returned": len(rows),
+            # Verbatim passthrough — cannot bucket arbitrary SQL. Caveat so a
+            # blended SUM(metric_weight*2.2046*reps) over multiple exercises is
+            # not treated as authoritative: that mixes pounds and kilograms.
+            "note": (
+                "Raw values. metric_weight*2.2046 = the TYPED number, which is "
+                "kilograms for kg-native exercises (post-2025-12-26 Deadlift, "
+                "Seated Machine Curl (Kg), Machine Wrist Extension, Hand Gripper) "
+                "and pounds otherwise — do NOT SUM weight or volume across both "
+                "frames in one number; bar weight and offsets are not included."
+            ),
+        })
     except Exception as exc:
         return json.dumps({"error": str(exc)})
 

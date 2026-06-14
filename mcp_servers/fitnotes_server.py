@@ -200,10 +200,20 @@ async def _get_exercise_history(exercise_name: str, days: int = 30) -> str:
 async def _get_weekly_volume(days: int = 30) -> str:
     from src.db import get_connection, run_query
 
+    # Per-unit volume split — kilograms (kg-native exercises) are never summed
+    # into a category's pounds total. kg-native = the three always-kg machines
+    # OR Deadlift on/after its 2025-12-26 switch. NOTE: this predicate duplicates
+    # combined_server._kg_native_volume_case / the analytical rule; unify later.
+    _kg_pred = (
+        "(e.name IN ('Seated Machine Curl (Kg)','Machine Wrist Extension','Hand Gripper') "
+        "OR (e.name = 'Deadlift' AND tl.date >= '2025-12-26'))"
+    )
+    _vol = "tl.metric_weight * 2.2046 * tl.reps"
     sql = f"""
         SELECT c.name AS muscle_group,
                COUNT(*) AS total_sets,
-               ROUND(SUM(tl.metric_weight * 2.2046 * tl.reps), 1) AS total_volume
+               ROUND(SUM(CASE WHEN NOT {_kg_pred} THEN {_vol} ELSE 0 END), 1) AS total_volume_lbs,
+               ROUND(SUM(CASE WHEN     {_kg_pred} THEN {_vol} ELSE 0 END), 1) AS total_volume_kg
         FROM training_log tl
         JOIN exercise e ON tl.exercise_id = e._id
         JOIN Category c ON e.category_id = c._id
@@ -217,7 +227,13 @@ async def _get_weekly_volume(days: int = 30) -> str:
         return json.dumps(
             {
                 "days": days,
-                "note": "total_volume uses typed_value (metric_weight * 2.2046) × reps. Units are lbs for lbs-native exercises.",
+                "note": (
+                    "Volume split per UNIT FRAME: total_volume_lbs (pounds-typed) and "
+                    "total_volume_kg (kg-native: post-2025-12-26 Deadlift, Seated Machine "
+                    "Curl (Kg), Machine Wrist Extension, Hand Gripper). Each is "
+                    "metric_weight * 2.2046 x reps, plates only (no bar). DIFFERENT UNITS "
+                    "— never add total_volume_lbs and total_volume_kg."
+                ),
                 "volume_by_muscle_group": rows,
             }
         )
