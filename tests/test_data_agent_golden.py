@@ -253,18 +253,19 @@ def test_G_CARDIO0_cycling_dead_hang_duration_no_pace():
 
 def test_G_ALLTIME_alltime_summary():
     """
-    All-time training summary: first session 2024-06-04, last 2026-05-29,
-    305 distinct training days.
-    Pinned to 2026-06-11 snapshot.
+    All-time training summary: first session 2024-06-04, last 2026-06-13,
+    306 distinct training days.
+    Re-pinned to 2026-06-13 snapshot (DB extended past the prior 2026-06-11 pin;
+    all_time_summary is unrelated to the plateau-logic change).
     """
     data = collect(query_period_days=None)
     ats = data["all_time_summary"]
 
     # E1: boundary dates
     assert ats["first_training_date"] == "2024-06-04"
-    assert ats["last_training_date"]  == "2026-05-29"
+    assert ats["last_training_date"]  == "2026-06-13"
     # E4: distinct training day count
-    assert ats["total_training_days"] == 305
+    assert ats["total_training_days"] == 306
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -809,3 +810,167 @@ def test_G_SCOPE_FALLBACK_nonexistent_exercise():
         f"G-SCOPE-FALLBACK: expected a WARNING log containing the unresolved name; "
         f"captured log messages: {log_records[:10]}"
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Plateau / regression / current-ability — rep-aware, cadence-scaled detection
+# Locks the false-89-day-plateau / false-7.7%-regression bug out for good.
+# (process.py _compute_progression / _evaluate_phase2)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_LAT_KW = dict(query_period_days=400, exercise_names=["Lat Pulldown"],
+               aggregation_level="session", include_phase2=True)
+
+
+def _synth_session(date: str, w: float, reps: int) -> dict:
+    """Minimal session dict accepted by _compute_progression (Epley e1RM)."""
+    e = round(w * (1 + reps / 30), 1) if reps > 1 else float(w)
+    return {"date": date, "unit": "lbs", "max_working_weight": float(w),
+            "reps_at_max": reps, "estimated_1rm": e}
+
+
+# ── G-PLATEAU-FALSE · Lat Pulldown rising run must NOT read as a plateau ───────
+
+def test_G_PLATEAU_FALSE_lat_pulldown():
+    data = collect(**_LAT_KW)
+    ex = _ex(data, "Lat Pulldown")
+    p = ex["progression"]
+    # The 12-session 130 run (incl. 130x9) is progression, not a plateau.
+    assert p["is_plateau"] is False, p.get("plateau_note")
+    assert p["plateau_since"] is None
+    assert p["last_new_best_date"] == "2026-05-18"      # the 130x9 rep-gain session
+    assert p["sessions_since_best"] < 5                  # below the plateau threshold
+    # "current ability" reflects the established 130, NOT today's 120 back-off day
+    assert p["current_weight"] == 130.0
+    assert ex["plateau_days"] == 0
+    assert ex["phase2_triggered"] is False
+
+
+# ── G-NO-REGRESSION · today's 120 back-off day is not a regression ────────────
+
+def test_G_NO_REGRESSION_lat_pulldown_backoff():
+    data = collect(**_LAT_KW)
+    p = _ex(data, "Lat Pulldown")["progression"]
+    assert p["regression_from_peak"] is None             # was a false 7.7% drop
+    assert p["max_weight_end"] == 120.0                  # literal last session (factual)
+    assert p["current_weight"] == 130.0                  # but current ability holds at 130
+
+
+# ── G-REP-PROGRESS · same-weight rep gain IS a new best ───────────────────────
+
+def test_G_REP_PROGRESS_same_weight_more_reps():
+    from src.data_agent.process import _is_new_best, _last_new_best_index
+    assert _is_new_best(130.0, 9, 130.0, 5) is True      # 130x5 -> 130x9
+    assert _is_new_best(130.0, 7, 130.0, 9) is False     # fewer reps, same weight
+    assert _is_new_best(130.0, 9, 130.0, 9) is False     # equal is not a new best
+    assert _is_new_best(135.0, 1, 130.0, 9) is True      # heavier always wins
+    # Real history: the last new best is the 130x9 rep-gain session
+    sess = _ex(collect(**_LAT_KW), "Lat Pulldown")["sessions"]
+    idx = _last_new_best_index(sess, "lbs")
+    assert sess[idx]["date"] == "2026-05-18"
+    assert sess[idx]["max_working_weight"] == 130.0 and sess[idx]["reps_at_max"] == 9
+
+
+# ── G-WARMUP-NOT-BEST · a light high-rep set is NOT a new best (e1RM ≠ basis) ──
+
+def test_G_WARMUP_NOT_BEST_light_highrep():
+    from src.data_agent.process import _is_new_best, _epley_1rm
+    # Epley would WRONGLY crown the lighter high-rep set...
+    assert _epley_1rm(20, 15) > _epley_1rm(25, 3)        # 30.0 > 27.5
+    # ...but the weight->reps PR rule does not.
+    assert _is_new_best(20.0, 15, 25.0, 3) is False
+    # Real exercise: PR + current ability are the heavy 25x3, never a light set.
+    ex = _ex(collect(query_period_days=None, aggregation_level="session"),
+             "dumbbell skull crusher")
+    assert ex["pr"]["weight"] == 25.0 and ex["pr"]["reps"] == 3
+    assert ex["progression"]["current_weight"] == 25.0
+
+
+# ── G-REAL-PLATEAU · genuine flat run (no new best, e1RM not rising) plateaus ──
+
+def test_G_REAL_PLATEAU_synthetic():
+    from src.data_agent.process import _compute_progression, _evaluate_phase2
+    from datetime import datetime
+    sessions = [
+        _synth_session("2026-01-05", 100, 5),   # the only new best
+        _synth_session("2026-01-12", 100, 5),
+        _synth_session("2026-01-19",  95, 6),
+        _synth_session("2026-01-26", 100, 4),
+        _synth_session("2026-02-02", 100, 5),
+        _synth_session("2026-02-09",  95, 5),
+        _synth_session("2026-02-16", 100, 5),
+    ]
+    p = _compute_progression(sessions)
+    assert p["is_plateau"] is True
+    assert p["last_new_best_date"] == "2026-01-05"
+    assert p["sessions_since_best"] == 6
+    assert p["plateau_span_days"] and p["plateau_span_days"] > 0
+    assert "no new best" in p["plateau_note"]
+    trig, days = _evaluate_phase2(p, datetime.strptime("2026-02-16", "%Y-%m-%d").date())
+    assert trig is True and days > 0
+
+
+# ── G-THIN-DATA · too few sessions → refuse to opine ──────────────────────────
+
+def test_G_THIN_DATA_too_few_sessions():
+    from src.data_agent.process import _compute_progression
+    sessions = [
+        _synth_session("2026-01-05", 100, 5),
+        _synth_session("2026-01-12", 100, 5),
+        _synth_session("2026-01-19", 100, 5),
+    ]  # 3 sessions < MIN_SESSIONS_FOR_TREND (4)
+    p = _compute_progression(sessions)
+    assert p["trend_assessable"] is False
+    assert p["is_plateau"] is False
+    assert p["regression_from_peak"] is None
+    assert "not enough sessions" in p["plateau_note"] and "only 3" in p["plateau_note"]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Comment binding — each comment sits on its OWN set, bound by training_log._id
+# (Comment.owner_id). Locks out the weight/reps re-correlation misattribution.
+# ══════════════════════════════════════════════════════════════════════════════
+
+_LATPD = dict(query_period_days=400, exercise_names=["Lat Pulldown"],
+              aggregation_level="session", include_phase2=True)
+
+
+def _set_by_weight(ex: dict, date: str, weight: float) -> dict:
+    s = _sess(ex, date)
+    return next(st for st in s["sets"] if abs(st["weight"] - weight) < 0.5)
+
+
+# ── G-COMMENT-BIND · 2026-05-18: 130x9 and 115x12 hold their OWN comments ─────
+
+def test_G_COMMENT_BIND_lat_pulldown_0518():
+    ex = _ex(collect(**_LATPD), "Lat Pulldown")
+    top = _set_by_weight(ex, "2026-05-18", 130.0)   # the 130x9 PR set
+    mid = _set_by_weight(ex, "2026-05-18", 115.0)
+    assert top["set_db_id"] == 14371
+    assert top["comment"] == "First 3 below the neck\nNext 3 neck ups\nLast 2 partials"
+    assert mid["set_db_id"] == 14370
+    assert mid["comment"] == "First 8 below the neck\nLast 4 neck ups"
+    # not swapped / cross-matched
+    assert top["comment"] != mid["comment"]
+
+
+# ── G-COMMENT-NULL · a real no-comment set carries comment=None ───────────────
+
+def test_G_COMMENT_NULL_lat_pulldown_0518_warmup():
+    ex = _ex(collect(**_LATPD), "Lat Pulldown")
+    warm = _set_by_weight(ex, "2026-05-18", 70.0)
+    assert warm["set_db_id"] == 14368
+    assert warm["comment"] is None        # no neighbour's comment leaked onto it
+
+
+# ── G-COMMENT-MARCH16 · different sets, the prior bug quoted the 115 as the top ─
+
+def test_G_COMMENT_MARCH16_lat_pulldown():
+    ex = _ex(collect(**_LATPD), "Lat Pulldown")
+    mid = _set_by_weight(ex, "2026-03-16", 115.0)
+    top = _set_by_weight(ex, "2026-03-16", 130.0)
+    assert mid["set_db_id"] == 13417
+    assert mid["comment"] == "First 8 below the neck\nNext 2 neck ups\nLast 2 partials"
+    assert top["set_db_id"] == 13418
+    assert top["comment"] == "3rd set\nFirst 2 neck ups\nLast 3 partials"
+    assert mid["comment"] != top["comment"]

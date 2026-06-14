@@ -125,6 +125,11 @@ async def main() -> None:
                     wait_msg = ""
                     if "Please try again in" in error_str:
                         wait_msg = error_str.split("Please try again in")[1].split(".")[0].strip()
+                    # Checkpoint status message (QuotaInterrupted) — typing
+                    # 'continue' resumes the saved question via the Coordinator.
+                    cp_msg = getattr(e, "user_message", None)
+                    if cp_msg:
+                        print(f"\n[{cp_msg}]")
                     print(f"\n[Rate limit reached. Reset in {wait_msg if wait_msg else 'some time'}. Type 'exit' to quit or wait and try again.]\n")
                 elif "503" in error_str or "UNAVAILABLE" in error_str:
                     print("\n[Gemini is under high demand right now. Wait a few minutes and try again.]\n")

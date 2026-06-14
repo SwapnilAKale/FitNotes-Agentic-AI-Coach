@@ -13,6 +13,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from src.memory import add_fact, format_relevant_memories_for_prompt
 from src.schema_prompt import build_user_context_prompt, load_user_context
+from src import checkpoint as _ckpt
 
 MODEL = "gemini-3.1-flash-lite"
 
@@ -638,16 +639,33 @@ class AgentSession:
     #  Main answer loop                                                    #
     # ------------------------------------------------------------------ #
 
-    async def answer(self, question: str) -> dict:
+    async def answer(self, question: str, resume_messages: list | None = None) -> dict:
         history_messages: list[dict] = [
             msg for exchange in self._conversation_history for msg in exchange
         ]
         messages: list[dict] = [
             *self._context_messages,
             *history_messages,
-            {"role": "user", "content": question},
         ]
-        new_exchange_start = len(self._context_messages) + len(history_messages)
+        new_exchange_start = len(messages)
+        if resume_messages:
+            # Quota-interrupted exchange reloaded from the checkpoint: the
+            # original user question plus the already-completed assistant/tool
+            # turns. Completed tool calls are NOT repeated — their results are
+            # in the reloaded messages.
+            messages.extend(resume_messages)
+            messages.append({
+                "role": "user",
+                "content": (
+                    "Your previous response was interrupted by a rate limit. "
+                    "Continue from where you left off and finish answering the "
+                    "original question above. Do not repeat tool calls whose "
+                    "results are already shown. Never execute a staged write "
+                    "without the user explicitly confirming it first."
+                ),
+            })
+        else:
+            messages.append({"role": "user", "content": question})
         max_iterations = 12
         tool_calls_made = 0
 
@@ -710,7 +728,22 @@ class AgentSession:
                     gemini_contents.append(model_content)
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
+                if _ckpt.is_rate_limit(exc):
+                    # Checkpoint the exchange so 'continue' resumes the loop
+                    # without re-running completed tool calls. Tool results
+                    # are mechanically pruned on save (head+tail, no LLM).
+                    try:
+                        _ckpt.save_checkpoint(
+                            route="operational",
+                            question=question,
+                            messages=messages[new_exchange_start:],
+                        )
+                    except Exception:
+                        pass  # checkpoint failure must not mask the 429
+                    raise _ckpt.QuotaInterrupted(
+                        exc, _ckpt.MSG_OPERATIONAL_INTERRUPTED
+                    )
                 raise  # Let cli.py handle all errors cleanly
 
             # Store assistant turn in OpenAI-format dict for history
@@ -872,6 +905,44 @@ class AgentSession:
             "tool_calls_made": tool_calls_made,
             "error": "max_iterations_reached",
         }
+
+    # ------------------------------------------------------------------ #
+    #  Checkpoint resume                                                   #
+    # ------------------------------------------------------------------ #
+
+    async def resume(self, cp: dict) -> dict:
+        """
+        Resume a quota-interrupted operational exchange from a checkpoint.
+
+        Reloads the saved messages (original question + completed tool turns)
+        and continues the ReAct loop. Staged-write safety: execution only ever
+        happens through the confirmation gate; if the interrupted exchange had
+        staged a write but the staging state was lost with the session, the
+        user is asked to re-issue the write instead of resuming.
+        """
+        saved    = cp.get("messages") or []
+        question = cp.get("question") or ""
+
+        had_staged_write = any(
+            m.get("role") == "tool"
+            and isinstance(m.get("content"), str)
+            and "staged_key" in m["content"]
+            for m in saved
+        )
+        if had_staged_write and not self._staged_active:
+            return {
+                "question": question,
+                "answer": (
+                    "Your interrupted request involved a staged write, and the "
+                    "staging state was lost with the session. Nothing was "
+                    "executed. Please re-issue the write request so it can be "
+                    "staged and confirmed again."
+                ),
+                "tool_calls_made": 0,
+                "error": None,
+            }
+
+        return await self.answer(question, resume_messages=saved)
 
     # ------------------------------------------------------------------ #
     #  Reflection                                                          #

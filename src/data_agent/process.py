@@ -36,6 +36,15 @@ HEAVY_FRACTION    = 0.50  # 0-weight opener: working max must be ≥ this × all
 DEADLIFT_KG_SWITCH_DATE = date(2025, 12, 26)
 PLATEAU_TRIGGER_DAYS    = 28
 IMPROVEMENT_TRIGGER_PCT = 20.0
+
+# ── Plateau / regression / "current ability" detection ────────────────────────
+# Every threshold is structural (a count or tolerance applied to the exercise's
+# OWN sessions), never a per-user or per-exercise hardcode.
+NEW_BEST_WEIGHT_TOL_KG          = 0.05  # kg tolerance for "same weight" across unit-switch rounding
+CURRENT_ABILITY_SESSIONS        = 3     # "current" = best (weight→reps) over the exercise's last N sessions; one back-off/high-rep day cannot redefine it
+PLATEAU_MIN_SESSIONS_SINCE_BEST = 5     # need ≥ this many of THIS exercise's sessions with no new best before a plateau — normal gaps between PRs during a rising run must not count
+PLATEAU_SLOPE_WINDOW            = 6     # sessions used for the e1RM trend-direction gate; a rising recent e1RM slope blocks a plateau regardless of the count
+MIN_SESSIONS_FOR_TREND          = 4     # below this, refuse to opine on plateau/regression (thin data → report sample size only)
 SESSION_MAX_DAYS        = 90
 WEEKLY_MAX_DAYS         = 365
 ABANDONED_DAYS          = 60
@@ -622,6 +631,10 @@ def _build_sessions_from_rows(rows: list, ctx: dict,
                           and not reps_zero_normal)
             sets.append({
                 "set_id":             r["set_id"],
+                # set_db_id == training_log._id: the row the comment is bound to
+                # by the fetch LEFT JOIN (Comment.owner_id = tl._id). The comment
+                # is carried on its own set by id — never re-found by weight/reps.
+                "set_db_id":          r["set_id"],
                 "weight":             weight,
                 "reps":               reps,
                 "distance":           round(distance, 3),
@@ -855,6 +868,56 @@ def _aggregate_yearly(sessions: list, unit: str) -> list:
 
 # ── Progression, PR, regression ───────────────────────────────────────────────
 
+def _session_wr_kg(s: dict, default_unit: str) -> tuple:
+    """
+    (kg-normalized working-max weight, reps-at-that-weight) for a session —
+    the pair used for new-best / current-ability comparisons. Weight is
+    kg-normalized so a mid-history unit switch (Deadlift lbs→kg) compares
+    correctly; reps are the reps achieved AT that working max in the SAME
+    session (never mixed across sets).
+    """
+    return (_to_kg(s["max_working_weight"], s.get("unit", default_unit)),
+            s.get("reps_at_max", 0) or 0)
+
+
+def _is_new_best(w_kg: float, r: int, best_w_kg, best_r) -> bool:
+    """
+    PR rule (weight → reps), matching _compute_alltime_pr so plateau-logic and
+    PR-logic never contradict. A session is a new best iff its top working
+    weight is heavier, OR the same weight with more reps. e1RM is deliberately
+    NOT used here — Epley inflates light high-rep sets and would crown a warmup.
+    """
+    if best_w_kg is None:
+        return True
+    if w_kg > best_w_kg + NEW_BEST_WEIGHT_TOL_KG:
+        return True
+    if abs(w_kg - best_w_kg) <= NEW_BEST_WEIGHT_TOL_KG and r > best_r:
+        return True
+    return False
+
+
+def _last_new_best_index(sessions: list, default_unit: str) -> int:
+    """Index of the most recent session that set a new best by the PR rule."""
+    best_w = best_r = None
+    last_idx = 0
+    for i, s in enumerate(sessions):
+        w, r = _session_wr_kg(s, default_unit)
+        if _is_new_best(w, r, best_w, best_r):
+            best_w, best_r = w, r
+            last_idx = i
+    return last_idx
+
+
+def _recent_best_session(sessions: list, default_unit: str, k: int) -> dict:
+    """
+    The session holding the best (weight → reps) over the exercise's last k
+    sessions — the robust 'current ability'. A lone back-off / high-rep day
+    cannot lower it below the established working max.
+    """
+    window = sessions[-k:] if k else sessions
+    return max(window, key=lambda s: _session_wr_kg(s, default_unit))
+
+
 def _compute_progression(sessions: list) -> dict:
     if not sessions: return {}
     first = sessions[0]; last = sessions[-1]
@@ -894,41 +957,85 @@ def _compute_progression(sessions: list) -> dict:
         if max_weight_start > 0 else None
     )
 
-    # Plateau / peak / regression comparisons are kg-normalized per session
-    # unit. Raw comparison is a latent cross-unit bug for exercises with a
-    # mid-history unit switch (Deadlift): a 150 lbs session would compare as
-    # "above" a 70 kg session. For single-unit exercises the kg conversion
-    # is the same monotonic transform on every value — behaviour unchanged.
+    # Plateau / peak / regression / current-ability are kg-normalized per
+    # session unit. Raw comparison is a latent cross-unit bug for exercises
+    # with a mid-history unit switch (Deadlift): a 150 lbs session would
+    # compare as "above" a 70 kg session. For single-unit exercises the kg
+    # conversion is the same monotonic transform on every value.
     def _mww_kg(s: dict) -> float:
         return _to_kg(s["max_working_weight"], s.get("unit", last_unit))
 
-    current_max_kg = _mww_kg(last); plateau_since = last["date"]
-    for s in reversed(sessions):
-        if _mww_kg(s) >= current_max_kg - 1e-9: plateau_since = s["date"]
-        else: break
-    sessions_at_max = sum(1 for s in sessions if _mww_kg(s) >= current_max_kg - 1e-9)
+    def _to_last_unit(w_kg: float) -> float:
+        return round(w_kg if last_unit == "kg" else w_kg * 2.2046, 1)
 
+    n = len(sessions)
+    trend_assessable = n >= MIN_SESSIONS_FOR_TREND
+
+    # ── Peak (best headline weight, kg-normalized) ─────────────────────────────
     peak_kg      = max(_mww_kg(s) for s in sessions)
     peak_session = next(s for s in reversed(sessions)
                         if _mww_kg(s) >= peak_kg - 1e-9)
     peak_date    = peak_session["date"]
-    # Report the peak in the END session's unit so peak/current/regression
-    # share one frame of reference even across a unit switch. When the peak
-    # session is already in the end unit (the normal case) the raw value is
-    # used unchanged.
-    if peak_session.get("unit", last_unit) == last_unit:
-        peak_weight = peak_session["max_working_weight"]
+    peak_weight  = (peak_session["max_working_weight"]
+                    if peak_session.get("unit", last_unit) == last_unit
+                    else _to_last_unit(peak_kg))
+
+    # ── "Current ability" = robust recent best, NOT the single last session ────
+    # Best (weight → reps) over the exercise's last CURRENT_ABILITY_SESSIONS, so
+    # a lone back-off / high-rep day cannot lower current below the working max.
+    cur_session    = _recent_best_session(sessions, last_unit, CURRENT_ABILITY_SESSIONS)
+    current_kg     = _mww_kg(cur_session)
+    current_weight = (cur_session["max_working_weight"]
+                      if cur_session.get("unit", last_unit) == last_unit
+                      else _to_last_unit(current_kg))
+    current_reps   = cur_session.get("reps_at_max", 0)
+    current_basis  = f"best of last {min(CURRENT_ABILITY_SESSIONS, n)} sessions"
+
+    # ── New-best tracking (literal weight → reps, never e1RM) ──────────────────
+    last_best_idx       = _last_new_best_index(sessions, last_unit)
+    last_new_best_date  = sessions[last_best_idx]["date"]
+    sessions_since_best = (n - 1) - last_best_idx
+    plateau_span_days   = (datetime.strptime(last["date"], "%Y-%m-%d").date() -
+                           datetime.strptime(last_new_best_date, "%Y-%m-%d").date()).days
+
+    # ── e1RM trend-direction gate (e1RM used ONLY here) ────────────────────────
+    # A rising recent e1RM slope blocks a plateau even past the session count —
+    # same-weight rep gains (130×5 → 130×9) push e1RM up and must not read flat.
+    recent_e1rms = [s["estimated_1rm"] for s in sessions[-PLATEAU_SLOPE_WINDOW:]
+                    if s["estimated_1rm"] > 0]
+    e1rm_rising  = _trend(recent_e1rms, 0.02, 0.02) == "increasing"
+
+    # ── Plateau: ALL of (a) enough sessions since the last new best,
+    #    (b) recent e1RM not rising, (c) enough sessions to judge ───────────────
+    is_plateau = (trend_assessable
+                  and sessions_since_best >= PLATEAU_MIN_SESSIONS_SINCE_BEST
+                  and not e1rm_rising)
+    plateau_since = last_new_best_date if is_plateau else None
+
+    if not trend_assessable:
+        plateau_note = f"not enough sessions to assess trend (only {n} logged)"
+    elif is_plateau:
+        plateau_note = (f"no new best in the last {sessions_since_best} "
+                        f"sessions (~{plateau_span_days} days)")
     else:
-        peak_weight = round(peak_kg if last_unit == "kg" else peak_kg * 2.2046, 1)
-    end_kg       = _mww_kg(last)
+        plateau_note = (f"progressing — last new best {last_new_best_date} "
+                        f"({sessions_since_best} session(s) ago)")
+
+    # sessions_at_max: informational count sitting at the peak weight.
+    sessions_at_max = sum(1 for s in sessions if _mww_kg(s) >= peak_kg - 1e-9)
+
+    # ── Regression: peak vs the robust recent best, NOT the last session ───────
+    # A single lighter / back-off day must not register as a regression; only a
+    # sustained drop in the recent-best window counts. Thin data: don't opine.
     regression_from_peak = None
-    if end_kg < peak_kg - 0.005:
+    if trend_assessable and current_kg < peak_kg - 0.005:
         regression_from_peak = {
             "peak_weight":       peak_weight,
             "peak_date":         peak_date,
-            "current_weight":    max_weight_end,
-            "regression_amount": round(peak_weight - max_weight_end, 1),
-            "regression_pct":    round((peak_weight - max_weight_end) / peak_weight * 100, 1),
+            "current_weight":    current_weight,
+            "current_basis":     current_basis,
+            "regression_amount": round(peak_weight - current_weight, 1),
+            "regression_pct":    round((peak_weight - current_weight) / peak_weight * 100, 1),
         }
 
     dim_returns = None
@@ -965,10 +1072,22 @@ def _compute_progression(sessions: list) -> dict:
         "e1rm_end":             e1rm_end,
         "e1rm_change":          round(e1rm_end - e1rm_start, 1),
         "sessions_at_max":      sessions_at_max,
-        "plateau_since":        plateau_since if sessions_at_max > 1 else None,
         "session_count":        len(sessions),
         "reps_at_max_start":    first["reps_at_max"],
         "reps_at_max_end":      last["reps_at_max"],
+        # ── Current ability (robust recent best, not the last session) ────────
+        "current_weight":       current_weight,
+        "current_reps":         current_reps,
+        "current_basis":        current_basis,
+        # ── Plateau (rep-aware new-best rule, cadence-scaled) ─────────────────
+        "is_plateau":           is_plateau,
+        "plateau_since":        plateau_since,
+        "last_new_best_date":   last_new_best_date,
+        "sessions_since_best":  sessions_since_best,
+        "plateau_span_days":    plateau_span_days if is_plateau else None,
+        "plateau_note":         plateau_note,
+        "trend_assessable":     trend_assessable,
+        "e1rm_recent_rising":   e1rm_rising,
         "regression_from_peak": regression_from_peak,
         "diminishing_returns":  dim_returns,
     }
@@ -1126,16 +1245,22 @@ def _compute_distance_progression(sessions: list) -> Optional[dict]:
 
 
 def _evaluate_phase2(progression: dict, end_date) -> tuple:
+    # Plateau is now a rep-aware, cadence-scaled judgment made in
+    # _compute_progression (≥ N sessions with no new best AND recent e1RM not
+    # rising). Trust that decision instead of re-deriving from a raw calendar
+    # delta that ignored cadence and rep progress. plateau_days is the span
+    # since the last new best.
     plateau_days = 0
-    if progression.get("plateau_since"):
-        plateau_dt   = datetime.strptime(progression["plateau_since"], "%Y-%m-%d").date()
-        plateau_days = (end_date - plateau_dt).days
-    # abs(): a >20% REGRESSION warrants the full comment history at least as
-    # much as a >20% improvement — comments are where the reason for a drop
-    # lives (injury, deload, technique rebuild). The old `> 20` only fired
-    # on improvements.
+    if progression.get("is_plateau"):
+        plateau_days = progression.get("plateau_span_days") or 0
+        if not plateau_days and progression.get("plateau_since"):
+            plateau_dt   = datetime.strptime(progression["plateau_since"], "%Y-%m-%d").date()
+            plateau_days = (end_date - plateau_dt).days
+    # A declared plateau OR a large swing pulls the full comment history —
+    # comments are where the reason lives (injury, deload, technique rebuild).
+    # abs(): a >20% REGRESSION warrants it as much as a >20% improvement.
     triggered = (
-        plateau_days > PLATEAU_TRIGGER_DAYS or
+        bool(progression.get("is_plateau")) or
         abs(progression.get("weight_change_pct") or 0) > IMPROVEMENT_TRIGGER_PCT
     )
     return triggered, plateau_days
@@ -1509,6 +1634,7 @@ def _build_daily_workouts(all_rows: list, ctx: dict,
             category   = CATEGORY_NAMES.get(ex_rows[0]["category_id"],
                                              f"Cat_{ex_rows[0]['category_id']}")
             ex_sets = [{"set_id":           r["set_id"],
+                        "set_db_id":         r["set_id"],   # training_log._id; comment bound by id
                         "weight":            _recover_typed_weight(r["metric_weight"], offset),
                         "comment":           r.get("comment"),
                         "reps":              r["reps"],

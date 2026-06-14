@@ -36,7 +36,8 @@ from google import genai
 from google.genai import types
 
 from src.data_agent import prepare_analysis_package, DataAgentIntegrityError
-from src.analysis_agent import run as analysis_run
+from src import analysis_agent
+from src import checkpoint as _ckpt
 
 # Rate-limit error types: re-raised instead of swallowed so CLI/server
 # countdown UX works for analytical-path quota exhaustion.
@@ -237,6 +238,38 @@ class Coordinator:
               "error":         str | None,
             }
         """
+        # ── 0. Checkpoint: resume, confirm-before-discard, or pass through ────
+        # Continue-intent is checked BEFORE the write-intent guard so "continue"
+        # always resumes the interrupted question, never classifies as new.
+        # A live slot is never silently discarded — a NEW question prompts for
+        # confirmation first. (Stale >48h slots are dropped silently on load.)
+        cp = _ckpt.load_checkpoint()
+        if _ckpt.is_continue_intent(question):
+            if cp is not None:
+                return await self._resume(cp)
+            # continue with no live slot: fall through to normal routing
+        elif cp is not None:
+            if cp.get("awaiting_discard_confirm"):
+                # This message answers the discard prompt for the live slot.
+                if _ckpt.is_discard_intent(question):
+                    # Discard saved; process the stashed new question.
+                    question = cp.get("pending_question") or question
+                    _ckpt.clear_checkpoint()
+                elif _ckpt.is_ambiguous_reply(question):
+                    # Resolves neither way — re-ask, keep the slot (never
+                    # silently discard). The prompt makes no LLM call, so this
+                    # reply path cannot be re-checkpointed or loop.
+                    return self._confirm_response(_ckpt.discard_confirm_prompt(cp))
+                else:
+                    # A re-sent / substantive new question: discard, process it.
+                    _ckpt.clear_checkpoint()
+                # fall through to normal routing with `question`
+            else:
+                # First NEW question while a live slot exists: prompt and stash,
+                # do NOT process the new question or discard the slot yet.
+                _ckpt.mark_awaiting_discard(cp, question)
+                return self._confirm_response(_ckpt.discard_confirm_prompt(cp))
+
         # ── 1. Classify (or short-circuit for obvious write operations) ──────
         # Misrouting a write to analytical bypasses the confirmation gate.
         if _WRITE_INTENT_RE.search(question):
@@ -289,6 +322,86 @@ class Coordinator:
 
         # ── 3. Update conversation history ────────────────────────────────────
         self._history.append({"role": "user",      "content": question})
+        self._history.append({"role": "assistant", "content": answer})
+        if len(self._history) > CONTEXT_WINDOW * 2:
+            self._history = self._history[-(CONTEXT_WINDOW * 2):]
+
+        return {
+            "answer":         answer,
+            "route":          route,
+            "flagged_claims": flagged,
+            "error":          error,
+        }
+
+    # ── Checkpoint resume ─────────────────────────────────────────────────────
+
+    def _confirm_response(self, text: str) -> dict:
+        """
+        Transient control-flow reply (the discard-confirmation prompt).
+        Not recorded in conversation history — it is a meta-prompt about a
+        pending checkpoint, not a question/answer turn.
+        """
+        return {
+            "answer":         text,
+            "route":          "checkpoint_confirm",
+            "flagged_claims": [],
+            "error":          None,
+        }
+
+    async def _resume(self, cp: dict) -> dict:
+        """
+        Resume a quota-interrupted question from the checkpoint slot.
+
+        Completed stages are never re-paid: the package rebuilds free (pure
+        Python, re-validated as normal), and a stored draft skips the draft
+        LLM call entirely — only the remaining verification stages run.
+        Clears the slot on success. If the resume itself hits the quota, the
+        stage handlers update the checkpoint and the status flows to the user
+        again (slot intact).
+        """
+        orig_q  = cp.get("question") or ""
+        route   = cp.get("route") or "analytical"
+        flagged: list = []
+        error = None
+
+        logger.info(
+            "[coordinator] resuming checkpoint: route=%s completed_stage=%s",
+            route, cp.get("completed_stage"),
+        )
+
+        if route == "operational":
+            if self._agent is None:
+                return {
+                    "answer": ("Operational path is not available in this "
+                               "configuration, so the saved request cannot be "
+                               "resumed."),
+                    "route": "operational", "flagged_claims": [], "error": None,
+                }
+            result = await self._agent.resume(cp)   # QuotaInterrupted propagates
+            _ckpt.clear_checkpoint()
+            answer = result.get("answer", "")
+        else:
+            params = cp.get("params") or {}
+            try:
+                answer, flagged = await self._run_analytical(
+                    orig_q, params, resume=cp
+                )
+                _ckpt.clear_checkpoint()
+            except DataAgentIntegrityError as e:
+                # Deterministic failure — retrying the slot cannot help.
+                _ckpt.clear_checkpoint()
+                ids_str = ", ".join(v.invariant_id for v in e.violations)
+                logger.error(
+                    "[coordinator] resume: data integrity check failed: %s", ids_str
+                )
+                error  = str(e)
+                answer = (
+                    f"I cannot resume this question. A data integrity check "
+                    f"failed ({ids_str}) while rebuilding the analysis. "
+                    f"Please ask the question again."
+                )
+
+        self._history.append({"role": "user",      "content": orig_q})
         self._history.append({"role": "assistant", "content": answer})
         if len(self._history) > CONTEXT_WINDOW * 2:
             self._history = self._history[-(CONTEXT_WINDOW * 2):]
@@ -378,12 +491,22 @@ class Coordinator:
         self,
         question: str,
         params:   dict,
+        resume:   Optional[dict] = None,
     ) -> tuple[str, list]:
         """
         Full analytical pipeline:
           1. prepare_analysis_package() with extracted params
-          2. analysis_agent.run() → draft + grounding edits
-          3. coverage check → if incomplete, one retry with gap context
+          2. analysis_agent.analyze() → draft
+          3. analysis_agent.ground_check() → verified answer + edits
+          4. coverage check → if incomplete, one retry with gap context
+
+        resume: a checkpoint slot dict. The package always rebuilds (free,
+        re-validated — G6 etc. still apply); a stored draft skips the draft
+        LLM call and is verified VERBATIM.
+
+        Stage-boundary 429 handling: each LLM stage saves a checkpoint of
+        the last COMPLETED stage and raises QuotaInterrupted (status text
+        only — never draft content).
 
         Returns (final_answer, flagged_claims).
         """
@@ -502,39 +625,90 @@ class Coordinator:
         except Exception:
             memories = None
 
-        # Supplementary cross-cutting SQL (counts, dates, gaps, patterns)
+        # ── Stage: DRAFT (supplementary SQL + analyze) ─────────────────────────
+        # A stored draft (resume) is used VERBATIM — the draft LLM call is
+        # skipped entirely; only the remaining verification stages run.
         custom_query = None
-        if params.get("needs_custom_sql") and params.get("custom_sql_intent"):
-            custom_query = await self._generate_custom_sql(
-                question, params["custom_sql_intent"]
+        draft = (resume or {}).get("draft") if resume else None
+        if draft is not None:
+            logger.info(
+                "[coordinator] resume: stored draft (%d chars) used verbatim — "
+                "draft LLM call skipped", len(draft),
             )
+        else:
+            try:
+                # Custom SQL generation is an LLM call — it belongs to the
+                # draft stage (nothing paid for yet if it 429s).
+                if params.get("needs_custom_sql") and params.get("custom_sql_intent"):
+                    custom_query = await self._generate_custom_sql(
+                        question, params["custom_sql_intent"]
+                    )
+                draft = await analysis_agent.analyze(
+                    pkg, scoped_question, research, memories,
+                    conversation_context, custom_query,
+                )
+            except Exception as e:
+                if _is_rate_limit(e):
+                    _ckpt.save_checkpoint(
+                        route="analytical", question=question, params=params,
+                        completed_stage="classify",
+                    )
+                    raise _ckpt.QuotaInterrupted(e, _ckpt.msg_draft_interrupted(e))
+                raise
 
-        # First pass
-        answer, flagged = await analysis_run(
-            pkg, scoped_question, research, memories, conversation_context, custom_query
-        )
+        # ── Stage: GROUNDING ───────────────────────────────────────────────────
+        # POLICY: the user never sees unverified draft text. On interruption
+        # the verbatim draft is checkpointed and only a status message ships.
+        flagged: list = []
+        if resume and resume.get("completed_stage") == "coverage":
+            # Grounding completed before the interruption — the stored text
+            # is already verified; only the coverage stage remains.
+            answer = draft
+        else:
+            try:
+                answer, flagged = await analysis_agent.ground_check(draft, pkg)
+            except Exception as e:
+                if _is_rate_limit(e):
+                    _ckpt.save_checkpoint(
+                        route="analytical", question=question, params=params,
+                        completed_stage="draft", draft=draft,
+                    )
+                    raise _ckpt.QuotaInterrupted(e, _ckpt.MSG_VERIFY_INTERRUPTED)
+                raise
 
-        # Coverage check (question + answer only, no data)
-        answer, complete = await self._coverage_check(question, answer)
+        # ── Stage: COVERAGE (question + answer only, no data; 1 retry) ────────
+        try:
+            answer, complete = await self._coverage_check(question, answer)
 
-        if not complete:
-            # One retry: add first draft + gaps to context, re-run Analysis Agent
-            logger.info("[coordinator] coverage incomplete — retrying analysis")
-            retry_context = list(conversation_context or []) + [
-                {"role": "assistant", "content": answer},
-                {
-                    "role": "user",
-                    "content": (
-                        "Your previous answer did not fully address the question. "
-                        "Please revise to cover all parts."
-                    ),
-                },
-            ]
-            answer, flagged2 = await analysis_run(
-                pkg, scoped_question, research, memories, retry_context, custom_query
-            )
-            flagged.extend(flagged2)
-            # No second coverage check — return best effort
+            if not complete:
+                # One retry: add first draft + gaps to context, re-run analysis
+                logger.info("[coordinator] coverage incomplete — retrying analysis")
+                retry_context = list(conversation_context or []) + [
+                    {"role": "assistant", "content": answer},
+                    {
+                        "role": "user",
+                        "content": (
+                            "Your previous answer did not fully address the question. "
+                            "Please revise to cover all parts."
+                        ),
+                    },
+                ]
+                retry_draft = await analysis_agent.analyze(
+                    pkg, scoped_question, research, memories, retry_context, custom_query
+                )
+                answer, flagged2 = await analysis_agent.ground_check(retry_draft, pkg)
+                flagged.extend(flagged2)
+                # No second coverage check — return best effort
+        except Exception as e:
+            if _is_rate_limit(e):
+                # `answer` is the grounded text — store it verbatim so resume
+                # re-runs only the coverage stage.
+                _ckpt.save_checkpoint(
+                    route="analytical", question=question, params=params,
+                    completed_stage="coverage", draft=answer,
+                )
+                raise _ckpt.QuotaInterrupted(e, _ckpt.MSG_VERIFY_INTERRUPTED)
+            raise
 
         # Prefix answer when requested exercises weren't found in the DB.
         # Partial resolution (some names matched) covers the matched

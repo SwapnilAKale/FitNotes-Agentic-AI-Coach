@@ -1055,3 +1055,34 @@ def test_g6_broad_leaked_full_comments_raises():
     with pytest.raises(DataAgentIntegrityError) as exc_info:
         _report_violations(violations, "test")
     assert any(v.invariant_id == "G6" for v in exc_info.value.violations)
+
+
+# ── D5 · comment binding (DB-verified: comment must sit on its own set row) ────
+
+def test_d5_comment_misattributed_to_wrong_set():
+    # A set carrying a real training_log._id but a comment that is NOT that
+    # row's Comment → the misattribution class → D5 (integrity), must raise.
+    pkg = _package()
+    sess = pkg["exercises"][0]["sessions"][0]
+    st = sess["sets"][0]
+    st["set_db_id"] = 14371                       # real id: Lat Pulldown 130x9 set
+    st["comment"]   = "not the comment on row 14371"
+    sess["comment_count"] = 1                     # keep D1 satisfied
+    v = validate(pkg)
+    _only(v, "D5")
+    assert any(x.invariant_id == "D5" and x.severity == "integrity" for x in v)
+
+
+def test_d5_correct_binding_passes():
+    # Same set id, but the EXACT comment bound to that row → no D5.
+    pkg = _package()
+    sess = pkg["exercises"][0]["sessions"][0]
+    st = sess["sets"][0]
+    st["set_db_id"] = 14371
+    st["comment"]   = "First 3 below the neck\nNext 3 neck ups\nLast 2 partials"
+    sess["comment_count"] = 1
+    v = validate(pkg)
+    assert not any(x.invariant_id == "D5" for x in v), (
+        f"correctly-bound comment must not trip D5: "
+        f"{[(x.invariant_id, x.message) for x in v]}"
+    )

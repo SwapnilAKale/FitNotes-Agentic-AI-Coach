@@ -438,13 +438,16 @@ def _error_response(exc: Exception) -> JSONResponse:
     if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
         retry_seconds = _parse_retry_seconds(msg)
         should_retry = retry_seconds is not None and retry_seconds < 120
+        # QuotaInterrupted (checkpoint saved mid-pipeline) carries a status
+        # message for the user — never draft content.
         return JSONResponse(
             status_code=429,
             content={
                 "error": "rate_limit",
                 "retry_after_seconds": retry_seconds,
                 "should_retry": should_retry,
-                "message": "Rate limit reached.",
+                "message": getattr(exc, "user_message", None) or "Rate limit reached.",
+                "checkpoint_saved": bool(getattr(exc, "checkpoint_saved", False)),
             },
         )
     return JSONResponse(content={"type": "error", "text": f"An error occurred: {msg}"})
@@ -461,6 +464,28 @@ async def status():
 @app.get("/history")
 async def history():
     return JSONResponse(content={"history": session.chat_history if session else []})
+
+
+@app.get("/checkpoint-status")
+async def checkpoint_status():
+    """Debug view of the checkpoint slot — never returns the draft text."""
+    from src.checkpoint import load_checkpoint
+    cp = load_checkpoint()
+    if cp is None:
+        return JSONResponse(content={"exists": False})
+    draft = cp.get("draft")
+    msgs  = cp.get("messages")
+    return JSONResponse(content={
+        "exists":          True,
+        "created":         cp.get("created"),
+        "route":           cp.get("route"),
+        "question":        cp.get("question"),
+        "params":          cp.get("params"),
+        "completed_stage": cp.get("completed_stage"),
+        "has_draft":       bool(draft),
+        "draft_chars":     len(draft) if draft else 0,
+        "message_count":   len(msgs) if msgs else 0,
+    })
 
 
 @app.post("/chat")

@@ -660,11 +660,160 @@ The upload+replay race is closed in both directions:
 
 The frontend chatbox is disabled the moment a file is selected for upload and stays locked until `/status` reports ready.
 
+### Correctness invariants (validator) — A–G + G6
+
+The validator asserts deterministic post-conditions on the finished package and
+**raises** `DataAgentIntegrityError` for the integrity class (A/B/C/D/E/G + G6),
+so a wrong number can never silently reach the Analysis Agent. Each invariant
+names the bug it catches:
+
+| ID | Invariant | Bug it catches |
+|----|-----------|----------------|
+| A1 | `unit` is exactly `"kg"` or `"lbs"`, never null/other | silent null/garbage unit |
+| A2 | `kg` only if in `exercises_in_kg` (Deadlift on/after 2025-12-26) or a comment-override | wrong-unit headline |
+| A3 | no weight appears without a unit label travelling with it | unlabeled number misquoted |
+| A4 | one unit per exercise, except Deadlift's split + comment-override sets | Hand Gripper "Pounds" mislabel (M3) |
+| B1 | plate weight = `metric_weight*2.2046 + offset`, 1 dp | non-deterministic weight |
+| B1a | headline = plates + bar (exercise's unit); bar in **both** headline and volume; non-barbell bar = 0 | Deadlift PR showing 65 kg not 85 |
+| B2 | PRs from full set history (highest headline → most reps → most recent), never the app `is_personal_record` flag | flag dependence in PR selection |
+| B2a | PR carries its set's comment | PR missing its context |
+| B3 | `pr.weight` ≥ `pr_period.weight` ≥ every in-period `max_working_weight` | PR below a session max |
+| B4 | `pr.weight > 0` for weight-based; `pr is None` only for non-weight | weight exercise with no PR |
+| B5 | every `max_working_weight` equals an actual set headline in that session | invented session max |
+| B6 | no negative weight/reps/distance/duration | sign/parse errors |
+| B7 | cross-unit comparisons are kg-normalized (Deadlift lbs→kg), never raw display | 150 lbs ranked above 70 kg |
+| B8 | `is_pr_session`/`pr_velocity`/`pr_count`/`pr_context`/`learning_curve` from real weights, not the flag | flag leakage (tracked gap until fully refactored) |
+| C1 | cardio `distance>0` ⇒ `distance_progression` non-null and > 0 | H3 single-session distance null |
+| C2 | cardio `duration_seconds>0` ⇒ duration progression populated | duration dropped |
+| C3 | `all_time_sessions` non-null when ≥1 all-time session | H2 `total_sessions_alltime` key typo |
+| C4 | cardio `sessions` non-empty when `total_sessions_period>0` | H3 >90-day cardio wiping sessions |
+| C5 | a period comment survives into the cardio block + sets pain flag | H1 `ex.clear()` destroying "kidney started paining" |
+| C6 | `pace` only on sessions with `distance>0` (none for Cycling/Dead Hang) | H4 divide-by-zero / fabricated pace |
+| D1 | `comment_count` == sets with a non-null comment (from the `LEFT JOIN Comment`) | approximate comment matching |
+| D2 | `has_pain_flag` iff a set comment matches the pain vocabulary | missed pain note |
+| D3 | every unit/bar/warmup token is applied **or** logged unclassified | "next time use black rod" silently corrupting the bar |
+| D4 | every `full_comments` entry has a real date + text from a real row | fabricated comment |
+| E1 | every session date within `[query_start_date, query_end_date]` | row outside window |
+| E2 | no session dated after the end anchor | future data |
+| E3 | weekly/monthly/yearly volume reconciles to member-session sums (per unit frame) | aggregation not summing to parts |
+| E4 | unfiltered `distinct_training_days` == distinct dates across exercises | miscounted consistency |
+| E5 | ISO-week keys are year-boundary correct | Dec-29 mapped to W53 not next-year W01 |
+| F1 | every correlational block carries `n`, `ci_95`, `cohen_d`/`pearson`, `cis_overlap`, `confidence_label` | naked comparative claim |
+| F2 | `confidence_label ∈ {insufficient_data, weak, moderate, strong}` | bad label |
+| F3 | a bucket's `n` equals its real session count | inflated sample size |
+| F4 | CI `None` when `n<2`; Pearson CI `None` when `n<4` | overstated certainty on thin data |
+| G1 | required keys present per exercise type | missing `progression`/cardio block |
+| G2 | no `None` where a value is required given data exists | silent null |
+| G3 | package serializes to JSON | stray non-serializable object |
+| G4 | (soft) size ceiling per scope — BROAD ≤ 500 KB, GROUP ≤ 400 KB, FOCUSED ≤ 250 KB | ~986 KB unfiltered package that 429s |
+| G5 | (soft) BROAD omits the deep-stat fields | `trim_package` leak |
+| G6 | (integrity) scope consistency: focused→≤3 exercises; broad→no leaked deep-stat fields + exactly one aggregation level | mislabeled scope bypassing the trim |
+
+### Scope derived from effective package contents
+
+Scope is computed from what actually survives filtering (`_derive_scope_from_package`),
+not from classifier intent: a filter that resolves to **zero** exercises falls
+back to BROAD so the broad trim still runs. Unresolved exercise names are popped
+before the LLM sees the package, and the answer is prefixed with a plain note
+("*X wasn't found in your workout history, so this answer covers …*") — partial
+resolution covers the matched exercises, total failure falls back to the broad
+package.
+
+### Coordinator details
+
+Every message routes through the Coordinator. A **write-intent regex guard**
+routes logging/corrections/goal-setting to the operational single-agent path
+**without** an LLM classification call (a misrouted write would bypass the
+confirmation gate). `/confirm` bypasses routing entirely — it is the
+continuation of an in-flight staged write whose context lives in the agent
+session. Analytical turns are mirrored into `session.chat_history` so `/history`
+shows them. Multi-candidate name resolution **surfaces the candidates and asks**
+on the analytical path instead of guessing the first. **RAG
+(`search_fitness_knowledge`) is suppressed on analytical (personal-data)
+questions** — `research=None` — and only fires on the operational ReAct loop.
+
+### Token / quota engineering
+
+The package is serialized **compactly** for LLM input (`separators=(",",":")`,
+no indent) — about **−34 %** input tokens on a broad package. The grounding
+check re-sends the **full compact package** for every scope (~366 KB ≈ 92k
+tokens) rather than a subset, so the REMOVE rule can never strip a true claim
+for a missing source field; per-question input stays under the 250k/min ceiling.
+The retry countdown parses Gemini's own `'retryDelay': '26s'` JSON hint (not just
+the api-core "try again in 26.5s" phrasing).
+
+### Bar-weight consistency (Pass 1)
+
+Every shipped weight/volume/PR/e1RM is **bar-inclusive** (plates + bar in the
+exercise's unit) or **explicitly labeled plates-only**:
+
+- `goal_projection` previously compared a plates-only `target_weight` against a
+  bar-inclusive `current_e1rm` — a mixed frame that understated the gap and made
+  `is_on_track`/`months_needed` optimistic. Fixed by adding the exercise's bar
+  before computing `target_e1rm`; a barbell goal's gap widens by ~44 lbs (the
+  bar's e1RM contribution at 1 rep), a no-bar goal is unchanged.
+- `daily_workouts` `estimated_1rm`/`max_weight` are now bar-inclusive, matching
+  the per-session values (previously plates-only; `workout_position_effect`
+  derives from this block in BROAD scope).
+- `all_time_summary.total_volume_raw_lbs` → `…_typed` with a `total_volume_raw_note`
+  stating it is plates-only, excludes bar + offsets, and is not unit-normalized.
+- Legitimately plates-only display fields now carry a marker:
+  `warmup_weight` (`warmup_weight_plates_only`), `goals[].target_weight`
+  (`target_weight_plates_only`), `pain_analysis.failed_attempts[].weight`
+  (`weight_plates_only`).
+
+### Cross-unit volume (Pass 2) — per-unit buckets
+
+Volume is reported **per typed-unit frame** everywhere it crosses
+exercises/sessions, and the two frames are **never added together** — switch-proof
+across lbs↔kg gym moves: `*_lbs`/`*_kg` on weekly/monthly/yearly aggregations,
+per-exercise `period_volume_*` and `volume_trend_*`, `muscle_group_summary`
+(totals, `weekly_volumes`, `trend_*`), `muscle_group_balance` (push/pull/ratio/
+dominant/distribution per frame + a `note`), `rankings.highest_volume`
+(`{exercise, volume_lbs, volume_kg}`, ordered by an internal kg-equivalent key
+that is never emitted), `all_time_summary.total_volume_raw_typed_lbs/_kg`, and
+`training_density`. Deadlift is the only genuinely mixed exercise: its
+monthly 2025-12 old blended total **4539.6 = 1943.6 lbs + 2596.0 kg** — proof the
+old field was adding raw kg numbers onto lbs. Validator E3 now reconciles each
+bucket against member sessions of the same frame. A read-only deep-diff harness
+(`scripts/diff_volume_passes.py`) proved the change touched only volume fields
+and surfaced latent **cross-process nondeterminism** (set-iteration tie-breaks in
+`form_quality_mode` and `inter_exercise_correlation` ordering), now fixed with
+deterministic sort keys.
+
+### Checkpoint / resume for quota-interrupted questions
+
+A rate-limit 429 mid-pipeline saves a single-slot checkpoint
+(`data/checkpoint.json`, gitignored) so the user can say **"continue"** when
+quota resets and resume **without re-paying for completed stages**. The
+analytical package is never stored — it **rebuilds free** (pure Python,
+re-validated; G6 still applies). The draft is stored **verbatim** (grounding must
+verify the exact text the user will see), and under the option-a policy the user
+**never sees unverified draft text** — a grounding/coverage interruption returns
+a status message only and ships the answer solely after verification on resume.
+Stage-boundary catches save the last *completed* stage: a draft-time 429 →
+`classify` (no draft), a grounding-time 429 → `draft` + verbatim draft, a
+coverage-time 429 → `coverage` + grounded text; the operational ReAct loop saves
+its message list with **mechanical** head+tail pruning (no LLM summarization). A
+new question never silently discards a live slot — it triggers a
+**confirm-before-discard** prompt naming the saved question (continue → resume,
+"new"/re-send → discard + process, ambiguous → re-ask; stale >48h slots are
+dropped silently on load). `/chat` 429 responses carry `checkpoint_saved` and
+`retry_after_seconds`; `GET /checkpoint-status` exposes the slot for debugging
+(never the draft text).
+
 ### Known open gaps (updated)
 
-- RAG (`search_fitness_knowledge`) fires on personal-data questions when research context is irrelevant — burns API tokens with no benefit.
-- `/history` returns only the single agent's history; analytical turns live in `Coordinator._history` and are lost on browser session restore.
-- Multi-candidate name resolution picks the first candidate without asking — single-agent path asks for clarification; the analytical path should too.
-- `daily_workouts` e1RM/max_weight is bar-inclusive (headline), consistent with the per-session values; `workout_position_effect` derives from it.
-- Volume is reported per typed-unit frame everywhere it crosses exercises/sessions: `*_lbs` and `*_kg` buckets (weekly/monthly/yearly aggregations, muscle_group_summary/balance, rankings.highest_volume, all_time_summary.total_volume_raw_typed_lbs/_kg, training_density). The two frames are never added together — switch-proof across lbs↔kg gym moves. `all_time_summary` volume remains plates-only (excludes bar + offsets) per its `total_volume_raw_note`.
-- `cli.py` 429 handling catches `ClientError` from a different code path than the server's string-match guard — rate limits may not surface correctly on all error shapes.
+- **Operational-path SQL `total_volume`** (`mcp_servers/*.py`) still computes
+  `SUM(metric_weight * 2.2046 * reps)` uniformly — the same kg-as-lbs conversion
+  the analytical package now buckets per-unit. The cross-unit bug's second
+  surface, not yet fixed.
+- **Warmup 0-opener gate** (`process.py` ~342) compares a plates-only working max
+  against the bar-inclusive `exercise_alltime_max` — an internal cross-frame
+  heuristic (not a shipped value), left as-is.
+- **No token streaming** — answers return whole (non-streaming `_run_collect`);
+  long answers have no progressive render.
+- **Research / paper fetcher** (PubMed / RAG) is best-effort and uncached — it can
+  be slow or empty and still spends an API call on the operational path.
+- `cli.py` 429 handling catches `ClientError` from a different code path than the
+  server's string-match guard — some error shapes may not surface as rate limits.

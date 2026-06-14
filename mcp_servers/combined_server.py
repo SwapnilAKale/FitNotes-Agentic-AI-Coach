@@ -2321,9 +2321,14 @@ def _get_exercise_sessions_sync(arguments: dict) -> str:
         return json.dumps({"error": f"Exercise '{exercise_name}' not found."})
     exercise_id = row["_id"]
 
+    # Bind each set's comment AT FETCH TIME by the DB foreign key
+    # (Comment.owner_id = training_log._id), so a set's comment is carried on
+    # its own row and is never re-found by weight/reps proximity downstream.
     base_select = """
-        SELECT tl._id, tl.date, tl.metric_weight AS typed_weight, tl.reps
+        SELECT tl._id, tl.date, tl.metric_weight AS typed_weight, tl.reps,
+               c.comment AS comment
         FROM training_log tl
+        LEFT JOIN Comment c ON c.owner_id = tl._id
         WHERE tl.exercise_id = :exercise_id
     """
 
@@ -2377,7 +2382,12 @@ def _get_exercise_sessions_sync(arguments: dict) -> str:
         d = r["date"]
         if d not in sessions_map:
             sessions_map[d] = []
-        sessions_map[d].append({"weight": round(r["typed_weight"] * 2.2046 + _quirk_offset, 1), "reps": r["reps"]})
+        sessions_map[d].append({
+            "set_db_id": r["_id"],                 # training_log._id
+            "weight":    round(r["typed_weight"] * 2.2046 + _quirk_offset, 1),
+            "reps":      r["reps"],
+            "comment":   r["comment"],             # bound by id at fetch time (may be None)
+        })
 
     sessions = [
         {
@@ -2455,26 +2465,15 @@ def _get_exercise_sessions_sync(arguments: dict) -> str:
             return result
 
         for session in sessions:
-            session_date = session["date"]
-            comments_result = json.loads(_read_exercise_comments_sync(
-                exercise_name=exercise_name,
-                date=session_date,
-                limit=15,
-            ))
-            comments = comments_result.get("comments", [])
-
-            used: set = set()
+            # Comment is already bound to its own set by id (Comment.owner_id =
+            # training_log._id) from the fetch query — read it directly. No
+            # separate fetch, no weight/reps re-correlation (that swapped
+            # comments between same-weight×reps sets). The "Nth set" drop-group
+            # label is parsed from the set's OWN comment.
             for s in session["sets"]:
-                matched_comment = None
-                for j, c in enumerate(comments):
-                    if j in used:
-                        continue
-                    if s["reps"] == c["reps"] and abs((s["weight"] - _quirk_offset) - c["typed_value"]) < 1.0:
-                        matched_comment = c["comment"]
-                        used.add(j)
-                        break
-                s["comment"] = _strip_set_label(matched_comment)
-                s["drop_group"] = _parse_set_num(matched_comment)
+                raw_comment = s.get("comment")
+                s["drop_group"] = _parse_set_num(raw_comment)
+                s["comment"] = _strip_set_label(raw_comment)
 
             session["display_sets"] = _build_display_sets(session["sets"])
             del session["sets"]

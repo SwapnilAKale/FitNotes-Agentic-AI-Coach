@@ -11,6 +11,7 @@ dist/
 .pytest_cache/
 
 # Personal workout data — never push
+data/checkpoint.json
 data/memory.json
 data/user_context.json
 data/agent_writes.json

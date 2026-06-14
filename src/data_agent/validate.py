@@ -26,6 +26,8 @@ Invariants implemented here (checkable from the package alone):
   C4  cardio sessions non-empty when total_sessions_period > 0
   C6  pace field only on sessions that have distance > 0
   D1  comment_count == count of sets with a non-null comment (sets present only)
+  D5  (integrity) each set's comment matches the Comment row bound to its own
+      training_log._id (set_db_id) — verified against the DB; catches misattribution
   D2  no exercise session has more than one warmup set
   E1  every session date within [query_start_date, query_end_date]
   E2  no session dated in the future
@@ -44,10 +46,16 @@ Invariants implemented here (checkable from the package alone):
 
 import json
 import logging
+import os
+import sqlite3
 from datetime import date
 from typing import NamedTuple, Optional
 
 logger = logging.getLogger(__name__)
+
+# Same DB the fetch layer reads — used ONLY by the D5 comment-binding check to
+# verify each comment against its own Comment row (independent ground truth).
+_DB_PATH = os.environ.get("FITNOTES_DB_PATH", "data/FitNotes_Backup.fitnotes")
 
 # ── Known kg-native exercises (static config, matches user_context.json) ──────
 _KG_NATIVE: frozenset = frozenset({
@@ -538,6 +546,68 @@ def _check_structural(ex: dict, v: list) -> None:
 
 # ── Package-level checks ──────────────────────────────────────────────────────
 
+def _ro_connection() -> Optional[sqlite3.Connection]:
+    """Best-effort read-only connection for ground-truth checks; None on failure."""
+    try:
+        norm = _DB_PATH.replace("\\", "/")
+        conn = sqlite3.connect(f"file:{norm}?mode=ro", uri=True, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        return conn
+    except Exception:
+        return None
+
+
+def _check_comment_binding(package: dict, v: list) -> None:
+    """
+    D5 (integrity) — every set carrying a non-null comment must carry the
+    Comment row bound to its OWN training_log._id (set_db_id), verified
+    independently against the Comment table (Comment.owner_id), not against
+    the package's own derivation. This is exactly the misattribution class —
+    a comment shown against the wrong set — so it raises, never ships.
+
+    Rules:
+      • comment is None        → correct, skipped (≈46% of sets, expected).
+      • comment + no set_db_id → not cross-checkable here (no binding); skipped.
+      • DB unavailable         → check skipped (pure synthetic fixtures).
+    """
+    bound: list = []
+    for ex in package.get("exercises", []):
+        name = ex.get("name", "?")
+        for s in ex.get("sessions", []) or []:
+            for st in s.get("sets", []) or []:
+                if st.get("comment") is None:
+                    continue
+                sid = st.get("set_db_id")
+                if sid is None:
+                    continue
+                bound.append((name, sid, st["comment"]))
+    if not bound:
+        return   # no commented, id-bound sets (e.g. trimmed package) → no DB hit
+
+    conn = _ro_connection()
+    if conn is None:
+        return
+    try:
+        # 1:1 in current data; if a future schema allows several, the
+        # deterministic first by Comment._id wins (matches the fetch contract).
+        truth: dict = {}
+        for row in conn.execute("SELECT owner_id, comment FROM Comment ORDER BY _id ASC"):
+            oid = row["owner_id"]
+            if oid not in truth:
+                truth[oid] = row["comment"]
+    except Exception:
+        return
+    finally:
+        conn.close()
+
+    for name, sid, comment in bound:
+        if truth.get(sid) != comment:
+            v.append(_viol("D5",
+                f"{name} set training_log._id={sid}: carried comment does not "
+                f"match the Comment row bound to it (owner_id={sid}) — "
+                f"comment misattributed to the wrong set"))
+
+
 def _check_g3(package: dict, v: list) -> None:
     """G3 — package must be JSON-serialisable."""
     try:
@@ -670,6 +740,7 @@ def validate(package: dict) -> list:
         _check_statistical(ex, violations)     # F1, F2, F4
         _check_structural(ex, violations)      # G1, G2
 
+    _check_comment_binding(package, violations)  # D5 (DB-verified comment binding)
     _check_g3(package, violations)             # G3
     _check_g4(package, violations)             # G4
     _check_g5(package, violations)             # G5
