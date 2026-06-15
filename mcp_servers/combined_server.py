@@ -50,35 +50,12 @@ def _get_kb():
 
 @server.list_tools()
 async def list_tools() -> list[types.Tool]:
+    # Step C, Part 3: get_personal_record / query_workout_data / get_weekly_volume /
+    # run_read_only_sql are UNEXPOSED from the operational agent (their reads now
+    # route analytical, where the package answers them deterministically). The
+    # dispatch handlers and _sync functions remain below for analytical reuse and
+    # evals — this is unexposing, not deleting.
     return [
-        types.Tool(
-            name="query_workout_data",
-            description="query(question) -> {answer, rows} — flexible natural language workout history query",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "question": {
-                        "type": "string",
-                        "description": "the natural-language question about workout data",
-                    }
-                },
-                "required": ["question"],
-            },
-        ),
-        types.Tool(
-            name="get_personal_record",
-            description="get_personal_record(exercise_name) -> {weight, reps, date} — heaviest set ever for an exercise",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "exercise_name": {
-                        "type": "string",
-                        "description": "exact exercise name as stored in FitNotes",
-                    }
-                },
-                "required": ["exercise_name"],
-            },
-        ),
         types.Tool(
             name="get_exercise_history",
             description="get_exercise_history(exercise_name, days) -> [{date, weight, reps}] — recent sets for an exercise",
@@ -94,33 +71,6 @@ async def list_tools() -> list[types.Tool]:
                     },
                 },
                 "required": ["exercise_name"],
-            },
-        ),
-        types.Tool(
-            name="get_weekly_volume",
-            description="get_weekly_volume(days) -> [{muscle_group, total_sets, total_volume_lbs, total_volume_kg}] — training volume by muscle group, split per unit frame (lbs vs kg-native); never add the two buckets",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "days": {
-                        "description": "number of days to look back (default 30)",
-                    }
-                },
-                "required": [],
-            },
-        ),
-        types.Tool(
-            name="run_read_only_sql",
-            description="run_read_only_sql(query) -> {rows} — execute custom SQL for novel queries",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "sql": {
-                        "type": "string",
-                        "description": "a SELECT query only",
-                    }
-                },
-                "required": ["sql"],
             },
         ),
         types.Tool(

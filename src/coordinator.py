@@ -20,9 +20,14 @@ Shared modules wired into the analytical path:
 NOT YET WIRED:
   Memory extraction from mixed analytical+memory messages
 
-ROUTING RULE: when uncertain, default to operational.
-The single agent can always answer something; a wrong analytical
-package produces a confusing analysis.
+ROUTING RULE (Step C): reads default ANALYTICAL. Operational is a positive
+allowlist — writes (caught first by the write-intent regex pre-guard),
+research/RAG, and specific-date session display — plus out_of_scope refusals.
+Everything else, and anything uncertain, routes analytical. The analytical
+package is deterministic and validated (it hard-stops on an integrity failure),
+so it is the safer default for a read; the old "a wrong analytical package is
+confusing" reasoning is obsolete now that the package fails loud and the
+operational hand-rolled-SQL path is the riskier read surface.
 """
 
 import asyncio
@@ -187,9 +192,18 @@ MEDICAL questions are NEVER out_of_scope. A stated symptom, pain, or condition
 is in-domain training territory — route it analytical/operational as normal. The
 answer (governed by the coach's system prompt) gives training adaptations plus a
 see-a-professional redirect and refuses only to DIAGNOSE or TREAT. Never send a
-medical/symptom question to out_of_scope.
+medical/symptom question to out_of_scope. A medical/symptom question is a
+read/coaching question → ANALYTICAL by the default below.
 
-DEFAULT: when uncertain, use "operational".
+DEFAULT: operational is a POSITIVE allowlist — route "operational" ONLY for the
+three cases listed above (writes/corrections/goals, research/RAG, and
+specific-date session display), and "out_of_scope" only per the test above.
+EVERYTHING ELSE is "analytical": every read, trend, stat, PR, volume, frequency,
+plateau, comparison, projection, and coaching question — including terse ones
+("my squat?", "Lat Pulldown PR"). When uncertain, default to "analytical". The
+analytical package is deterministic and validated (it hard-stops on integrity
+failure), whereas the operational hand-rolled-SQL read path is the riskier
+surface for a read.
 
 If a [PREVIOUS TURNS] block is present, use it ONLY to resolve pronouns
 and follow-up references in the current message ("what about my squat?",
@@ -368,7 +382,7 @@ class Coordinator:
                     )
                     raise _ckpt.QuotaInterrupted(e, _ckpt.msg_draft_interrupted(e))
                 raise
-        route  = params.get("route", "operational")
+        route  = params.get("route", "analytical")
 
         # ── Out-of-scope: refuse at classification time. No package build, no
         # agent turn, no search, no analysis LLM call — the refusal IS the
@@ -573,10 +587,17 @@ class Coordinator:
     async def _classify(self, question: str) -> dict:
         """
         Single Gemini call: route + extract parameters.
-        Defaults to operational on any failure — safe fallback.
+        Defaults to ANALYTICAL on parse/exception failure (Step C flip): reads
+        are the common case and the analytical package is deterministic and
+        validated, while the operational hand-rolled-SQL read path is the riskier
+        surface for a read. Genuine operational intents (writes, research,
+        session-display) are caught positively by the write-intent pre-guard and
+        the classifier's operational allowlist; a write that somehow defaults
+        analytical simply won't write (the confirmation gate is operational-only),
+        so it cannot corrupt data.
         """
         default = {
-            "route":              "operational",
+            "route":              "analytical",
             "exercise_names":     None,
             "muscle_groups":      None,
             "query_period_days":  90,
@@ -628,8 +649,8 @@ class Coordinator:
                 ).strip()
 
             params = json.loads(raw)
-            # Ensure required keys are present
-            params.setdefault("route",             "operational")
+            # Ensure required keys are present (route defaults analytical — Step C flip)
+            params.setdefault("route",             "analytical")
             params.setdefault("exercise_names",    None)
             params.setdefault("muscle_groups",     None)
             params.setdefault("query_period_days", 90)
@@ -640,7 +661,7 @@ class Coordinator:
         except Exception as e:
             if _is_rate_limit(e):
                 raise
-            logger.warning("[coordinator] classify failed: %s — defaulting to operational", e)
+            logger.warning("[coordinator] classify failed: %s — defaulting to analytical", e)
             return default
 
     # ── Analytical pipeline ───────────────────────────────────────────────────

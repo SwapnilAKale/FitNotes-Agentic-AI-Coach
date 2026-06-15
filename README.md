@@ -1052,9 +1052,58 @@ legitimately answers weight questions through it.) On refusal,
 the package's authoritative weight/volume fields — no crash, no silent empty
 result.
 
-Steps C-2 (flip the classifier default toward analytical) and C-3 (strip the
-operational read tools the analytical pipeline no longer needs) are still
-planned.
+---
+
+## Routing Step C, Parts 2 & 3 (DONE) — flip the read default, strip the operational read tools
+
+With the custom-SQL lane fenced (Part 1), reads can safely consolidate onto the
+analytical path. Parts 2 and 3 land together — flip first, strip second — so no
+intermediate state strands a request.
+
+### Part 2 — reads default ANALYTICAL
+
+Routing is now a **positive operational allowlist** rather than an operational
+default. Operational means exactly: writes (caught first by the unchanged
+write-intent regex pre-guard), research/RAG, and specific-date session display —
+plus out_of_scope refusals (Step A). **Everything else is analytical**, and the
+default when uncertain is now **analytical** (flipped from operational) in all
+the spots that pick a route: the `_CLASSIFY_SYSTEM` DEFAULT line, `_classify`'s
+parse/exception fallback (`default` dict + `setdefault` + the `_route_fresh`
+`params.get` guard), and the module docstring rationale. The old "a wrong
+analytical package is confusing, so default operational" reasoning is obsolete:
+the analytical package is deterministic and validated (it hard-stops on an
+integrity failure), while the operational hand-rolled-SQL read path is the
+riskier surface for a read. Medical/symptom questions are reads → analytical by
+the new default (the diagnose-vs-adapt prompt rule is unchanged). Safety note: a
+verb-less write that slips the regex and defaults analytical simply *won't write*
+(the confirmation gate is operational-only), so an ambiguous write can never
+corrupt data — worst case it isn't logged and the user rephrases.
+
+### Part 3 — unexpose the four analysis-read tools
+
+`get_personal_record`, `get_weekly_volume`, `query_workout_data`, and
+`run_read_only_sql` are removed from the operational agent's exposed tool list
+(`combined_server.list_tools`, 35 → 31 tools). Their dispatch handlers and
+`_sync` functions **remain** in `combined_server.py` for analytical reuse and
+evals — this is unexposing, not deleting. Kept exposed: `get_exercise_sessions`,
+`resolve_exercise_name`, `read_exercise_comments`, `get_exercise_history`, all
+write tools, RAG, memory, and quirks. The operational `SYSTEM_PROMPT` was updated
+to match: the four tools are dropped from the READ-WORKOUT group; the
+`run_read_only_sql`-specific blocks (DATABASE NOTE / SQL COLUMN RULES / OFFSET
+WARNING) and the PR-answer flow (which told the agent to call
+`get_personal_record` + a single-rep `read_exercise_comments` caveat) are removed
+— PR questions now route analytical and the package's `pr` / `pr_period` carry
+the comment and pain flag. The write/edit and session-display flows still
+instruct `get_exercise_sessions` + `resolve_exercise_name` (kept), so nothing is
+stranded.
+
+**Why this is safe (no strand):** with the default flipped first, reads route
+analytical, so the operational agent never receives a read needing a stripped
+tool; writes/RAG/display use only kept tools; single-exercise reads (one PR, one
+exercise's history) are covered by focused-scope package fields; and no eval
+calls the stripped tools through the exposed list (they call the `_sync`
+functions directly, which remain). There is now **one read path** —
+deterministic and validated.
 
 ---
 
@@ -1072,10 +1121,15 @@ planned.
 - **`agent_lock` held during a per-minute wait** — the silent retry holds the
   single agent lock for up to ~2×70s, so a concurrent `/chat` gets the existing
   "busy" 429. Acceptable under the single-user assumption; flagged for multi-user.
-- **Routing Step C (in progress)** — Part 1 (fence the custom-SQL lane to
-  non-weight aggregates) is **landed** (see above). Part 2 (flip the classifier
-  default toward analytical) and Part 3 (strip the operational read tools the
-  analytical pipeline no longer needs) are still planned.
+- **Routing redesign (Steps A–C) — DONE.** Step A (out_of_scope + medical
+  carve-out + coach character), Step B (muscle-group guard + plates-only volume
+  steering), and Step C (Part 1 custom-SQL weight-aggregate fence, Part 2
+  analytical default flip, Part 3 unexpose the four analysis-read tools) are all
+  landed. The duplication / operational-read-leak root cause — low-confidence
+  reads falling into the operational hand-rolled-SQL path — is **CLOSED**: there
+  is one deterministic, validated read path. Small future cleanup: the two
+  borderline display/dump tools kept exposed for now
+  (`get_exercise_history`, `read_exercise_comments`) can be revisited later.
 - **No token streaming** — answers return whole (non-streaming `_run_collect`);
   long answers have no progressive render.
 - **Research / paper fetcher** (PubMed / RAG) is best-effort and uncached — it can
