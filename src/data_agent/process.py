@@ -18,6 +18,11 @@ from datetime import date, datetime, timedelta
 from collections import defaultdict
 from typing import Optional
 
+# Kg-native switch date — single source of truth in src/units.py.
+# (_is_kg_native stays config-driven, reading user_context.exercises_in_kg;
+# only the switch DATE was a duplicated constant.)
+from src.units import DEADLIFT_KG_SWITCH_DATE
+
 logger = logging.getLogger(__name__)
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -33,7 +38,6 @@ WARMUP_GAP_RATIO  = 1.5   # gap(s1→s2) must exceed this × max(working_steps) 
 WARMUP_FLAT_RATIO = 0.60  # equal-working-set case: s1 ≤ this fraction of s2
 WARMUP_MIN_REPS   = 12    # minimum reps on the first set for weight-based warmup
 HEAVY_FRACTION    = 0.50  # 0-weight opener: working max must be ≥ this × alltime max
-DEADLIFT_KG_SWITCH_DATE = date(2025, 12, 26)
 PLATEAU_TRIGGER_DAYS    = 28
 IMPROVEMENT_TRIGGER_PCT = 20.0
 
@@ -341,13 +345,19 @@ def _detect_warmup_flags(sets: list,
     if s1 >= s2:
         return
 
-    # ── 0-weight (bodyweight) opener ──────────────────────────────────────────
-    # Replace the generic flat/gap rule with a history-relative heaviness check:
-    # the session is a genuine warmup situation only when the working sets reach
-    # at least HEAVY_FRACTION of the exercise's all-time best headline weight.
+    # ── 0-weight (bodyweight / empty-bar) opener ──────────────────────────────
+    # History-relative heaviness check: the opener is a genuine warmup only when
+    # the working sets reach >= HEAVY_FRACTION of the exercise's all-time best
+    # headline weight. exercise_alltime_max is BAR-INCLUSIVE, so working_max must
+    # be too — use the set's own headline_weight (plates + eff_bar, already
+    # computed by the session builder), not plates, or the bar understates the
+    # left side and genuine empty-bar warmups are missed. (s1 stays plates: an
+    # "empty bar" opener is 0 PLATES.) headline_weight is absent only on the
+    # daily-workouts set dicts, where it harmlessly falls back to plates.
     if s1 == 0:
         if exercise_alltime_max > 0:
-            working_max = max(s.get("weight", 0) for s in rest)
+            working_max = max(s.get("headline_weight", s.get("weight", 0))
+                              for s in rest)
             if working_max >= HEAVY_FRACTION * exercise_alltime_max:
                 first["is_warmup"] = True
         return   # 0-openers never fall through to gap/flat-ratio logic
@@ -921,41 +931,13 @@ def _recent_best_session(sessions: list, default_unit: str, k: int) -> dict:
 def _compute_progression(sessions: list) -> dict:
     if not sessions: return {}
     first = sessions[0]; last = sessions[-1]
-    max_weight_start_raw  = first["max_working_weight"]
-    max_weight_end        = last["max_working_weight"]
     first_unit            = first.get("unit", "lbs")
     last_unit             = last.get("unit",  "lbs")
     unit_switch_in_period = first_unit != last_unit
-
-    # Normalize start weight to the same unit as the end weight for valid comparison
-    if unit_switch_in_period:
-        if first_unit == "lbs" and last_unit == "kg":
-            max_weight_start = round(max_weight_start_raw / 2.2046, 2)
-        elif first_unit == "kg" and last_unit == "lbs":
-            max_weight_start = round(max_weight_start_raw * 2.2046, 2)
-        else:
-            max_weight_start = max_weight_start_raw
-    else:
-        max_weight_start = max_weight_start_raw
-
-    e1rm_start_raw = first["estimated_1rm"]
-    e1rm_end       = last["estimated_1rm"]
-
-    if unit_switch_in_period:
-        if first_unit == "lbs" and last_unit == "kg":
-            e1rm_start = round(e1rm_start_raw / 2.2046, 1)
-        elif first_unit == "kg" and last_unit == "lbs":
-            e1rm_start = round(e1rm_start_raw * 2.2046, 1)
-        else:
-            e1rm_start = e1rm_start_raw
-    else:
-        e1rm_start = e1rm_start_raw
-
-    weight_change     = round(max_weight_end - max_weight_start, 1)
-    weight_change_pct = (
-        round(weight_change / max_weight_start * 100, 1)
-        if max_weight_start > 0 else None
-    )
+    # max_weight_start / end / weight_change / e1rm are computed AFTER current
+    # ability below: the progression "end" is the robust recent best (never the
+    # possibly back-off last session), and "start" is re-anchored into the current
+    # unit frame when the window spans a unit switch (no boundary-spanning %).
 
     # Plateau / peak / regression / current-ability are kg-normalized per
     # session unit. Raw comparison is a latent cross-unit bug for exercises
@@ -990,6 +972,57 @@ def _compute_progression(sessions: list) -> dict:
                       else _to_last_unit(current_kg))
     current_reps   = cur_session.get("reps_at_max", 0)
     current_basis  = f"best of last {min(CURRENT_ABILITY_SESSIONS, n)} sessions"
+
+    # ── Start anchor (Fix 2: same-unit baseline across a unit switch) ──────────
+    # Normally the window's first session. When the window spans a unit switch
+    # (e.g. Deadlift lbs→kg on 2025-12-26), anchor "start" on the first session
+    # in the END (current) unit frame so the % reflects same-unit progress and
+    # never spans the boundary. True window bounds stay in first/last_session_date.
+    progression_note = None
+    if unit_switch_in_period:
+        frame_sessions = [s for s in sessions
+                          if s.get("unit", last_unit) == last_unit]
+        start_session  = frame_sessions[0] if frame_sessions else first
+        progression_note = (
+            f"window spans a {first_unit}->{last_unit} unit switch; weight change "
+            f"is computed within the {last_unit} era only "
+            f"(from {start_session['date']})"
+        )
+    else:
+        frame_sessions = sessions
+        start_session  = first
+    max_weight_start = start_session["max_working_weight"]
+    e1rm_start       = start_session["estimated_1rm"]
+    start_unit       = start_session.get("unit", first_unit)
+
+    # ── End anchor = CURRENT ABILITY, never the back-off last session (Fix 1) ──
+    # max_weight_end / weight_change / e1rm_end track the robust recent best, so
+    # a lighter last session can't read as the end of progression (the −7.7% /
+    # "60→70" artifacts came from anchoring on sessions[-1]).
+    max_weight_end = current_weight
+    e1rm_end       = cur_session["estimated_1rm"]
+    weight_change  = round(max_weight_end - max_weight_start, 1)
+    if max_weight_start > 0 and len(frame_sessions) >= 2:
+        weight_change_pct = round(weight_change / max_weight_start * 100, 1)
+    else:
+        # Too few same-unit sessions to anchor a meaningful percentage.
+        weight_change_pct = None
+        if unit_switch_in_period and progression_note:
+            progression_note += " — too few same-unit sessions for a percentage"
+
+    # ── Latest session vs current ability (Fix 3: back-off label) ──────────────
+    # The most recent session, labeled distinctly from current ability so a
+    # lighter/back-off day is not narrated as a decline. is_backoff is True when
+    # the latest session is below current ability by the new-best weight→reps rule.
+    latest_session_date   = last["date"]
+    latest_session_weight = last["max_working_weight"]
+    latest_session_reps   = last.get("reps_at_max", 0)
+    _last_kg = _mww_kg(last)
+    latest_session_is_backoff = (
+        _last_kg < current_kg - NEW_BEST_WEIGHT_TOL_KG
+        or (abs(_last_kg - current_kg) <= NEW_BEST_WEIGHT_TOL_KG
+            and latest_session_reps < current_reps)
+    )
 
     # ── New-best tracking (literal weight → reps, never e1RM) ──────────────────
     last_best_idx       = _last_new_best_index(sessions, last_unit)
@@ -1058,27 +1091,35 @@ def _compute_progression(sessions: list) -> dict:
         "first_session_date":   first["date"],
         "last_session_date":    last["date"],
         "max_weight_start":          max_weight_start,
-        "max_weight_start_original": max_weight_start_raw,
+        "max_weight_start_original": max_weight_start,
+        "start_session_date":        start_session["date"],
         "first_session_unit":        first_unit,
         "last_session_unit":         last_unit,
         "unit_switch_in_period":     unit_switch_in_period,
+        "progression_note":          progression_note,
+        # End fields track CURRENT ABILITY (recent best), not the last session
         "max_weight_end":       max_weight_end,
-        "display_weight_start": f"{max_weight_start_raw} {first_unit}",
+        "display_weight_start": f"{max_weight_start} {start_unit}",
         "display_weight_end":   f"{max_weight_end} {last_unit}",
         "weight_change":        weight_change,
         "weight_change_pct":    weight_change_pct,
         "e1rm_start":           e1rm_start,
-        "e1rm_start_original":  e1rm_start_raw,
+        "e1rm_start_original":  e1rm_start,
         "e1rm_end":             e1rm_end,
         "e1rm_change":          round(e1rm_end - e1rm_start, 1),
         "sessions_at_max":      sessions_at_max,
         "session_count":        len(sessions),
-        "reps_at_max_start":    first["reps_at_max"],
-        "reps_at_max_end":      last["reps_at_max"],
+        "reps_at_max_start":    start_session["reps_at_max"],
+        "reps_at_max_end":      current_reps,
         # ── Current ability (robust recent best, not the last session) ────────
         "current_weight":       current_weight,
         "current_reps":         current_reps,
         "current_basis":        current_basis,
+        # ── Most recent session (labeled distinct from current ability) ───────
+        "latest_session_date":       latest_session_date,
+        "latest_session_weight":     latest_session_weight,
+        "latest_session_reps":       latest_session_reps,
+        "latest_session_is_backoff": latest_session_is_backoff,
         # ── Plateau (rep-aware new-best rule, cadence-scaled) ─────────────────
         "is_plateau":           is_plateau,
         "plateau_since":        plateau_since,

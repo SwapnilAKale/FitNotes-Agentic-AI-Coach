@@ -263,9 +263,9 @@ def test_G_ALLTIME_alltime_summary():
 
     # E1: boundary dates
     assert ats["first_training_date"] == "2024-06-04"
-    assert ats["last_training_date"]  == "2026-06-13"
+    assert ats["last_training_date"]  == "2026-06-14"
     # E4: distinct training day count
-    assert ats["total_training_days"] == 306
+    assert ats["total_training_days"] == 307
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -411,26 +411,25 @@ def test_G_ZERO_POS_sumo_squats_0_opener_heavy_session_is_warmup():
 
 def test_G_ZERO_NEG_deadlift_0_opener_light_session_not_warmup():
     """
-    Deadlift 2026-01-06: sets 0x16 / 10x12 / 30x12 (kg, post-2025-12-26 switch).
-    Query end = 2026-03-31 so alltime_max = 80 kg headline (60 plates + 20 bar,
-    from the 2026-03-30 session). Working plates max = 30 kg.
-    30 < HEAVY_FRACTION(0.5) x 80 = 40 -> opener is NOT a warmup (light session).
-    Exercise is first in its Back category on that day (category gate: eligible).
-    Pinned to 2026-05-28 snapshot.
+    Deadlift 2025-12-26 (all-time): 0-plate (empty 20kg bar) x16 opener, working
+    sets up to 32 kg HEADLINE (12 plates + 20 bar). All-time max headline = 85 kg.
+    32 < HEAVY_FRACTION(0.5) x 85 = 42.5 -> opener is NOT a warmup (genuinely
+    light session). This is a true negative in the BAR-INCLUSIVE frame (not the
+    old plates-vs-headline artifact): even counting the bar, the working sets stay
+    below half the all-time best. Exercise is first in its Back category that day.
+    Pinned to current DB.
     """
-    # end_date_str=2026-03-31 (84 days, agg_level=session) gives alltime_rows
-    # through 2026-03-30 (Deadlift 60 plates+20 bar=80 kg), so alltime_max=80 kg.
-    # Working plates max on 2026-01-06 = 30 kg; 30 < 0.5*80=40 -> NOT warmup.
-    data = collect(
-        start_date_str="2026-01-06", end_date_str="2026-03-31",
-        exercise_names=["Deadlift"],
-    )
+    data = collect(query_period_days=None, exercise_names=["Deadlift"],
+                   aggregation_level="session")
     ex   = _ex(data, "Deadlift")
-    sess = _sess(ex, "2026-01-06")
+    sess = _sess(ex, "2025-12-26")
     opener = next(s for s in sess["sets"] if pytest.approx(s["weight"]) == 0.0)
+    work_head_max = max(st["headline_weight"] for st in sess["sets"]
+                        if st is not opener)
+    assert work_head_max == 32.0                  # headline-frame working max
     assert not opener["is_warmup"], (
-        "D3: 0-kg opener before light Deadlift sets (plates 30 < 0.5*alltime_max_80=40) "
-        "must NOT be a warmup — bodyweight here is a light learning-era working set"
+        "D3: 0-kg opener before light Deadlift sets (headline 32 < 0.5*alltime_85=42.5) "
+        "must NOT be a warmup — even with the bar counted, the session is light"
     )
 
 
@@ -843,7 +842,12 @@ def test_G_PLATEAU_FALSE_lat_pulldown():
     # "current ability" reflects the established 130, NOT today's 120 back-off day
     assert p["current_weight"] == 130.0
     assert ex["plateau_days"] == 0
-    assert ex["phase2_triggered"] is False
+    # Phase 2 fires on the genuine year-long improvement (start 100 -> current
+    # ability 130 = +30%), NOT on a plateau (is_plateau stays False above). The
+    # end-anchor fix means weight_change_pct now reflects current ability, not
+    # the 120 back-off last session (which gave a sub-threshold 20%).
+    assert p["weight_change_pct"] == 30.0
+    assert ex["phase2_triggered"] is True
 
 
 # ── G-NO-REGRESSION · today's 120 back-off day is not a regression ────────────
@@ -852,8 +856,12 @@ def test_G_NO_REGRESSION_lat_pulldown_backoff():
     data = collect(**_LAT_KW)
     p = _ex(data, "Lat Pulldown")["progression"]
     assert p["regression_from_peak"] is None             # was a false 7.7% drop
-    assert p["max_weight_end"] == 120.0                  # literal last session (factual)
-    assert p["current_weight"] == 130.0                  # but current ability holds at 130
+    # End now tracks current ability (130), not the back-off last session;
+    # the literal 120 lives in latest_session_weight (labeled as a back-off).
+    assert p["max_weight_end"] == 130.0
+    assert p["current_weight"] == 130.0
+    assert p["latest_session_weight"] == 120.0
+    assert p["latest_session_is_backoff"] is True
 
 
 # ── G-REP-PROGRESS · same-weight rep gain IS a new best ───────────────────────
@@ -974,3 +982,152 @@ def test_G_COMMENT_MARCH16_lat_pulldown():
     assert top["set_db_id"] == 13418
     assert top["comment"] == "3rd set\nFirst 2 neck ups\nLast 3 partials"
     assert mid["comment"] != top["comment"]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Progression end-anchor + cross-frame % guard + back-off label
+# (process.py _compute_progression — end = current ability, not the last session)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_DL_90 = dict(query_period_days=90, exercise_names=["Deadlift"],
+              aggregation_level="session", include_phase2=True)
+
+
+def test_G_PROG_END_CURRENT_deadlift_90d():
+    # End must be current ability (85, the PR), not the back-off last session (70).
+    data = collect(**_DL_90)
+    ex = _ex(data, "Deadlift")
+    p = ex["progression"]
+    assert p["max_weight_end"] == 85.0
+    assert p["current_weight"] == 85.0
+    assert p["latest_session_weight"] == 70.0            # the back-off last session
+    assert p["latest_session_is_backoff"] is True
+    # no contradiction with the PR: end == PR weight
+    assert ex["pr"]["weight"] == 85.0
+    # start unchanged (60), so the % is start->current, not start->back-off
+    assert p["max_weight_start"] == 60.0
+    assert p["weight_change_pct"] == 41.7
+
+
+def test_G_PROG_CROSSFRAME_deadlift_alltime():
+    # All-time spans the 2025-12-26 lbs->kg switch — the % must NOT be the old
+    # boundary-spanning 185.4; it is within the kg era (start re-anchored).
+    data = collect(query_period_days=None, exercise_names=["Deadlift"],
+                   aggregation_level="session", include_phase2=True)
+    p = _ex(data, "Deadlift")["progression"]
+    assert p["unit_switch_in_period"] is True
+    assert p["weight_change_pct"] != 185.4
+    assert p["weight_change_pct"] is None or p["weight_change_pct"] < 185.4
+    assert p["progression_note"] and "unit switch" in p["progression_note"]
+    assert p["max_weight_start"] == 32.0                 # first post-switch session
+    assert p["max_weight_end"] == 85.0
+
+
+def test_G_BACKOFF_LABEL_lat_pulldown():
+    # 90-day window: first session is 130×5, so start==current==130 and the
+    # working weight is HELD (0), not the old -10/-7.7% back-off decline.
+    p = _ex(collect(query_period_days=90, exercise_names=["Lat Pulldown"],
+                    aggregation_level="session", include_phase2=True),
+            "Lat Pulldown")["progression"]
+    assert p["latest_session_is_backoff"] is True
+    assert p["latest_session_weight"] == 120.0
+    assert p["latest_session_reps"] == 6
+    assert p["current_weight"] == 130.0
+    assert p["weight_change"] == 0.0                     # working weight HELD, not -10
+
+
+def test_G_NO_BACKOFF_last_session_is_new_best():
+    # A clean rising run ending on its best: no false back-off flag; end == latest.
+    from src.data_agent.process import _compute_progression
+
+    def S(d, w, reps):
+        e = round(w * (1 + reps / 30), 1) if reps > 1 else float(w)
+        return {"date": d, "unit": "lbs", "max_working_weight": float(w),
+                "reps_at_max": reps, "estimated_1rm": e}
+
+    sessions = [S("2026-01-05", 100, 5), S("2026-01-12", 105, 5),
+                S("2026-01-19", 110, 5), S("2026-01-26", 115, 5)]   # last is best
+    p = _compute_progression(sessions)
+    assert p["latest_session_is_backoff"] is False
+    assert p["current_weight"] == 115.0
+    assert p["latest_session_weight"] == 115.0
+    assert p["max_weight_end"] == 115.0                  # end == latest == current
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Warmup 0-opener gate — bar-inclusive frame (process.py _detect_warmup_flags)
+# The empty-bar opener's heaviness check now compares headline-vs-headline, so a
+# genuine empty-bar warmup before heavy working sets is no longer missed.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_G_WARMUP_EMPTYBAR_deadlift_2026_01_17():
+    # 0-plate (empty 20kg bar) x12 opener, then working sets up to 60kg headline
+    # (40 plates + 20 bar). 60 >= 0.5 * all-time 85 -> the opener IS a warmup.
+    ex = next(e for e in collect(query_period_days=None, exercise_names=["Deadlift"],
+                                 aggregation_level="session", include_phase2=False)["exercises"]
+              if e["name"] == "Deadlift")
+    s = _sess(ex, "2026-01-17")
+    opener = s["sets"][0]
+    assert opener["weight"] == 0.0                 # empty bar (0 plates)
+    assert opener["headline_weight"] == 20.0       # bar-inclusive headline
+    assert opener["is_warmup"] is True
+    # the comparison is headline-frame: a working set reaches 60 headline
+    assert max(st["headline_weight"] for st in s["sets"][1:]) == 60.0
+
+
+def test_G_WARMUP_NO_FALSE_light_session_and_preconditions():
+    # The fix must NOT create false warmups: the heaviness threshold still gates,
+    # and every precondition still holds.
+    from src.data_agent.process import _detect_warmup_flags
+
+    def S(sid, plate, head, reps):
+        return {"set_id": sid, "weight": plate, "headline_weight": head,
+                "reps": reps, "comment": None, "is_warmup": False}
+
+    # 0-plate opener, 12 reps, 3 sets, eligible — but working sets LIGHT
+    # (headline 5 < 0.5 * alltime 100 = 50) -> NOT a warmup.
+    light = [S(1, 0.0, 0.0, 12), S(2, 5.0, 5.0, 8), S(3, 5.0, 5.0, 8)]
+    _detect_warmup_flags(light, exercise_name="X", weight_eligible=True,
+                         exercise_alltime_max=100.0)
+    assert light[0]["is_warmup"] is False
+
+    # same opener, HEAVY working sets (headline 60 >= 50) -> flagged (gate works)
+    heavy = [S(1, 0.0, 0.0, 12), S(2, 60.0, 60.0, 8), S(3, 60.0, 60.0, 8)]
+    _detect_warmup_flags(heavy, exercise_name="X", weight_eligible=True,
+                         exercise_alltime_max=100.0)
+    assert heavy[0]["is_warmup"] is True
+
+    # precondition: not first-in-category -> never flagged, even heavy
+    not_elig = [S(1, 0.0, 0.0, 12), S(2, 60.0, 60.0, 8), S(3, 60.0, 60.0, 8)]
+    _detect_warmup_flags(not_elig, exercise_name="X", weight_eligible=False,
+                         exercise_alltime_max=100.0)
+    assert not_elig[0]["is_warmup"] is False
+
+    # precondition: opener < 12 reps -> not flagged
+    low_reps = [S(1, 0.0, 0.0, 8), S(2, 60.0, 60.0, 8), S(3, 60.0, 60.0, 8)]
+    _detect_warmup_flags(low_reps, exercise_name="X", weight_eligible=True,
+                         exercise_alltime_max=100.0)
+    assert low_reps[0]["is_warmup"] is False
+
+    # precondition: < 3 sets (only 1 working set) -> not flagged
+    two = [S(1, 0.0, 0.0, 12), S(2, 60.0, 60.0, 8)]
+    _detect_warmup_flags(two, exercise_name="X", weight_eligible=True,
+                         exercise_alltime_max=100.0)
+    assert two[0]["is_warmup"] is False
+
+
+def test_G_WARMUP_COUNT_UNCHANGED_FIELDS_deadlift_2026_01_17():
+    # Flagging the 0-plate opener as a warmup shifts ONLY working_sets_count and
+    # rep_ranges; weight/volume/e1RM/max are unchanged (0-plate set carries no
+    # plate load, and volume sums all sets regardless of the warmup flag).
+    ex = next(e for e in collect(query_period_days=None, exercise_names=["Deadlift"],
+                                 aggregation_level="session", include_phase2=False)["exercises"]
+              if e["name"] == "Deadlift")
+    s = _sess(ex, "2026-01-17")
+    assert s["max_working_weight"] == 60.0         # from a heavy working set, not the opener
+    assert s["total_volume"] == 1200.0             # includes the warmup (20*12 + 40*12 + 60*8)
+    assert s["estimated_1rm"] == 76.0
+    # the flag's effect: opener excluded from working sets / rep ranges
+    assert s["working_sets_count"] == 2            # 3 sets - 1 warmup
+    assert s["rep_ranges"]["hypertrophy_sets"] == 2
+    assert s["rep_ranges"]["endurance_sets"] == 0  # the 0-plate x12 opener no longer counted

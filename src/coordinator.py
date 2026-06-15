@@ -149,6 +149,44 @@ OPERATIONAL — use only for questions that require MCP tools:
     Session display — show me exactly what I did on a specific date
                       with full set breakdown
 
+OUT_OF_SCOPE — refuse politely WITHOUT any tool, search, or analysis. Decide
+this by a FITNESS-CONNECTION test, NOT a keyword blocklist:
+  "Is this about fitness, training, nutrition-for-training, fitness
+   science/history, or the user's own training data?"
+  If yes → route analytical/operational as above. If no → route "out_of_scope".
+
+  IN SCOPE (route normally, NOT out_of_scope):
+   - The user's own logs / training data — any phrasing, even with no fitness
+     words ("how many days have I trained excluding Sundays").
+   - Fitness science, exercise physiology, and DEFINITIONS of fitness terms
+     ("what is progressive overload / hypertrophy / RPE / a superset").
+   - Nutrition for training/performance, incl. food prep with a nutrition/goal
+     angle ("cook chicken keeping protein high", "good pre-workout meal", macros).
+   - Fitness history & culture ("Ronnie Coleman's diet", "who won Mr. Olympia 1998").
+   - Program design, splits, recovery, periodization, rest days.
+   - Training / rehab / mobility / warmups around a stated symptom (see MEDICAL).
+
+  OUT OF SCOPE (route "out_of_scope"):
+   - Coding / software / SQL-for-its-own-sake / tech support.
+   - AI / technology topics, writing about AI models.
+   - Politics, news, current events, geography, economics.
+   - Arts & humanities, NON-fitness history, literature, philosophy, music, film.
+   - Linguistics / etymology / translation of NON-fitness terms ("what does
+     ad-hoc mean", "translate this"). NOTE: fitness-term definitions are IN.
+   - Puzzles, riddles, math-for-itself, brain teasers, general (non-fitness) trivia.
+   - Creative writing, INCLUDING motivational poems / hype / "write me a poem".
+   - General cooking / recipes with NO training or nutrition angle.
+   - Personal-life advice unrelated to training (relationships, career, finance).
+
+  When GENUINELY ambiguous, lean IN — a false refusal of a real fitness
+  question is worse than answering something borderline.
+
+MEDICAL questions are NEVER out_of_scope. A stated symptom, pain, or condition
+is in-domain training territory — route it analytical/operational as normal. The
+answer (governed by the coach's system prompt) gives training adaptations plus a
+see-a-professional redirect and refuses only to DIAGNOSE or TREAT. Never send a
+medical/symptom question to out_of_scope.
+
 DEFAULT: when uncertain, use "operational".
 
 If a [PREVIOUS TURNS] block is present, use it ONLY to resolve pronouns
@@ -185,7 +223,7 @@ CUSTOM SQL (analytical route only):
 
 Return ONLY valid JSON, no preamble, no markdown fences:
 {
-  "route": "analytical" | "operational",
+  "route": "analytical" | "operational" | "out_of_scope",
   "exercise_names": ["..."] | null,
   "muscle_groups": ["..."] | null,
   "query_period_days": 90 | null,
@@ -193,6 +231,17 @@ Return ONLY valid JSON, no preamble, no markdown fences:
   "custom_sql_intent": null
 }
 """.strip()
+
+
+# Out-of-scope refusal — warm, brief, redirects to purpose. Returned directly
+# by route() the moment the classifier says out_of_scope, so it costs nothing
+# beyond the classify call: no package build, no agent turn, no search, no
+# analysis LLM call.
+OUT_OF_SCOPE_REFUSAL = (
+    "I'm your fitness coach, so I'll stick to your training, workouts, "
+    "nutrition, and fitness questions — that one's outside what I'm built for. "
+    "Ask me anything about your lifts, progress, programming, or recovery."
+)
 
 
 # ── Coverage check prompt ─────────────────────────────────────────────────────
@@ -319,6 +368,12 @@ class Coordinator:
                 raise
         route  = params.get("route", "operational")
 
+        # ── Out-of-scope: refuse at classification time. No package build, no
+        # agent turn, no search, no analysis LLM call — the refusal IS the
+        # classifier's output, so a non-fitness question costs only the classify.
+        if route == "out_of_scope":
+            return self._out_of_scope_response()
+
         # ── 2. Route ──────────────────────────────────────────────────────────
         flagged = []
         error   = None
@@ -407,6 +462,19 @@ class Coordinator:
         return {
             "answer":         "There's no saved question to resume.",
             "route":          "none",
+            "flagged_claims": [],
+            "error":          None,
+        }
+
+    def _out_of_scope_response(self) -> dict:
+        """
+        Non-fitness question — refuse immediately with the coach redirect. No
+        tool, package, search, or analysis call is made (the dispatch returns
+        before any of them), so an out-of-scope turn spends only the classify.
+        """
+        return {
+            "answer":         OUT_OF_SCOPE_REFUSAL,
+            "route":          "out_of_scope",
             "flagged_claims": [],
             "error":          None,
         }
@@ -543,7 +611,10 @@ class Coordinator:
                 config=config,
             )
             raw = ""
-            for part in response.candidates[0].content.parts:
+            _cand  = response.candidates[0] if getattr(response, "candidates", None) else None
+            _parts = (_cand.content.parts
+                      if _cand and _cand.content and _cand.content.parts else [])
+            for part in _parts:
                 if getattr(part, "text", None):
                     raw += part.text
 
@@ -901,7 +972,10 @@ class Coordinator:
                 config=config,
             )
             raw = ""
-            for part in response.candidates[0].content.parts:
+            _cand  = response.candidates[0] if getattr(response, "candidates", None) else None
+            _parts = (_cand.content.parts
+                      if _cand and _cand.content and _cand.content.parts else [])
+            for part in _parts:
                 if getattr(part, "text", None):
                     raw += part.text
 

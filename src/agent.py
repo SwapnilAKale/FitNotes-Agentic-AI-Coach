@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import os
 import re
 import sys
@@ -14,6 +15,8 @@ from mcp.client.stdio import stdio_client
 from src.memory import add_fact, format_relevant_memories_for_prompt
 from src.schema_prompt import build_user_context_prompt, load_user_context
 from src import checkpoint as _ckpt
+
+logger = logging.getLogger(__name__)
 
 MODEL = "gemini-3.1-flash-lite"
 
@@ -254,7 +257,41 @@ When an update/delete tool returns needs_clarification: true (date missing), pre
 3. Give me a date range"
 Then call get_exercise_sessions with mode="approximate" / "recent" / "range" accordingly.
 Present date + max weight + total reps per session. Ask the user to confirm before proceeding.
-For goals: list all found goals with target_date, weight, reps, start_date and ask which to use.\
+For goals: list all found goals with target_date, weight, reps, start_date and ask which to use.
+
+COACH CHARACTER:
+Be a direct, warm coach — opinionated because your numbers are trustworthy.
+1. DIRECT & WARM: state a clear recommendation plainly and supportively, not
+   buried under hedges ("Your Overhead Press has stalled 6 sessions — I'd drop
+   volume 20% for two weeks", not "you might possibly consider reducing volume").
+2. ALWAYS EXPLAIN THE WHY: every opinion carries its reasoning and the data
+   behind it, so the user can judge whether it applies to them.
+3. USER HOLDS THE FINAL CALL: you advise and reason, you don't dictate. You know
+   the user through their logged numbers only — not their sleep, mood, or how a
+   joint feels. State the view, give the reasoning, leave the decision to them.
+4. BIAS TOWARD TRAINING, NEVER TOWARD EXCUSES: advise rest or a deload only when
+   the data genuinely supports it; never volunteer "take today off" as a casual
+   option or validate skipping the data doesn't justify. Default posture is
+   "show up." Recovery advice is earned by evidence.
+GROUNDING (overrides the above): every strong claim must trace to the user's
+tool data or an established fitness principle. When data is thin (small n), say
+so directly — "there isn't enough data to tell you this confidently" is a direct
+answer, not a hedge and not a licence to fabricate confidence. Directness is
+about data-grounded training/recovery decisions — never blanket negativity,
+discouragement, or anything promoting unhealthy restriction.
+
+MEDICAL LINE (diagnose vs adapt):
+NEVER diagnose, name, or treat a medical condition or prescribe medication
+("what spinal injury do I have", "what's causing my knee pain", "how do I treat
+my herniated disc" → refuse the diagnostic/treatment part and redirect to a
+qualified professional). ALWAYS allowed (this is your job): training adaptations,
+exercise substitutions, form cues, warmups, mobility/flexibility work, and load
+management AROUND a stated symptom — while adding a see-a-professional note ("my
+neck hurts during chest" → warmups/mobility/form or exercise swaps + "see a pro
+if it persists"; "wrist pain on biceps" → grip changes, substitutions, deload +
+redirect). THE LINE: EXERCISES and TRAINING ADJUSTMENTS = always allowed (with
+redirect when a symptom is named); DIAGNOSING or TREATING a condition = refuse +
+redirect. Never cross into "here's what's medically wrong with you."\
 """
 
 
@@ -1018,25 +1055,46 @@ class AgentSession:
                 contents=reflection_contents,
                 config=reflect_config,
             )
-            raw_parts = response.candidates[0].content.parts if (response.candidates and response.candidates[0].content) else []
+            raw_parts = (response.candidates[0].content.parts
+                         if (response.candidates and response.candidates[0].content
+                             and response.candidates[0].content.parts) else [])
             text_parts = [p for p in raw_parts if getattr(p, "text", None)]
             return "\n".join(p.text for p in text_parts) or answer
         except Exception:
             return answer
 
     def _run_collect(self, contents, config) -> tuple:
-        """Standard non-streaming collect. Runs in a thread via asyncio.to_thread."""
+        """
+        Standard non-streaming collect. Runs in a thread via asyncio.to_thread.
+
+        Returns the degraded result ("", [], None) — never raises — when Gemini
+        returns a candidate with no usable content: no candidates, content is
+        None, parts is None/empty (the live MALFORMED_RESPONSE crash), or a
+        non-STOP terminal finish_reason (malformed / safety / truncation). The
+        caller turns an empty result into a clean "I wasn't able to form a clear
+        answer. Please try rephrasing." instead of crashing on a None iteration.
+        We do NOT retry here — a malformed response may repeat; one clean failure
+        is correct.
+        """
         response = self._client.models.generate_content(
             model=MODEL,
             contents=contents,
             config=config,
         )
-        candidate = response.candidates[0] if response.candidates else None
-        if candidate is None or candidate.content is None:
+        candidate = response.candidates[0] if getattr(response, "candidates", None) else None
+        finish = getattr(candidate, "finish_reason", None) if candidate else None
+        parts = (candidate.content.parts
+                 if candidate and candidate.content and candidate.content.parts
+                 else None)
+        if not parts:
+            logger.warning(
+                "[agent] empty/malformed Gemini response — no usable content "
+                "(finish_reason=%s); returning degraded result", finish,
+            )
             return ("", [], None)
         combined_text = ""
         fc_parts = []
-        for part in candidate.content.parts:
+        for part in parts:
             if hasattr(part, "text") and part.text:
                 combined_text += part.text
             elif hasattr(part, "function_call") and part.function_call:
@@ -1102,7 +1160,9 @@ class AgentSession:
                 contents=[types.Content(role="user", parts=[types.Part.from_text(text=prompt)])],
                 config=extract_config,
             )
-            raw_parts = response.candidates[0].content.parts if (response.candidates and response.candidates[0].content) else []
+            raw_parts = (response.candidates[0].content.parts
+                         if (response.candidates and response.candidates[0].content
+                             and response.candidates[0].content.parts) else [])
             text = "\n".join(p.text for p in raw_parts if getattr(p, "text", None)).strip()
             if "```" in text:
                 text = text.split("```")[1]

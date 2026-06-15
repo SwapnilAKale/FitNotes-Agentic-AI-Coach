@@ -57,14 +57,8 @@ logger = logging.getLogger(__name__)
 # verify each comment against its own Comment row (independent ground truth).
 _DB_PATH = os.environ.get("FITNOTES_DB_PATH", "data/FitNotes_Backup.fitnotes")
 
-# ── Known kg-native exercises (static config, matches user_context.json) ──────
-_KG_NATIVE: frozenset = frozenset({
-    "Deadlift",
-    "Seated Machine Curl (Kg)",
-    "Machine Wrist Extension",
-    "Hand Gripper",
-})
-_DEADLIFT_KG_SWITCH = "2025-12-26"   # YYYY-MM-DD; before this date Deadlift is lbs
+# Kg-native rule — single source of truth in src/units.py (was a local copy).
+from src.units import KG_NATIVE_EXERCISES as _KG_NATIVE, DEADLIFT_KG_SWITCH as _DEADLIFT_KG_SWITCH
 
 # ── Allowed confidence labels (spec F2) ───────────────────────────────────────
 _VALID_CONFIDENCE = frozenset({"insufficient_data", "weak", "moderate", "strong"})

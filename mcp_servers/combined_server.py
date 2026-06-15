@@ -804,30 +804,12 @@ async def _query_workout_data(question: str) -> str:
     return await asyncio.to_thread(_query_workout_data_sync, question)
 
 
-KG_NATIVE = {"Deadlift", "Seated Machine Curl (Kg)", "Machine Wrist Extension", "Hand Gripper"}
-
-# Deadlift switched from lbs to kg logging on this date; the other kg-native
-# exercises log kg for all of history. Mirrors validate._DEADLIFT_KG_SWITCH /
-# process.DEADLIFT_KG_SWITCH_DATE. NOTE: duplicated here so the SQL volume split
-# stays self-contained in this MCP subprocess — unify into one shared helper later.
-DEADLIFT_KG_SWITCH = "2025-12-26"
-
-
-def _kg_native_volume_case(expr: str) -> tuple:
-    """
-    Build (lbs_sum_sql, kg_sum_sql) for a volume expression, split by the
-    kg-native rule so kilograms are never summed into pounds. Reuses KG_NATIVE
-    (the always-kg names) + DEADLIFT_KG_SWITCH (Deadlift's date-conditioned
-    switch). Inputs are internal constants, not user data — safe to interpolate.
-    The two buckets are different UNITS and must never be added together.
-    """
-    always_kg = sorted(n for n in KG_NATIVE if n != "Deadlift")
-    in_list = ", ".join("'" + n.replace("'", "''") + "'" for n in always_kg)
-    kg_pred = (f"(e.name IN ({in_list}) "
-               f"OR (e.name = 'Deadlift' AND tl.date >= '{DEADLIFT_KG_SWITCH}'))")
-    lbs_sum = f"SUM(CASE WHEN NOT {kg_pred} THEN {expr} ELSE 0 END)"
-    kg_sum  = f"SUM(CASE WHEN {kg_pred} THEN {expr} ELSE 0 END)"
-    return lbs_sum, kg_sum
+# Kg-native rule — single source of truth in src/units.py (was a local copy).
+from src.units import (
+    KG_NATIVE_EXERCISES as KG_NATIVE,
+    DEADLIFT_KG_SWITCH,
+    kg_native_volume_case as _kg_native_volume_case,
+)
 
 
 BAR_EXERCISE_NOTES = {
@@ -1026,38 +1008,68 @@ async def _get_exercise_history(exercise_name: str, days: int = 30) -> str:
 
 
 def _get_weekly_volume_sync(days: int = 30) -> str:
-    from src.db import get_connection, run_query
+    from collections import defaultdict
+    from src.db import get_connection
+    # Reuse the ANALYTICAL per-set headline source (no duplicate copy): plates =
+    # _recover_typed_weight(metric_weight, offset); headline = plates + bar, with
+    # the bar in the exercise's own unit frame (kg-native -> kg bucket, else lbs).
+    # _get_bar_weight_lbs handles per-exercise + date-ranged bars exactly as the
+    # analytical path does, so the two surfaces produce the same numbers.
+    from src.data_agent.process import (
+        _get_bar_weight_lbs, _get_numeric_offset, _is_kg_native, _recover_typed_weight,
+    )
+    from src.data_agent.fetch import load_user_context
 
-    # Per-unit volume: metric_weight * 2.2046 recovers the TYPED number, which is
-    # kilograms for kg-native exercises and pounds otherwise. Bucket by frame so
-    # a kg-native exercise (e.g. post-2025-12-26 Deadlift) is never summed into a
-    # category's pounds total. Mirrors the analytical path's _lbs/_kg fields.
-    _lbs_sum, _kg_sum = _kg_native_volume_case("tl.metric_weight * 2.2046 * tl.reps")
+    try:
+        ctx = load_user_context()
+    except Exception:
+        ctx = {}
+
     sql = f"""
-        SELECT c.name AS muscle_group,
-               COUNT(*) AS total_sets,
-               ROUND({_lbs_sum}, 1) AS total_volume_lbs,
-               ROUND({_kg_sum}, 1) AS total_volume_kg
+        SELECT c.name AS muscle_group, e.name AS exercise_name,
+               tl.date AS date, tl.metric_weight AS metric_weight, tl.reps AS reps
         FROM training_log tl
         JOIN exercise e ON tl.exercise_id = e._id
         JOIN Category c ON e.category_id = c._id
-        WHERE tl.date >= date('now', '-{days} days')
-        GROUP BY c.name
-        ORDER BY total_sets DESC;
+        WHERE tl.date >= date('now', '-{days} days');
     """
     try:
         conn = get_connection(DB_PATH)
-        rows = run_query(conn, sql)
+        cur = conn.execute(sql)
+        agg = defaultdict(lambda: {"sets": 0, "lbs": 0.0, "kg": 0.0})
+        for r in cur.fetchall():
+            mg   = r["muscle_group"]
+            name = r["exercise_name"]
+            d    = r["date"]
+            reps = r["reps"] or 0
+            plates  = _recover_typed_weight(r["metric_weight"], _get_numeric_offset(ctx, name))
+            is_kg   = _is_kg_native(ctx, name, d)
+            bar_lbs = _get_bar_weight_lbs(ctx, name, d)
+            bar     = bar_lbs / 2.2046 if is_kg else bar_lbs     # bar in the set's frame
+            vol     = (plates + bar) * reps
+            a = agg[mg]
+            a["sets"] += 1
+            a["kg" if is_kg else "lbs"] += vol
+        rows = [
+            {"muscle_group": mg, "total_sets": a["sets"],
+             "total_volume_lbs": round(a["lbs"], 1),
+             "total_volume_kg":  round(a["kg"], 1)}
+            for mg, a in agg.items()
+        ]
+        rows.sort(key=lambda x: x["total_sets"], reverse=True)
         return json.dumps(
             {
                 "days": days,
                 "note": (
-                    "Volume is split per UNIT FRAME: total_volume_lbs (pounds-typed "
-                    "exercises) and total_volume_kg (kg-native exercises: post-2025-12-26 "
-                    "Deadlift, Seated Machine Curl (Kg), Machine Wrist Extension, Hand "
-                    "Gripper). Each is typed_value (metric_weight * 2.2046) x reps, "
-                    "plates only (no bar weight). The two are DIFFERENT UNITS — never "
-                    "add total_volume_lbs and total_volume_kg together."
+                    "Volume is BAR-INCLUSIVE (plates + bar + numeric offset) x reps, "
+                    "split per UNIT FRAME: total_volume_lbs (pounds-typed exercises) and "
+                    "total_volume_kg (kg-native: post-2025-12-26 Deadlift, Seated Machine "
+                    "Curl (Kg), Machine Wrist Extension, Hand Gripper). The bar is added "
+                    "in each exercise's own unit (a 20kg Deadlift bar lands in the kg "
+                    "bucket). This matches the analytical path's muscle_group_summary "
+                    "(Smith-machine counterbalance reductions from set comments are not "
+                    "applied here, so Smith-heavy categories may read very slightly high). "
+                    "The two frames are DIFFERENT UNITS — never add _lbs and _kg together."
                 ),
                 "volume_by_muscle_group": rows,
             }
@@ -2410,8 +2422,7 @@ def _get_exercise_sessions_sync(arguments: dict) -> str:
     except Exception as exc:
         return json.dumps({"error": str(exc)})
 
-    _KG_NATIVE = {"Deadlift", "Seated Machine Curl (Kg)", "Machine Wrist Extension", "Hand Gripper"}
-    session_unit = "kg" if exercise_name in _KG_NATIVE else "lbs"
+    session_unit = "kg" if exercise_name in KG_NATIVE else "lbs"
 
     # Load numeric_offset for this exercise from user_context.json if present
     _quirk_offset = 0
