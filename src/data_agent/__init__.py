@@ -10,12 +10,15 @@ from datetime import date, datetime, timedelta
 from typing import Optional
 
 from .fetch    import fetch_data, load_user_context, query, sanitize_sql
-from .process  import process_data, trim_package, _get_aggregation_level
+from .process  import (
+    process_data, trim_package, _get_aggregation_level,
+    match_muscle_group, MUSCLE_GROUP_NAMES,
+)
 from .validate import validate, Violation  # noqa: F401  (Violation re-exported)
 
 __all__ = [
     "collect", "prepare_analysis_package", "query", "sanitize_sql",
-    "DataAgentIntegrityError",
+    "DataAgentIntegrityError", "match_muscle_group", "MUSCLE_GROUP_NAMES",
 ]
 
 _log = logging.getLogger(__name__)

@@ -35,7 +35,9 @@ from typing import Optional
 from google import genai
 from google.genai import types
 
-from src.data_agent import prepare_analysis_package, DataAgentIntegrityError
+from src.data_agent import (
+    prepare_analysis_package, DataAgentIntegrityError, match_muscle_group,
+)
 from src import analysis_agent
 from src import checkpoint as _ckpt
 
@@ -669,6 +671,31 @@ class Coordinator:
         exercise_names    = params.get("exercise_names")
         if exercise_names:
             exercise_names = [n.strip() for n in exercise_names]
+
+        # ── Muscle-group Category guard (belt-and-suspenders) ──────────────────
+        # A term that names a muscle-group Category (Triceps, Chest, Back, …) is
+        # NOT an exercise. "Triceps" substring-matches 5 real exercise names, so
+        # running resolve_exercise_name on it emits a bogus "which one did you
+        # mean?" disambiguation prompt and never builds the package. Regardless of
+        # which slot the classifier used, route every category term to
+        # muscle_groups (canonical form) → GROUP scope, and resolve/disambiguate
+        # only the genuine exercise names that remain.
+        muscle_groups: list = []
+        for g in (params.get("muscle_groups") or []):
+            canon = match_muscle_group(g) or (g.strip() if isinstance(g, str) else g)
+            if canon and canon not in muscle_groups:
+                muscle_groups.append(canon)
+        if exercise_names:
+            kept_names: list = []
+            for name in exercise_names:
+                canon = match_muscle_group(name)
+                if canon:
+                    if canon not in muscle_groups:
+                        muscle_groups.append(canon)
+                else:
+                    kept_names.append(name)
+            exercise_names = kept_names or None
+
         if exercise_names:
             from src.shared.resolver import resolve_exercise_name
             db_path = os.environ.get(
@@ -699,7 +726,9 @@ class Coordinator:
                     # No match — keep original so the package reports it as unresolved
                     resolved.append(name)
             exercise_names = resolved
-        muscle_groups     = params.get("muscle_groups")
+        # muscle_groups already computed above by the Category guard (canonical,
+        # including any category terms moved out of exercise_names).
+        muscle_groups     = muscle_groups or None
         query_period_days = params.get("query_period_days", 90)
 
         # Build compact package (scope-aware trim: BROAD 365d ≈ 396 KB)

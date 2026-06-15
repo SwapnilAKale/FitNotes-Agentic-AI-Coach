@@ -34,6 +34,31 @@ CATEGORY_NAMES = {
 PUSH_CATEGORIES = {"Shoulders", "Triceps", "Chest"}
 PULL_CATEGORIES = {"Back", "Biceps"}
 
+# Canonical muscle-group Category names — the CATEGORY_NAMES values, the single
+# source the Coordinator's category guard matches against (no inline re-copy).
+# A term that names one of these is a MUSCLE GROUP, not an exercise: "Triceps"
+# is a category that substring-matches 5 real exercise names, so running the
+# exercise-name resolver on it would emit a bogus disambiguation prompt.
+# Time/Place/Neck (ids 10/11/12) are non-muscle and intentionally excluded.
+MUSCLE_GROUP_NAMES = frozenset(CATEGORY_NAMES.values())
+
+
+def match_muscle_group(term: str) -> Optional[str]:
+    """
+    Return the canonical muscle-group Category name a user/classifier term refers
+    to, or None if the term is not a muscle group. Case-insensitive and tolerant
+    of a trailing singular/plural 's' ("tricep"/"triceps", "ab"/"abs"). The
+    returned name is the exact CATEGORY_NAMES form ("Back", "Triceps"), which is
+    what the muscle_groups → category-id map requires downstream.
+    """
+    if not term or not isinstance(term, str):
+        return None
+    key = term.strip().lower().rstrip("s")
+    for name in MUSCLE_GROUP_NAMES:
+        if key == name.lower().rstrip("s"):
+            return name
+    return None
+
 WARMUP_GAP_RATIO  = 1.5   # gap(s1→s2) must exceed this × max(working_steps) to flag
 WARMUP_FLAT_RATIO = 0.60  # equal-working-set case: s1 ≤ this fraction of s2
 WARMUP_MIN_REPS   = 12    # minimum reps on the first set for weight-based warmup
@@ -1937,14 +1962,22 @@ def _compute_alltime_summary(all_dates: list, alltime_rows: list,
         "last_training_date":    all_dates[-1],
         "total_training_days":   len(set(all_dates)),
         "total_sets":            total_sets,
-        "total_volume_raw_typed_lbs": round(vol_lbs, 0),
-        "total_volume_raw_typed_kg":  round(vol_kg, 0),
-        "total_volume_raw_note": (
-            "sum of typed plate weight × reps per typed-unit frame; excludes "
-            "bar weight and numeric offsets. _lbs is the lbs-typed frame and "
-            "_kg the kg-typed frame — separate frames, never add them. "
-            "Plates-only and NOT bar-inclusive."
-        ),
+        # Demoted under an underscore-prefixed sub-object so it no longer sits at
+        # the same level as authoritative volume fields, tempting the LLM to quote
+        # a plates-only number for "total volume". The real volume lives in
+        # muscle_group_summary.total_volume_lbs/_kg (bar-inclusive, per-unit).
+        "_raw_volume_crosscheck": {
+            "typed_lbs": round(vol_lbs, 0),
+            "typed_kg":  round(vol_kg, 0),
+            "note": (
+                "Internal cross-check ONLY — NOT the user's volume, do not quote. "
+                "Sum of typed plate weight × reps per typed-unit frame; excludes "
+                "bar weight and numeric offsets (plates-only, NOT bar-inclusive). "
+                "typed_lbs is the lbs-typed frame and typed_kg the kg-typed frame "
+                "— separate frames, never add them. For volume questions use "
+                "muscle_group_summary.total_volume_lbs/_kg instead."
+            ),
+        },
         "longest_streak_days":   max_streak,
         "longest_gap_days":      max_gap,
         "current_streak_days":   cur_now,

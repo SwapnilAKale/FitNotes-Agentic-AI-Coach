@@ -857,6 +857,13 @@ split). `run_read_only_sql` passes agent SQL through verbatim — it can't be
 bucketed, so its response now carries a caveat that kg-native typed values are
 kilograms and must not be summed across frames.
 
+> **Superseded by Session 10:** `get_weekly_volume` was subsequently made
+> **bar-inclusive** (plates + bar + numeric offset), so it now matches the
+> analytical `muscle_group_summary` rather than reconciling to the old
+> plates-only blended sum, and the kg-native rule moved to the single source of
+> truth in `src/units.py`. See "Operational bar-inclusive volume + kg-native
+> predicate unification" below.
+
 ### Per-minute vs daily 429 handling
 
 A 429's `quotaId` distinguishes the two (read structurally from `exc.details`,
@@ -881,26 +888,155 @@ falling back to `str(exc)`):
   `route="none"` ("There's no saved question to resume.") with zero downstream
   LLM calls, instead of running a fresh expensive question.
 
+---
+
+## Session 10 — Progression end-anchor, operational bar-inclusive volume, units unification, response-shape guard, routing Step A
+
+### Progression end-anchor — "current ability" vs "latest session"
+
+`_compute_progression` (`src/data_agent/process.py`) no longer treats the literal
+last session as the end of a progression trend. The trend's **end anchor is
+current ability** — the robust recent best (`_recent_best_session` over
+`CURRENT_ABILITY_SESSIONS`), by the weight→reps PR rule — so a deliberate back-off
+day no longer reads as a decline. The latest session is reported **separately** as
+`latest_session_date` / `latest_session_weight` / `latest_session_reps` with a
+`latest_session_is_backoff` flag, so the Analysis Agent can say "your most recent
+session was lighter" without narrating it as a taper. **Cross-frame % guard:**
+`weight_change_pct` is computed only within the end (current) unit frame and is set
+to `None` when the window spans a unit switch with fewer than two same-frame
+sessions, with a `progression_note` explaining why — this removes the ~185%
+Deadlift artifact that came from computing a percentage across the 2025-12-26
+lbs→kg switch. (Deadlift end now 70→85 = PR; the false Lat Pulldown −7.7% → 0,
+held.)
+
+### Operational bar-inclusive volume + kg-native predicate unification
+
+`get_weekly_volume` (the operational chat tool) now returns **bar-inclusive**
+volume (plates + bar + numeric offset) in per-unit buckets `total_volume_lbs` /
+`total_volume_kg`, matching the analytical `muscle_group_summary`. 9 of 10
+categories reconcile exactly; Legs runs ~0.5% high because the operational pass
+does not replicate Smith-machine counterbalance reductions (documented residual,
+below). The kg-native rule is now a **single source of truth** in
+`src/units.py` (`KG_NATIVE_NAMES`/`KG_NATIVE_EXERCISES`, `DEADLIFT_KG_SWITCH`/
+`DEADLIFT_KG_SWITCH_DATE`, `is_kg_native`, `kg_native_sql_predicate`,
+`kg_native_volume_case`), imported by `validate.py`, `process.py`, and
+`combined_server.py` — previously three independent copies of the same predicate.
+
+### E2 warmup 0-opener headline-frame fix
+
+The 0-weight-opener warmup gate (`process.py` ~357) now compares `working_max` on
+the **bar-inclusive headline frame** against the bar-inclusive
+`exercise_alltime_max` (was plates-only vs bar-inclusive — too strict, so genuine
+empty-bar warmups were missed). 43 real missed empty-bar warmups are now correctly
+flagged. Safe direction (adds correctly-missed warmups, creates no false
+positives); weight / volume / e1RM are unchanged — only rep-range and working-set
+counts shift.
+
+### Malformed-response crash guard
+
+Every place that iterates `candidate.content.parts` over a Gemini response is now
+guarded against no-candidates / `content=None` / `parts=None` / a non-STOP
+terminal `finish_reason` (`MALFORMED_RESPONSE`, `SAFETY`): `agent.py`
+(`_run_collect`, `_reflect`, `_auto_extract_memories`), `analysis_agent.py`
+(`_collect_text`), and `coordinator.py` (`_classify`, `_coverage_check`). A
+malformed envelope degrades to a clean user message ("I wasn't able to form a
+clear answer…") instead of a 500 / traceback, and is **not** blindly retried.
+
+### Routing Step A — out_of_scope gate + medical carve-out + coach character
+
+- **out_of_scope route** refuses non-fitness questions at classification with
+  **zero downstream spend** — no package build, no agent turn, no search, no
+  analysis call (`_out_of_scope_response` returns `OUT_OF_SCOPE_REFUSAL`
+  directly). The classifier uses a **fitness-connection test**, not a topic
+  blocklist: user data, fitness science, fitness-term definitions,
+  training/nutrition, fitness history/culture, and program design are IN; coding,
+  AI/tech, politics, non-fitness arts/history, non-fitness
+  definitions/translation, puzzles, trivia, and creative writing (including
+  motivational poems) are OUT. When genuinely ambiguous, it leans IN.
+- **Medical carve-out:** medical/symptom questions are **never** routed
+  out_of_scope. The coach never diagnoses, names, or treats a condition (refuses
+  + redirects to a professional) but always advises training adaptations,
+  substitutions, form cues, warmups, mobility, and load management around a
+  stated symptom (with a see-a-professional note).
+- **Coach character** added to both `_ANALYSIS_SYSTEM` (`analysis_agent.py`) and
+  the operational system prompt (`agent.py`): direct & warm, always explain the
+  why with the data, the user holds the final call, bias toward training (never
+  toward excuses) — with grounding overriding all four (strong claims trace to
+  data or principle; thin data → say so; never confidently wrong; within
+  wellbeing bounds).
+
+---
+
+## Routing Step B — muscle-group Category guard + plates-only volume steering
+
+Two targeted analytical-path fixes (Step C is still planned).
+
+### Fix 1 — muscle-group-vs-exercise-name Category guard
+
+A question like "my strength drops when I train triceps after chest" used to break
+the analytical path: the classifier slotted "triceps" into `exercise_names`, the
+resolver loop (`coordinator._run_analytical`) ran `resolve_exercise_name("triceps")`,
+got 5 candidate exercises (substring matches), and emitted "I found multiple
+exercises matching triceps. Which one did you mean?" — a category error, because
+"triceps" is a **muscle group**, not an exercise.
+
+Before resolving any extracted term, the coordinator now checks it against the
+canonical muscle-group Category names via `match_muscle_group` (case-insensitive,
+singular/plural tolerant). A term that names a Category is moved to
+`muscle_groups` in canonical form (→ GROUP scope) and is **never** sent to
+`resolve_exercise_name` or a disambiguation prompt. This is a belt-and-suspenders
+guard: it fires regardless of which slot the classifier used. Only genuine
+exercise names still resolve/disambiguate — "dumbbell bench press" still surfaces
+its 3 real variants. The canonical list is the single source of truth
+`MUSCLE_GROUP_NAMES` (derived from `process.CATEGORY_NAMES`, exported via
+`src.data_agent`), not a new inline copy. Substring-trap counts that motivated the
+guard: "Triceps" matches 5 exercise names, "Chest" 2, "Back" 1. Ordering/fatigue
+questions naming a muscle now build a GROUP-scope package and draw on
+`inter_exercise_correlation` / `workout_position_effect` (already present in group
+scope) instead of pinning to one exercise.
+
+### Fix 2 — plates-only volume steering + footgun demotion
+
+"Total volume by muscle group" used to return plates-only numbers with a "does not
+include bar weights" caveat: the model quoted the package's all-time raw
+cross-check field instead of the authoritative bar-inclusive volume. The
+`muscle_group_summary` already carries bar-inclusive per-unit volume
+(`total_volume_lbs` / `total_volume_kg`); the raw plates-only field was a footgun
+sitting in `all_time_summary`. Two changes:
+
+- **Steering** (`_ANALYSIS_SYSTEM`, new VOLUME RULES block): for any volume
+  question use `muscle_group_summary.total_volume_lbs/_kg` (bar-inclusive,
+  per-unit) and `muscle_group_balance`; **never** quote the raw plates-only field
+  as "total volume"; report `_lbs` and `_kg` separately and say "pounds-frame
+  volume" / "kilograms-frame volume" (never "total volume in pounds") when a
+  muscle group carries both frames (Back, Biceps, Forearms).
+- **Demotion** (package hygiene): the former top-level
+  `total_volume_raw_typed_lbs` / `_kg` / `total_volume_raw_note` keys are moved
+  under `all_time_summary._raw_volume_crosscheck` (`typed_lbs`, `typed_kg`,
+  `note`) so the plates-only number no longer sits beside authoritative volume
+  fields. Values are unchanged; the only other consumer (a validate test fixture)
+  was updated. The package is JSON-dumped wholesale to the Analysis Agent, so no
+  named-field consumer needed changing.
+
+---
+
 ### Known open gaps (updated)
 
-- **Bar weight in operational volume** — `get_weekly_volume` is now per-unit but
-  still **plates-only** (`metric_weight * 2.2046 * reps`, no bar), inconsistent
-  with the analytical path's bar-inclusive volume. Deliberately out of scope for
-  the cross-unit fix; tracked separately.
+- **Legs Smith-counterbalance residual** — operational `get_weekly_volume` runs
+  ~0.5% high on Legs because the chat-tool pass does not replicate the Smith-squat
+  counterbalance reductions the analytical path applies. Bar + per-unit buckets
+  are otherwise reconciled; the counterbalance correction is the only remaining
+  delta.
 - **`run_read_only_sql` blend edge** — arbitrary agent SQL can still emit a
   blended `SUM(...*2.2046)` across kg-native and lbs exercises. It can't be
   bucketed (verbatim passthrough), so it's only **annotated** with a unit
   caveat, not corrected.
-- **kg-native predicate duplication** — the rule (`KG_NATIVE` +
-  `DEADLIFT_KG_SWITCH` / `validate._KG_NATIVE` / `process._is_kg_native`) is
-  copied across `process.py`, `validate.py`, and both MCP servers; flagged
-  in-code to unify into one shared helper.
 - **`agent_lock` held during a per-minute wait** — the silent retry holds the
   single agent lock for up to ~2×70s, so a concurrent `/chat` gets the existing
   "busy" 429. Acceptable under the single-user assumption; flagged for multi-user.
-- **Warmup 0-opener gate** (`process.py` ~342) compares a plates-only working max
-  against the bar-inclusive `exercise_alltime_max` — an internal cross-frame
-  heuristic (not a shipped value), left as-is.
+- **Routing Step C (planned, NOT done)** — flip the classifier default toward
+  analytical and strip the operational read tools the analytical pipeline no
+  longer needs. Upcoming.
 - **No token streaming** — answers return whole (non-streaming `_run_collect`);
   long answers have no progressive render.
 - **Research / paper fetcher** (PubMed / RAG) is best-effort and uncached — it can

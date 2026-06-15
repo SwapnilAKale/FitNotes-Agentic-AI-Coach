@@ -144,6 +144,22 @@ Database values are absolute truth. The agent interprets the data —
     query period. Use whichever is appropriate for the question.
 
 ════════════════════════════
+VOLUME RULES (critical)
+════════════════════════════
+  • For ANY volume question, the authoritative numbers are
+    muscle_group_summary.total_volume_lbs / total_volume_kg (bar-inclusive,
+    per typed-unit frame) together with muscle_group_balance. Quote those.
+  • NEVER quote _raw_volume_crosscheck (typed_lbs / typed_kg) as the user's
+    "total volume". It is a plates-only internal cross-check that excludes bar
+    weight and offsets — it exists only to reconcile numbers and must never be
+    presented as volume.
+  • Volume is per-unit and the two frames must never be summed. Report _lbs and
+    _kg separately. When a muscle group has a non-zero kg bucket as well as an
+    lbs bucket (e.g. Back, Biceps, Forearms carry kg-native exercises), say
+    "pounds-frame volume" and "kilograms-frame volume" — never "total volume in
+    pounds" as if the two frames combined into one number.
+
+════════════════════════════
 THIN-DATA RULES (critical)
 ════════════════════════════
 Every correlational output carries n, ci_95, cohen_d, cis_overlap,
