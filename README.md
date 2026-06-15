@@ -1020,6 +1020,44 @@ sitting in `all_time_summary`. Two changes:
 
 ---
 
+## Routing Step C, Part 1 (prerequisite) — fence the custom-SQL lane to non-weight aggregates
+
+Step C consolidates reads onto the analytical path, which makes the analytical
+custom-SQL lane the only ad-hoc fallback. Before that consolidation, that lane
+must not become a weight-blend surface. The lane (`coordinator._generate_custom_sql`
+→ `src.data_agent.query` → `fetch.query`) runs LLM-generated SQL and only
+auto-converts `typed_weight = metric_weight * 2.2046` (plates-only, no bar, no
+offset, no per-unit bucketing) — the same blend-prone shape as
+`run_read_only_sql`. Its intended lane is counts / dates / gaps / streaks /
+patterns; weights and volume have authoritative package fields
+(`muscle_group_summary`, `pr` / `pr_period`, `progression`, `e1rm_*`).
+
+Because arbitrary SQL output cannot be reliably unit-typed, `fetch.query` now
+**hard-refuses** generated SQL whose aggregate (`SUM` / `AVG` / `TOTAL` / `MIN` /
+`MAX`) touches `metric_weight` or a volume expression / alias derived from it,
+returning a structured `{"refused": true, "reason": …}` instead of executing.
+Per-row `metric_weight` SELECT (no aggregate) is still allowed and keeps the
+existing plates-only caveat — only cross-row weight **aggregation** is refused.
+Detection is whitespace/casing-robust and covers the common forms
+(`SUM(metric_weight*reps)`, `SUM(metric_weight * 2.2046 * reps)`,
+`AVG(metric_weight)`, and explicit `… AS alias` aggregated downstream); when an
+aggregate's argument touches a weight target it refuses (safe direction).
+
+Belt-and-suspenders on the generation side: the coordinator's custom-SQL prompt
+now explicitly states the lane is counts/dates/gaps/streaks/patterns only and
+must not aggregate weight or compute volume. (The shared `_SQL_SYSTEM` /
+`generate_sql` is left untouched — the operational text-to-SQL pipeline
+legitimately answers weight questions through it.) On refusal,
+`_generate_custom_sql` returns `None`, so the Analysis Agent simply falls back to
+the package's authoritative weight/volume fields — no crash, no silent empty
+result.
+
+Steps C-2 (flip the classifier default toward analytical) and C-3 (strip the
+operational read tools the analytical pipeline no longer needs) are still
+planned.
+
+---
+
 ### Known open gaps (updated)
 
 - **Legs Smith-counterbalance residual** — operational `get_weekly_volume` runs
@@ -1034,9 +1072,10 @@ sitting in `all_time_summary`. Two changes:
 - **`agent_lock` held during a per-minute wait** — the silent retry holds the
   single agent lock for up to ~2×70s, so a concurrent `/chat` gets the existing
   "busy" 429. Acceptable under the single-user assumption; flagged for multi-user.
-- **Routing Step C (planned, NOT done)** — flip the classifier default toward
-  analytical and strip the operational read tools the analytical pipeline no
-  longer needs. Upcoming.
+- **Routing Step C (in progress)** — Part 1 (fence the custom-SQL lane to
+  non-weight aggregates) is **landed** (see above). Part 2 (flip the classifier
+  default toward analytical) and Part 3 (strip the operational read tools the
+  analytical pipeline no longer needs) are still planned.
 - **No token streaming** — answers return whole (non-streaming `_run_collect`);
   long answers have no progressive render.
 - **Research / paper fetcher** (PubMed / RAG) is best-effort and uncached — it can

@@ -936,11 +936,20 @@ class Coordinator:
             schema = build_schema_prompt()
             prompt_question = (
                 f"{question}\n\n"
-                f"Focus: {intent}. Return counts, dates, gaps, or patterns. "
-                f"Do not return individual set weights."
+                f"Focus: {intent}. Custom SQL is for counts, dates, gaps, "
+                f"streaks, and patterns ONLY. Do NOT aggregate weight and do NOT "
+                f"compute volume (no SUM/AVG/MIN/MAX/TOTAL over metric_weight or "
+                f"metric_weight*reps) — weights and volume come from the "
+                f"package's authoritative fields, not from this query. Do not "
+                f"return individual set weights."
             )
             sql = await asyncio.to_thread(generate_sql, prompt_question, schema)
             result = await asyncio.to_thread(run_custom_query, sql)
+            # Refused (weight/volume aggregate) → no custom data; the analysis
+            # falls back to the package's authoritative weight/volume fields.
+            if result.get("refused"):
+                logger.info("[coordinator] custom SQL refused: %s", result.get("reason"))
+                return None
             if result.get("row_count", 0) == 0:
                 return None
             return {

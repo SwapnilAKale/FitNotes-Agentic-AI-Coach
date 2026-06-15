@@ -12,11 +12,76 @@ Public surface:
 import sqlite3
 import json
 import os
+import re
 import logging
+from typing import Optional
 
 from src.shared.sql_executor import run_query as _run_ro_query
 
 logger = logging.getLogger(__name__)
+
+# ── Custom-SQL weight/volume-aggregate guard ────────────────────────────────────
+# The analytical custom-SQL lane is for counts / dates / gaps / streaks /
+# patterns ONLY. Weight and volume have authoritative package fields
+# (muscle_group_summary [bar-inclusive, per-unit], pr / pr_period, progression,
+# e1rm_*). A raw aggregate over metric_weight here is the same blend-prone
+# surface as run_read_only_sql: SUM(metric_weight * reps) adds kg-native rows'
+# kilograms onto lbs, and nothing applies the bar or offset. We cannot unit-type
+# arbitrary SQL output, so we REFUSE cross-row weight aggregation instead of
+# caveating it. Per-row metric_weight SELECT (no aggregate) is still allowed and
+# keeps the existing plates-only caveat.
+_AGG_FUNCS = ("sum", "avg", "total", "min", "max")
+_WEIGHT_AGG_REASON = (
+    "weight/volume aggregates are not available via custom SQL — use the "
+    "package's muscle_group_summary / pr / progression fields"
+)
+
+
+def _paren_arg(s: str, open_idx: int) -> str:
+    """Return the inner text of the parenthesised group whose '(' is at open_idx
+    (depth-matched, so nested parens are handled)."""
+    depth = 0
+    out: list = []
+    for i in range(open_idx, len(s)):
+        ch = s[i]
+        if ch == "(":
+            depth += 1
+            if depth == 1:
+                continue          # skip the opening paren itself
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                break
+        if depth >= 1:
+            out.append(ch)
+    return "".join(out)
+
+
+def _weight_aggregate_reason(sql: str) -> Optional[str]:
+    """
+    Return a refusal reason if the SQL applies an aggregate (SUM / AVG / TOTAL /
+    MIN / MAX) to metric_weight or to a volume expression / alias derived from
+    it; else None. Robust to whitespace/casing and common forms
+    (SUM(metric_weight*reps), SUM(metric_weight * 2.2046 * reps),
+    AVG(metric_weight), and explicit `... AS alias` aggregated downstream).
+    Does not parse SQL perfectly — when an aggregate's argument touches a
+    metric_weight target, it REFUSES (safe direction; the package answers
+    weights).
+    """
+    low = sql.lower()
+
+    # Aggregates can target metric_weight directly OR an alias explicitly bound
+    # to a metric_weight expression ("metric_weight * reps AS vol" → vol). Only
+    # explicit AS aliases are tracked (no false positives on "metric_weight FROM").
+    targets = {"metric_weight"}
+    for m in re.finditer(r"metric_weight\b[^,]*?\bas\s+([a-z_]\w*)", low):
+        targets.add(m.group(1))
+
+    for am in re.finditer(r"\b(?:sum|avg|total|min|max)\s*\(", low):
+        arg = _paren_arg(low, am.end() - 1)   # am.end()-1 points at the '('
+        if any(re.search(rf"\b{re.escape(t)}\b", arg) for t in targets):
+            return _WEIGHT_AGG_REASON
+    return None
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 DB_PATH           = os.environ.get("FITNOTES_DB_PATH",  "data/FitNotes_Backup.fitnotes")
@@ -223,6 +288,14 @@ def query(sql: str) -> dict:
             "row_count": int,
             "warning": str   <-- always present, always read this
         }
+        OR, when the SQL applies an aggregate to a weight/volume expression:
+        {
+            "refused": True, "reason": str,
+            "rows": [], "columns": [], "row_count": 0, "warning": "REFUSED: ..."
+        }
+        Weight/volume aggregates are out of this lane (counts/dates/gaps only);
+        the authoritative weight fields live in the package (muscle_group_summary,
+        pr / pr_period, progression). The caller falls back to those.
 
     WARNING — Raw values returned, no automatic conversions applied:
         metric_weight : stored as kg (FitNotes always divides typed value by 2.2046).
@@ -240,6 +313,19 @@ def query(sql: str) -> dict:
     answer that weights shown are raw logged values before conversion.
     """
     sql = sanitize_sql(sql.strip())
+
+    # Weight/volume-aggregate guard: refuse before executing. Custom SQL stays in
+    # its non-weight lane; weight/volume come from authoritative package fields.
+    refusal = _weight_aggregate_reason(sql)
+    if refusal:
+        return {
+            "refused":   True,
+            "reason":    refusal,
+            "rows":      [],
+            "columns":   [],
+            "row_count": 0,
+            "warning":   f"REFUSED: {refusal}",
+        }
 
     # Execution goes through shared/sql_executor.run_query:
     #   - read-only connection (mode=ro URI) — a write statement that slips
