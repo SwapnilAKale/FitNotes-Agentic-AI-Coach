@@ -30,57 +30,44 @@ logger = logging.getLogger(__name__)
 # arbitrary SQL output, so we REFUSE cross-row weight aggregation instead of
 # caveating it. Per-row metric_weight SELECT (no aggregate) is still allowed and
 # keeps the existing plates-only caveat.
-_AGG_FUNCS = ("sum", "avg", "total", "min", "max")
+# Blend-prone aggregates: each combines/serializes the raw metric_weight values
+# of multiple rows, so it adds kg-native rows' kilograms onto lbs (or, for
+# GROUP_CONCAT, emits a raw mixed-unit list). COUNT is deliberately NOT here — it
+# counts rows and never touches the weight values, so "how many sets + their
+# weights" / "count where metric_weight > 0" stay allowed. (See _weight_aggregate_reason.)
+_BLEND_AGG_RE = re.compile(r"\b(?:sum|avg|total|min|max|group_concat)\s*\(")
 _WEIGHT_AGG_REASON = (
     "weight/volume aggregates are not available via custom SQL — use the "
     "package's muscle_group_summary / pr / progression fields"
 )
 
 
-def _paren_arg(s: str, open_idx: int) -> str:
-    """Return the inner text of the parenthesised group whose '(' is at open_idx
-    (depth-matched, so nested parens are handled)."""
-    depth = 0
-    out: list = []
-    for i in range(open_idx, len(s)):
-        ch = s[i]
-        if ch == "(":
-            depth += 1
-            if depth == 1:
-                continue          # skip the opening paren itself
-        elif ch == ")":
-            depth -= 1
-            if depth == 0:
-                break
-        if depth >= 1:
-            out.append(ch)
-    return "".join(out)
-
-
 def _weight_aggregate_reason(sql: str) -> Optional[str]:
     """
-    Return a refusal reason if the SQL applies an aggregate (SUM / AVG / TOTAL /
-    MIN / MAX) to metric_weight or to a volume expression / alias derived from
-    it; else None. Robust to whitespace/casing and common forms
-    (SUM(metric_weight*reps), SUM(metric_weight * 2.2046 * reps),
-    AVG(metric_weight), and explicit `... AS alias` aggregated downstream).
-    Does not parse SQL perfectly — when an aggregate's argument touches a
-    metric_weight target, it REFUSES (safe direction; the package answers
-    weights).
+    Return a refusal reason if the SQL could aggregate metric_weight across rows
+    (blending kg-native and lbs frames into a meaningless number); else None.
+
+    FINAL RULE (invariant, not surface form): REFUSE iff `metric_weight` appears
+    ANYWHERE in the query AND a blend-prone aggregate — SUM / AVG / TOTAL / MIN /
+    MAX / GROUP_CONCAT — appears ANYWHERE in the query. We do not (and cannot
+    cheaply) fully parse SQL, so we match on the invariant that makes the blend
+    possible: to combine weights you must (a) reference the weight column and
+    (b) feed it to a combining aggregate. This deliberately closes the forms an
+    AS-only alias check missed — e.g. `SELECT SUM(v) FROM (SELECT metric_weight v
+    …)` (alias without AS) and GROUP_CONCAT(metric_weight) — because the literal
+    `metric_weight` still has to appear in the projection that feeds the alias.
+
+    Stays allowed: per-row `SELECT metric_weight … LIMIT n` (no blend aggregate),
+    counts/dates that never mention metric_weight, and COUNT alongside a weight
+    column or filter (COUNT is exempt). Over-refuses only in the safe direction
+    (e.g. SUM(reps) in a query that also touches metric_weight) — the package
+    answers any weight/volume question that gets refused here.
     """
     low = sql.lower()
-
-    # Aggregates can target metric_weight directly OR an alias explicitly bound
-    # to a metric_weight expression ("metric_weight * reps AS vol" → vol). Only
-    # explicit AS aliases are tracked (no false positives on "metric_weight FROM").
-    targets = {"metric_weight"}
-    for m in re.finditer(r"metric_weight\b[^,]*?\bas\s+([a-z_]\w*)", low):
-        targets.add(m.group(1))
-
-    for am in re.finditer(r"\b(?:sum|avg|total|min|max)\s*\(", low):
-        arg = _paren_arg(low, am.end() - 1)   # am.end()-1 points at the '('
-        if any(re.search(rf"\b{re.escape(t)}\b", arg) for t in targets):
-            return _WEIGHT_AGG_REASON
+    if "metric_weight" not in low:
+        return None
+    if _BLEND_AGG_RE.search(low):
+        return _WEIGHT_AGG_REASON
     return None
 
 # ── Paths ──────────────────────────────────────────────────────────────────────

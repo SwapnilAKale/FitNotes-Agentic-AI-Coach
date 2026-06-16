@@ -1072,16 +1072,29 @@ offset, no per-unit bucketing) — the same blend-prone shape as
 patterns; weights and volume have authoritative package fields
 (`muscle_group_summary`, `pr` / `pr_period`, `progression`, `e1rm_*`).
 
-Because arbitrary SQL output cannot be reliably unit-typed, `fetch.query` now
-**hard-refuses** generated SQL whose aggregate (`SUM` / `AVG` / `TOTAL` / `MIN` /
-`MAX`) touches `metric_weight` or a volume expression / alias derived from it,
-returning a structured `{"refused": true, "reason": …}` instead of executing.
-Per-row `metric_weight` SELECT (no aggregate) is still allowed and keeps the
-existing plates-only caveat — only cross-row weight **aggregation** is refused.
-Detection is whitespace/casing-robust and covers the common forms
-(`SUM(metric_weight*reps)`, `SUM(metric_weight * 2.2046 * reps)`,
-`AVG(metric_weight)`, and explicit `… AS alias` aggregated downstream); when an
-aggregate's argument touches a weight target it refuses (safe direction).
+Because arbitrary SQL output cannot be reliably unit-typed, `fetch.query`
+**hard-refuses** weight-aggregating SQL, returning a structured
+`{"refused": true, "reason": …}` instead of executing. The detector matches on
+the **invariant** that makes a blend possible, not on a surface form: it
+**REFUSES iff `metric_weight` appears anywhere in the query AND a blend-prone
+aggregate — `SUM` / `AVG` / `TOTAL` / `MIN` / `MAX` / `GROUP_CONCAT` — appears
+anywhere.** `COUNT` is deliberately exempt (it counts rows, never combines the
+weight values), so "how many sets + their weights" and `COUNT(*) … WHERE
+metric_weight > 0` still pass. Per-row `metric_weight` SELECT (no aggregate) is
+still allowed and keeps the existing plates-only caveat; counts/dates that never
+mention `metric_weight` pass untouched.
+
+> **#4 fix — alias-without-`AS` and `GROUP_CONCAT` bypass closed.** The previous
+> detector tracked only aliases bound with an explicit `AS`, so
+> `SELECT SUM(v) FROM (SELECT metric_weight v FROM training_log) t` (alias *without*
+> `AS`) slipped through and executed to a meaningless blended kg+lbs sum (~155k);
+> `GROUP_CONCAT(metric_weight)` (string-form blend) was unguarded too. The
+> invariant rule closes both: to blend weights the SQL must still name
+> `metric_weight` in the projection that feeds the alias, so "`metric_weight`
+> present + blend aggregate present" catches the no-`AS` form, and `GROUP_CONCAT`
+> is now in the refused set. Over-refusal is only ever in the safe direction
+> (e.g. `SUM(reps)` in a query that also touches `metric_weight`) — the package
+> answers any weight/volume question that gets refused here.
 
 Belt-and-suspenders on the generation side: the coordinator's custom-SQL prompt
 now explicitly states the lane is counts/dates/gaps/streaks/patterns only and

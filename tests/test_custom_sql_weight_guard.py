@@ -35,8 +35,16 @@ from src.data_agent.fetch import _weight_aggregate_reason, query  # noqa: E402
     "SELECT MAX(metric_weight) FROM training_log",
     "SELECT MIN(metric_weight) FROM training_log",
     "SELECT TOTAL(metric_weight * reps) FROM training_log",
-    # aliased: vol is bound to a metric_weight expression then aggregated
+    # aliased WITH AS: vol is bound to a metric_weight expression then aggregated
     "SELECT SUM(vol) FROM (SELECT metric_weight * reps AS vol FROM training_log) t",
+    # #4 fix — alias WITHOUT AS bypass: the projection still names metric_weight,
+    # so the invariant rule (metric_weight + blend aggregate) catches it.
+    "SELECT SUM(v) FROM (SELECT metric_weight v FROM training_log) t",
+    "SELECT AVG(w) FROM (SELECT metric_weight w FROM training_log) t",
+    "SELECT MAX(x) FROM (SELECT metric_weight * reps x FROM training_log) t",
+    # #4 fix — GROUP_CONCAT serializes raw mixed-unit kg+lbs values (string blend)
+    "SELECT GROUP_CONCAT(metric_weight) FROM training_log",
+    "SELECT group_concat(metric_weight, ',') FROM training_log",
 ])
 def test_weight_volume_aggregates_refused(sql):
     assert _weight_aggregate_reason(sql) is not None
@@ -48,9 +56,13 @@ def test_weight_volume_aggregates_refused(sql):
     "SELECT COUNT(*) AS n, date FROM training_log GROUP BY date",
     "SELECT MAX(date) FROM training_log",
     "SELECT date FROM training_log ORDER BY date",                # streak/gap input
-    "SELECT COUNT(*) FROM training_log WHERE metric_weight > 0",  # weight in filter, not aggregate
-    "SELECT date, SUM(reps) FROM training_log GROUP BY date",     # reps aggregate, not weight
+    "SELECT COUNT(*) FROM training_log WHERE metric_weight > 0",  # weight in filter, COUNT exempt
+    "SELECT date, SUM(reps) FROM training_log GROUP BY date",     # reps aggregate, no metric_weight
     "SELECT metric_weight, reps FROM training_log LIMIT 5",       # per-row select (allowed)
+    # COUNT alongside a per-row metric_weight column — granularity decision:
+    # COUNT is exempt (counts rows, never blends weights), so "how many sets +
+    # their weights" still works. Only SUM/AVG/MIN/MAX/TOTAL/GROUP_CONCAT refuse.
+    "SELECT COUNT(*) AS n, metric_weight FROM training_log GROUP BY metric_weight",
 ])
 def test_non_weight_queries_allowed(sql):
     assert _weight_aggregate_reason(sql) is None
@@ -64,6 +76,21 @@ def test_query_refuses_weight_aggregate_structured():
     assert "muscle_group_summary" in out["reason"]
     assert out["rows"] == [] and out["row_count"] == 0
     assert out["warning"].startswith("REFUSED:")
+
+
+def test_query_refuses_alias_without_as_bypass():
+    # #4 regression: this previously executed and returned a blended kg+lbs SUM
+    # (~155k). It must now refuse before running — no rows leak.
+    out = query("SELECT SUM(v) FROM (SELECT metric_weight v FROM training_log) t")
+    assert out["refused"] is True
+    assert out["rows"] == [] and out["row_count"] == 0
+    assert out["warning"].startswith("REFUSED:")
+
+
+def test_query_refuses_group_concat_weight():
+    out = query("SELECT GROUP_CONCAT(metric_weight) FROM training_log")
+    assert out["refused"] is True
+    assert out["rows"] == [] and out["row_count"] == 0
 
 
 def test_query_executes_counts_normally():
