@@ -83,6 +83,43 @@ You receive pre-calculated analytics — your job is to interpret them,
 not recompute them. Every specific number you cite must come from the package.
 
 ════════════════════════════
+CITATION TAGS (mandatory — internal, never shown to the user)
+════════════════════════════
+Every factual claim you make MUST carry an inline citation tag pointing to the
+exact package value it rests on. These tags are INTERNAL verification markers — a
+separate step strips them out before the user sees the answer. Write them exactly
+in the format below; never describe a tag in prose.
+
+FORMAT (exact): [[collection|match-key|field-path]]
+  collection  — the package section the value lives in (e.g. exercises,
+                muscle_group_summary, all_time_summary).
+  match-key   — the row's identifying name EXACTLY as it appears in the package
+                (the exercise name, the muscle-group name). For a top-level
+                section that is a single object, not a list, use a single dash: -
+  field-path  — the dotted path to the leaf (e.g. pr.weight,
+                progression.weight_change_pct, training_frequency.session_count).
+
+Place the tag IMMEDIATELY AFTER the claim's number/assertion. Three kinds of
+claim, three citation targets — ALL must cite, nothing is exempt:
+  1. NUMERIC / FACTUAL — "your PR is 63 lbs"
+       → tag the value leaf:  [[exercises|Barbell Curl|pr.weight]]
+  2. HEDGE / UNCERTAINTY — "only 13 sessions, too few to be sure"
+       → tag the leaf that JUSTIFIES the hedge (the session count, or a
+         correlation block's confidence_label / n leaf):
+         [[exercises|Barbell Curl|training_frequency.session_count]]
+  3. ABSENCE — "no Walking logged"
+       → tag the collection with the ABSENT marker:
+         [[exercises|Walking|ABSENT]]
+A COMPARATIVE or RELATIONAL claim ("A is stronger than B", "X rose while Y fell")
+carries MORE THAN ONE tag — tag BOTH constituent leaves, plus the n /
+confidence_label leaf when you assert the pattern is reliable.
+
+  • Tag every numeric, factual, hedge, and absence claim — no exceptions.
+  • The match-key and field-path must address a value that genuinely exists in
+    the package. Never invent a tag for a value that is not there.
+  • If you cannot cite a claim, do not make the claim.
+
+════════════════════════════
 DATA RULES
 ════════════════════════════
 FIRST PRINCIPLE: Look at what is there, not at what is missing.
@@ -650,5 +687,10 @@ async def run(
     draft   = await analyze(
         package, question, research, memories, conversation_context, custom_query
     )
-    grounded, flagged = await ground_check(draft, package)
+    # Draft now carries internal citation tags (see _ANALYSIS_SYSTEM). Strip them
+    # before grounding so the user never sees a tag — same as the Coordinator's
+    # live path. (This helper is currently unused; the strip keeps it from
+    # becoming a latent tag-leak path if a caller adopts it.)
+    from src.citations import strip_tags
+    grounded, flagged = await ground_check(strip_tags(draft), package)
     return grounded, flagged

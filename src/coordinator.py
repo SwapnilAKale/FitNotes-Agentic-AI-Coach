@@ -45,6 +45,7 @@ from src.data_agent import (
 )
 from src import analysis_agent
 from src import checkpoint as _ckpt
+from src import citations as _cite
 
 # Rate-limit error types: re-raised instead of swallowed so CLI/server
 # countdown UX works for analytical-path quota exhaustion.
@@ -815,6 +816,29 @@ class Coordinator:
             logger.warning("[coordinator] classify failed: %s — defaulting to analytical", e)
             return default
 
+    # ── Stage 1 citation health (log only; never alters answer/grounding) ──────
+
+    def _log_citation_health(self, cited: list) -> None:
+        """
+        Stage-1 verification log: report how the draft's citation tags resolved
+        against the package. Pure observability — does NOT change the answer or
+        grounding (full-package grounding is still the safety net). Surfaces the
+        two silent failure modes loud: a bad match-key (draft invented/altered a
+        name) and a false ABSENT claim.
+        """
+        if not cited:
+            return
+        problems = [c for c in cited if c["status"] in _cite.FLAG_STATUSES]
+        logger.info(
+            "[coordinator] citation health: %d tag(s), %d resolved, %d flagged",
+            len(cited), len(cited) - len(problems), len(problems),
+        )
+        for c in problems:
+            logger.warning(
+                "[coordinator] citation FLAG %s — %s|%s|%s",
+                c["status"], c["collection"], c["match_key"], c["field_path"],
+            )
+
     # ── Analytical pipeline ───────────────────────────────────────────────────
 
     async def _run_analytical(
@@ -1001,7 +1025,7 @@ class Coordinator:
                         self._generate_custom_sql,
                         question, params["custom_sql_intent"],
                     )
-                draft = await self._call_with_per_minute_retry(
+                draft_tagged = await self._call_with_per_minute_retry(
                     analysis_agent.analyze,
                     pkg, scoped_question, research, memories,
                     conversation_context, custom_query,
@@ -1014,6 +1038,15 @@ class Coordinator:
                     )
                     raise _ckpt.QuotaInterrupted(e, _ckpt.msg_draft_interrupted(e))
                 raise
+
+            # ── Stage 1 citation layer (separate verification path) ─────────
+            # The draft now carries inline [[collection|match-key|field]] tags.
+            # Resolve them against the package (verification-only log), then STRIP
+            # so the clean prose is what flows to grounding + checkpoint + the
+            # user. Grounding behaviour is UNCHANGED — it still receives the full
+            # package and the stripped draft (the same prose shape as before).
+            self._log_citation_health(_cite.extract_cited_values(draft_tagged, pkg))
+            draft = _cite.strip_tags(draft_tagged)
 
         # ── Stage: GROUNDING ───────────────────────────────────────────────────
         # POLICY: the user never sees unverified draft text. On interruption
@@ -1054,9 +1087,14 @@ class Coordinator:
                         ),
                     },
                 ]
-                retry_draft = await self._call_with_per_minute_retry(
+                retry_draft_tagged = await self._call_with_per_minute_retry(
                     analysis_agent.analyze,
                     pkg, scoped_question, research, memories, retry_context, custom_query)
+                # Same Stage-1 citation path as the first draft: verify, then
+                # strip before grounding (grounding gets stripped prose).
+                self._log_citation_health(
+                    _cite.extract_cited_values(retry_draft_tagged, pkg))
+                retry_draft = _cite.strip_tags(retry_draft_tagged)
                 answer, flagged2 = await self._call_with_per_minute_retry(
                     analysis_agent.ground_check, retry_draft, pkg)
                 flagged.extend(flagged2)

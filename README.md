@@ -569,6 +569,29 @@ Seven fixes landed; all 73 tests pass.
 
 ## Fixed
 
+**Broad-question latency — citation layer, Stage 1 of 2 (#7, in progress).** A
+broad analytical answer takes ~133s, dominated by the **grounding** stage
+re-sending the full ~415 KB / ~106K-token package a second time (the draft
+already sent it once) to fact-check the draft's numbers — a job that only needs
+the *cited* values, not the whole package. The fix is two-staged:
+
+- **Stage 1 (done):** the Analysis Agent's draft now emits an internal citation
+  tag after every factual claim — `[[collection|match-key|field-path]]` (numeric →
+  the value leaf; hedge → the `n`/`session_count`/`confidence_label` leaf;
+  absence → the `ABSENT` marker). A deterministic, no-LLM citation layer
+  (`src/citations.py`) parses, indexes (the package's `exercises` /
+  `muscle_group_summary` are *lists*, so it builds name→row maps), resolves each
+  tag against the package, and **strips** the tags so the user never sees one.
+  The cleaned (tag-free) prose is what flows to grounding, the checkpoint, and the
+  user. **Grounding is UNCHANGED this stage** — it still receives the full package
+  + the stripped draft (identical prose shape to before), so it remains the safety
+  net while the citation machinery is proven on every real turn (resolution health
+  is logged; a bad match-key or a false `ABSENT` claim flags loud, never silently).
+  **No user-visible change and no grounding behavior change.**
+- **Stage 2 (pending):** switch grounding's input from the full package to the
+  small extracted cited-values payload (`extract_cited_values`, built + tested
+  now) — the actual latency win (~10–40× smaller grounding input).
+
 **Hygiene sweep (#9–#13).** Five independent low-risk cleanups:
 
 - **#9 — one canonical SQL sanitizer (`src/shared/sql_sanitize.py`), em-dash bug
