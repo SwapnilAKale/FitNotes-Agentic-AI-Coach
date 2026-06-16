@@ -159,7 +159,7 @@ Hand-built ReAct loop — no LangChain or LangGraph. Each question: Thought → 
 RAG Pipeline
 Three-stage retrieval: query rewriting (casual English → academic terms) → BM25 + dense hybrid search → cross-encoder reranking (threshold 0.0). A relevance gate filters topically adjacent but irrelevant documents before answer composition. Section-aware chunking splits academic papers on headers first (Introduction, Methods, Results, Discussion, Conclusion) before word-count chunking within sections — conclusion chunks surface directly rather than being buried in 6000-char mixed-content blocks.
 Exercise Session Display
-get_exercise_sessions returns pre-formatted display_sets strings rather than raw weight values. Each string has set number, weights in correct units, inline comments, drop sets merged with →, and warmup labeled. The agent copies these strings verbatim — no arithmetic, no formatting decisions. All unit conversions, bar weights, and quirk offsets are applied at the tool level before returning.
+get_exercise_sessions returns pre-formatted display_sets strings rather than raw weight values. Each string has set number, weights in correct units, inline comments, drop sets merged with →, and warmup labeled. The agent copies these strings verbatim — no arithmetic, no formatting decisions. Unit conversion, **bar weight**, and quirk offsets are applied at the tool level before returning — bar-inclusive (plates + bar + offset), in each session's own unit frame, matching get_exercise_history and the analytical package (see the bar-inclusive display-reads fix below).
 Write Operations
 Two-phase pattern: stage (validate + preview) → CLI confirmation gate → execute (DB write) → verify (read-back). The agent cannot bypass the gate. Write connections are separate from read connections at the SQLite level.
 Long-Term Memory (Option B)
@@ -961,6 +961,38 @@ below). The kg-native rule is now a **single source of truth** in
 `DEADLIFT_KG_SWITCH_DATE`, `is_kg_native`, `kg_native_sql_predicate`,
 `kg_native_volume_case`), imported by `validate.py`, `process.py`, and
 `combined_server.py` — previously three independent copies of the same predicate.
+
+### Bar-inclusive display reads — get_exercise_history + get_exercise_sessions (#6)
+
+The two operational "recent sets" reads both returned **plates-only** weights
+(`metric_weight * 2.2046 + offset`, **no bar**), so barbell/Smith exercises read
+~bar-weight light — e.g. recent Barbell Curl showed **10/20/30 lbs** when the
+bar-inclusive headline is **43/53/63 lbs** (the ~33 lbs date-ranged curl bar by
+2026). This drifted from the analytical package, which is bar-inclusive
+(`pr.weight` = 63.07). `get_exercise_history` was the more visible regression
+once Step C kept it as a primary read, but **`get_exercise_sessions` was also
+plates-only** — it carried an explicit "add the bar" `bar_weight_note` rather
+than adding it. Both are now bar-inclusive.
+
+The fix introduces **one** shared conversion,
+`combined_server._bar_inclusive_weight(ctx, name, date, metric_weight)`
+(`combined_server.py` ~792), that *composes* the analytical-path primitives
+(`process._recover_typed_weight` + `_get_numeric_offset` + date-ranged
+`_get_bar_weight_lbs` + `_is_kg_native`) — the **single source of truth** the
+package and `get_weekly_volume` already use — and returns
+`(headline_weight, unit, plates)`. Both `_get_exercise_history_sync` (~954) and
+`_get_exercise_sessions_sync` (~2374) call it, so they now report identical,
+bar-inclusive numbers in each set's **own unit frame** (kg-native exercises in
+kg, date-ranged for Deadlift; others lbs). No bar/offset/kg rule is re-copied.
+Notes: the `weight` shown is bar-inclusive but the **warmup ratio stays
+plates-based** (the constant bar would otherwise shift which opener counts as a
+warmup — the analytical path also flags warmups on plates), so `plates` rides
+alongside each set for that check only; and `get_exercise_sessions`'
+`bar_weight_note` now says weights are bar-inclusive instead of "add the bar".
+Output shapes are unchanged (a per-row/`session` `unit` is added). Same Smith
+caveat as `get_weekly_volume` (counterbalance reductions not applied), so
+non-Smith barbell sets match the package exactly; Smith sets read very slightly
+high.
 
 ### E2 warmup 0-opener headline-frame fix
 

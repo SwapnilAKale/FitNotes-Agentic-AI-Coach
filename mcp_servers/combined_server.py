@@ -773,6 +773,48 @@ BAR_EXERCISE_NOTES = {
 }
 
 
+# ── Operational display reads: ONE bar-inclusive weight conversion ───────────────
+# get_exercise_history and get_exercise_sessions are user-facing "recent sets"
+# reads. Both must report the SAME headline number as the analytical package
+# (plates + bar + numeric offset, in the set's own unit frame), or barbell/Smith
+# exercises read ~bar-weight light. Rather than re-copy the bar/offset/kg rules,
+# this composes the analytical-path primitives (src/data_agent/process.py) — the
+# same source of truth the package and get_weekly_volume use — into one helper
+# both display reads call.
+from src.data_agent.process import (
+    _get_bar_weight_lbs as _proc_bar_weight_lbs,
+    _get_numeric_offset as _proc_numeric_offset,
+    _is_kg_native       as _proc_is_kg_native,
+    _recover_typed_weight as _proc_recover_typed_weight,
+)
+
+
+def _bar_inclusive_weight(ctx: dict, exercise_name: str, date_str: str,
+                          metric_weight: float):
+    """
+    Convert a raw training_log.metric_weight to the BAR-INCLUSIVE headline weight
+    for a given exercise/date, plus its unit label and the plates-only value.
+
+    Returns (headline_weight, unit, plates) where:
+      plates   = metric_weight * 2.2046 + numeric_offset  (recovers the logged number)
+      bar      = date-ranged bar weight, in the set's own frame (kg-native -> kg)
+      headline = round(plates + bar, 1)
+      unit     = "kg" for kg-native exercises (date-ranged for Deadlift), else "lbs"
+
+    Single source of truth for the operational display reads — identical math to
+    the analytical package's per-set headline (process.py). Smith counterbalance
+    reductions and per-set comment-unit overrides (analytical-only refinements)
+    are NOT applied here, same as get_weekly_volume, so Smith sets may read very
+    slightly high; non-Smith barbell sets match the package exactly.
+    """
+    offset  = _proc_numeric_offset(ctx, exercise_name)
+    plates  = _proc_recover_typed_weight(metric_weight, offset)
+    is_kg   = _proc_is_kg_native(ctx, exercise_name, date_str)
+    bar_lbs = _proc_bar_weight_lbs(ctx, exercise_name, date_str)
+    bar     = bar_lbs / 2.2046 if is_kg else bar_lbs
+    return round(plates + bar, 1), ("kg" if is_kg else "lbs"), plates
+
+
 def _get_bar_weight(exercise_name: str, date_str: str, unit: str) -> float:
     """Return bar weight in the given unit for a given exercise and date. Returns 0 if no bar applies."""
     from datetime import date
@@ -911,23 +953,17 @@ async def _get_personal_record(exercise_name: str) -> str:
 
 def _get_exercise_history_sync(exercise_name: str, days: int = 30) -> str:
     from src.db import get_connection, run_query
+    from src.data_agent.fetch import load_user_context
 
-    _quirk_offset = 0
     try:
-        _ctx_path = os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "user_context.json")
-        with open(_ctx_path, encoding="utf-8") as _f:
-            _ctx = json.load(_f)
-        for _q in _ctx.get("exercise_quirks", []):
-            if _q.get("exercise_name") == exercise_name and "numeric_offset" in _q:
-                _quirk_offset = _q["numeric_offset"]
-                break
+        ctx = load_user_context()
     except Exception:
-        pass
+        ctx = {}
 
     safe_name = exercise_name.replace("'", "''")
     sql = f"""
         SELECT tl.date,
-               tl.metric_weight * 2.2046 AS typed_value,
+               tl.metric_weight AS metric_weight,
                tl.reps
         FROM training_log tl
         JOIN exercise e ON tl.exercise_id = e._id
@@ -939,14 +975,28 @@ def _get_exercise_history_sync(exercise_name: str, days: int = 30) -> str:
     try:
         conn = get_connection(DB_PATH)
         rows = run_query(conn, sql)
-        if _quirk_offset:
-            rows = [{**r, "typed_value": round(r["typed_value"] + _quirk_offset, 1)} for r in rows]
+        # Bar-inclusive headline weight + per-set unit via the shared conversion
+        # (plates + date-ranged bar + offset) — same numbers as get_exercise_sessions
+        # and the analytical package. typed_value is kept as the weight key (shape
+        # stable) but is now bar-inclusive; unit is added per row.
+        out_rows = []
+        for r in rows:
+            w, unit, _plates = _bar_inclusive_weight(
+                ctx, exercise_name, r["date"], r["metric_weight"])
+            out_rows.append({"date": r["date"], "typed_value": w,
+                             "unit": unit, "reps": r["reps"]})
         return json.dumps(
             {
                 "exercise": exercise_name,
                 "days": days,
-                "note": "typed_value is metric_weight * 2.2046 — recovers the original logged number",
-                "rows": rows,
+                "note": (
+                    "typed_value is the BAR-INCLUSIVE headline weight (plates + bar "
+                    "+ numeric offset), reported in each row's own 'unit' "
+                    "(kg-native exercises report kg, all others lbs). Matches "
+                    "get_exercise_sessions and the analytical package — do NOT add "
+                    "the bar again, and never mix kg and lbs rows."
+                ),
+                "rows": out_rows,
             }
         )
     except Exception as exc:
@@ -2372,30 +2422,31 @@ def _get_exercise_sessions_sync(arguments: dict) -> str:
     except Exception as exc:
         return json.dumps({"error": str(exc)})
 
-    session_unit = "kg" if exercise_name in KG_NATIVE else "lbs"
-
-    # Load numeric_offset for this exercise from user_context.json if present
-    _quirk_offset = 0
+    from src.data_agent.fetch import load_user_context
     try:
-        _ctx_path = os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "user_context.json")
-        with open(_ctx_path, encoding="utf-8") as _f:
-            _ctx = json.load(_f)
-        for _q in _ctx.get("exercise_quirks", []):
-            if _q.get("exercise_name") == exercise_name and "numeric_offset" in _q:
-                _quirk_offset = _q["numeric_offset"]
-                break
+        ctx = load_user_context()
     except Exception:
-        pass
+        ctx = {}
 
-    # Group individual rows by date (SQL ORDER BY date DESC preserves recency order)
+    # Group individual rows by date (SQL ORDER BY date DESC preserves recency order).
+    # weight is now BAR-INCLUSIVE (plates + date-ranged bar + offset) via the shared
+    # conversion — same numbers as get_exercise_history and the analytical package.
+    # plates (pre-bar) is kept alongside ONLY for the warmup ratio, which must stay
+    # plates-based (adding the constant bar to both sides of the ratio would change
+    # which opener counts as a warmup); the analytical path also flags warmups on
+    # plates. unit is per-DATE (kg-native is date-ranged for Deadlift), and every
+    # set in a session shares its date, so a session has one well-defined unit.
     sessions_map: dict = {}
     for r in raw_rows:
         d = r["date"]
+        w, unit, plates = _bar_inclusive_weight(ctx, exercise_name, d, r["typed_weight"])
         if d not in sessions_map:
             sessions_map[d] = []
         sessions_map[d].append({
             "set_db_id": r["_id"],                 # training_log._id
-            "weight":    round(r["typed_weight"] * 2.2046 + _quirk_offset, 1),
+            "weight":    w,                        # bar-inclusive headline
+            "plates":    plates,                   # plates-only, for warmup ratio
+            "unit":      unit,
             "reps":      r["reps"],
             "comment":   r["comment"],             # bound by id at fetch time (may be None)
         })
@@ -2404,7 +2455,7 @@ def _get_exercise_sessions_sync(arguments: dict) -> str:
         {
             "date": date,
             "sets": sets,
-            "unit": session_unit,
+            "unit": sets[0]["unit"],               # all sets in a date share the unit
             "max_weight": max(s["weight"] for s in sets),
             "total_sets": len(sets),
         }
@@ -2421,7 +2472,12 @@ def _get_exercise_sessions_sync(arguments: dict) -> str:
         "count": len(sessions),
     }
     if exercise_name in BAR_EXERCISE_NOTES:
-        out["bar_weight_note"] = BAR_EXERCISE_NOTES[exercise_name]
+        # Weights are now bar-inclusive, so the old "add the bar" note would be
+        # wrong/double-counting. Keep the key (shape stable) but state it's included.
+        out["bar_weight_note"] = (
+            "Weights are BAR-INCLUSIVE (plates + bar already added) — do not add "
+            "the bar again."
+        )
 
     if sessions:
         import re as _re_sess
@@ -2437,17 +2493,20 @@ def _get_exercise_sessions_sync(arguments: dict) -> str:
             stripped = _SET_LABEL_RE.sub('', text).strip(' ,.-')
             return stripped or None
 
-        def _build_display_sets(sess_sets):
+        def _build_display_sets(sess_sets, unit):
             if not sess_sets:
                 return []
-            max_weight = max(s["weight"] for s in sess_sets)
+            # Display the bar-inclusive weight, but compute the warmup ratio on
+            # PLATES (pre-bar) so the constant bar doesn't shift which opener is a
+            # warmup — preserves the prior plates-based behavior.
+            max_plates = max(s["plates"] for s in sess_sets)
             groups: dict = {}
             for s in sess_sets:
                 dg = s.get("drop_group")
                 if dg is not None:
                     if dg not in groups:
-                        groups[dg] = {"parts": [], "first_weight": s["weight"]}
-                    part = f"{s['weight']} {session_unit} × {s['reps']} reps"
+                        groups[dg] = {"parts": [], "first_plates": s["plates"]}
+                    part = f"{s['weight']} {unit} × {s['reps']} reps"
                     if s.get("comment"):
                         part += f" ({s['comment'].strip()})"
                     groups[dg]["parts"].append(part)
@@ -2458,9 +2517,9 @@ def _get_exercise_sessions_sync(arguments: dict) -> str:
                 dg = s.get("drop_group")
                 if dg is None:
                     set_num += 1
-                    is_warmup = set_num == 1 and max_weight > 0 and s["weight"] < 0.6 * max_weight
+                    is_warmup = set_num == 1 and max_plates > 0 and s["plates"] < 0.6 * max_plates
                     label = f"Set {set_num} (Warmup)" if is_warmup else f"Set {set_num}"
-                    set_display = f"{s['weight']} {session_unit} × {s['reps']} reps"
+                    set_display = f"{s['weight']} {unit} × {s['reps']} reps"
                     if s.get("comment"):
                         set_display += f" ({s['comment'].strip()})"
                     result.append(f"{label}: {set_display}")
@@ -2468,7 +2527,7 @@ def _get_exercise_sessions_sync(arguments: dict) -> str:
                     seen_groups.add(dg)
                     set_num += 1
                     g = groups[dg]
-                    is_warmup = set_num == 1 and max_weight > 0 and g["first_weight"] < 0.6 * max_weight
+                    is_warmup = set_num == 1 and max_plates > 0 and g["first_plates"] < 0.6 * max_plates
                     label = f"Set {set_num} (Warmup)" if is_warmup else f"Set {set_num}"
                     indent = " " * len(f"{label}: ")
                     joined = f"\n{indent}".join(g["parts"])
@@ -2486,7 +2545,7 @@ def _get_exercise_sessions_sync(arguments: dict) -> str:
                 s["drop_group"] = _parse_set_num(raw_comment)
                 s["comment"] = _strip_set_label(raw_comment)
 
-            session["display_sets"] = _build_display_sets(session["sets"])
+            session["display_sets"] = _build_display_sets(session["sets"], session["unit"])
             del session["sets"]
 
     return json.dumps(out)
