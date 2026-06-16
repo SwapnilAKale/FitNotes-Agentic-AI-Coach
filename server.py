@@ -546,8 +546,21 @@ async def _process_turn(message: str) -> JSONResponse:
                 "type": "confirmation_required",
                 "preview": _state["confirmation_preview"],
             })
-        if result.get("error") and result["error"] != "max_iterations_reached":
-            return JSONResponse(content={"type": "error", "text": result["error"]})
+        # #2: the Coordinator already builds a graceful, user-facing answer for
+        # BOTH the operational fallback (pipeline failure) AND the
+        # DataAgentIntegrityError case. Surface THAT answer — never the raw error
+        # string, which can leak internal invariant IDs ("B3: …") or exception
+        # text to the user. Mirror cli.py, which always prints result['answer'].
+        # Only when there is genuinely no answer do we fall back to a generic
+        # message. The real error is logged server-side.
+        err = result.get("error")
+        if err and err != "max_iterations_reached":
+            print(f"[Server] Turn completed with error (logged, not surfaced): {err}")
+            if not result.get("answer"):
+                return JSONResponse(content={
+                    "type": "error",
+                    "text": "Something went wrong while answering that. Please try again.",
+                })
         return JSONResponse(content={"type": "answer", "text": result.get("answer", ""), "route": result.get("route")})
 
 
@@ -609,8 +622,11 @@ async def _reinitialize_session():
     if session is not None:
         try:
             await session.close()
-        except Exception:
-            pass
+        except Exception as e:
+            # close() shouldn't raise now (owner-task lifecycle fix). If it does,
+            # that's unexpected — log it instead of silently swallowing, but stay
+            # resilient (don't re-raise) so the reload still proceeds.
+            print(f"[Server] Unexpected error closing old session during reinit: {e}")
         session = None
 
     try:

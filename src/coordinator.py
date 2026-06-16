@@ -73,20 +73,122 @@ PER_MINUTE_WAIT_CAP    = 70   # s — cap on ONE wait; bounds the held request e
 PER_MINUTE_MAX_RETRIES = 2    # per stage — 2 waits clear all but pathological bursts before the daily fallback
 PER_MINUTE_BUFFER      = 2    # s added to retryDelay so we retry just AFTER the window resets
 
-# Write-intent guard: questions matching this are routed OPERATIONAL without
-# calling the classifier so a write can never reach the analytical path.
-_WRITE_INTENT_RE = re.compile(
-    r"(?i)"
-    r"(?:"
-    r"\b(?:log|record|add|save|delete|remove|update|change|correct)\b"
-    r".{0,50}"
-    r"\b(?:workout|set|goal|bodyweight|weight|exercise|session|reps?)\b"
-    r"|"
-    r"\bset\s+a?\s*goal\b"
-    r"|"
-    r"\bI\s+did\b.{0,80}\b(?:today|yesterday|this\s+morning|this\s+week)\b"
+# ── Write-intent guard (#3/#8 rework) ─────────────────────────────────────────
+# The pre-guard's job is to catch IMPERATIVE writes (commands to RECORD data) so
+# a write can never reach the analytical path. It must NOT fire on coaching
+# QUESTIONS about writing ("should I add weight to my squat") — post-Step-C those
+# get force-routed into the now-impoverished operational agent and strand as
+# non-answers.
+#
+# PRECEDENCE (stated): a question/modal phrasing ALWAYS wins — if the message
+# looks like a question, the guard does NOT fire, even when it also contains a
+# write verb + a quantity. The reasoning: a missed regex-write still gets caught
+# by the LLM classifier and is gated by the operational confirmation prompt
+# before it can touch the DB, so a false NEGATIVE is recoverable. A false
+# POSITIVE strands a coaching question with no recourse (operational can't
+# answer analytical reads). So when ambiguous between "question about writing"
+# and "command to write", we prefer NOT firing (let the classifier decide).
+
+# Interrogative / modal-coaching phrasing → this is a QUESTION, not a command.
+# Matched anywhere (a polite "..., should I add a set?" is still a question).
+_WRITE_QUESTION_RE = re.compile(
+    r"(?i)(?:"
+    r"\?"                                                       # any question mark
+    r"|\bshould\s+i\b|\bcan\s+i\b|\bcould\s+i\b|\bmay\s+i\b"
+    r"|\bdo\s+i\b|\bwould\s+it\b|\bdo\s+you\s+think\b"
+    r"|\bis\s+it\s+(?:ok|okay|fine|worth|better|good|bad|safe)\b"
+    r"|\bwhen\s+should\b|\bhow\s+(?:much|many|often|do|should|can)\b"
+    r"|^\s*(?:is|are|do|does|did|was|were|will|what|why|when|where|which|who)\b"
     r")"
 )
+
+# Weight×reps / sets×reps / unit shorthand — a strong signal a write is being
+# DICTATED ("bench 100x5", "3 sets", "80kg", "12 reps").
+_WRITE_QUANTITY = (
+    r"(?:"
+    r"\d+\s*[x×]\s*\d+"                              # 100x5, 3x5
+    r"|\d+\s*sets?\b|\d+\s*reps?\b"                  # 3 sets, 12 reps
+    r"|\d+\s*(?:lbs?|kgs?|pounds?|kilos?)\b"         # 100 lbs, 80kg
+    r")"
+)
+
+# Imperative writes that DO fire (only after the question guard says "not a
+# question"). Three forms:
+#   (A) "set a goal" / "set goal …"
+#   (B) write verb + quantity shorthand → bare "log bench 100x5", "record squat
+#       80kg x5", "add 3 sets of deadlift" (the #8 false-negatives)
+#   (C) write verb + an explicit data noun → "delete my deadlift goal",
+#       "log today's workout", "update my last set"
+#   (D) "I did … today/yesterday/…" narration of a completed session
+# NOTE: standalone "weight" is deliberately NOT a (C) noun — "add weight" is the
+# canonical coaching phrasing ("should I add weight"), so it must not anchor a write.
+_WRITE_IMPERATIVE_RE = re.compile(
+    r"(?i)(?:"
+    r"\bset\s+(?:a\s+|an\s+|my\s+|the\s+)?goal\b"                          # (A)
+    r"|\b(?:log|record|save|add|delete|remove|update|change|correct)\b"
+    r".{0,40}?" + _WRITE_QUANTITY +                                        # (B)
+    r"|\b(?:log|record|save|add|delete|remove|update|change|correct)\b"
+    r".{0,50}\b(?:workout|sets?|reps?|goal|bodyweight|exercise|session)\b" # (C)
+    r"|\bi\s+did\b.{0,80}\b(?:today|yesterday|this\s+morning|this\s+week)\b"  # (D)
+    r")"
+)
+
+
+def _is_write_intent(message: str) -> bool:
+    """
+    True only for IMPERATIVE writes (commands to record data). Question/modal
+    phrasing wins (precedence above): if the message reads as a question, return
+    False so the classifier — not this pre-guard — decides the route.
+    """
+    if not message:
+        return False
+    if _WRITE_QUESTION_RE.search(message):
+        return False
+    return bool(_WRITE_IMPERATIVE_RE.search(message))
+
+
+# ── Filler short-circuit (#5a) ────────────────────────────────────────────────
+# Bare greetings / acknowledgments / thanks must NOT spend a classify call, a
+# package build, or an analytical/operational turn. A small, conservative,
+# exact-match set (after stripping surrounding punctuation/whitespace) returns a
+# cheap canned reply. Anything with real content fails the exact match and falls
+# through to normal routing — so "thanks, now how's my squat" is NOT a filler.
+_FILLER_THANKS = frozenset({
+    "thanks", "thank you", "thank u", "thx", "ty", "tysm", "thanks so much",
+    "thank you so much", "cheers", "appreciate it", "much appreciated",
+})
+_FILLER_OTHER = frozenset({
+    "hi", "hello", "hey", "yo", "hiya", "heya", "hey there", "hi there",
+    "hello there", "good morning", "good evening", "good afternoon",
+    "ok", "okay", "k", "kk", "cool", "nice", "got it", "gotcha", "sure",
+    "yes", "yep", "yeah", "yup", "no", "nope", "great", "awesome", "perfect",
+    "sounds good", "sweet", "alright", "fine", "ok thanks", "okay thanks",
+})
+
+_FILLER_THANKS_REPLY = (
+    "You're welcome! Anything else about your training I can help with?"
+)
+_FILLER_GENERIC_REPLY = "What can I help you with about your training?"
+
+
+def _filler_reply(message: str) -> Optional[str]:
+    """
+    Canned reply for a bare filler message, or None if the message has real
+    content and should route normally. Conservative: exact match against a
+    small curated set after normalizing surrounding punctuation/whitespace,
+    length-gated so only short fillers qualify.
+    """
+    norm = re.sub(r"\s+", " ", message.strip().lower()).strip(" !.,…?")
+    if not norm:
+        # Empty / whitespace-only — cheap generic, no pipeline.
+        return _FILLER_GENERIC_REPLY
+    if len(norm) > 20:
+        return None
+    if norm in _FILLER_THANKS:
+        return _FILLER_THANKS_REPLY
+    if norm in _FILLER_OTHER:
+        return _FILLER_GENERIC_REPLY
+    return None
 
 
 def _is_rate_limit(exc: Exception) -> bool:
@@ -355,9 +457,18 @@ class Coordinator:
         completed_stage='classify' can re-enter here directly (re-running the
         cheap classify call) without re-triggering checkpoint logic.
         """
+        # ── 0b. Filler short-circuit (#5a) ───────────────────────────────────
+        # Bare greeting / ack / thanks / empty-ish → cheap canned reply, NO
+        # classify call, NO package, NO analytical/operational pipeline. Runs
+        # BEFORE classification. Conservative: anything with real content (incl.
+        # a question behind a polite prefix) falls through to normal routing.
+        filler = _filler_reply(question)
+        if filler is not None:
+            return self._filler_response(filler)
+
         # ── 1. Classify (or short-circuit for obvious write operations) ──────
         # Misrouting a write to analytical bypasses the confirmation gate.
-        if _WRITE_INTENT_RE.search(question):
+        if _is_write_intent(question):
             params = {
                 "route":             "operational",
                 "exercise_names":    None,
@@ -382,6 +493,17 @@ class Coordinator:
                     )
                     raise _ckpt.QuotaInterrupted(e, _ckpt.msg_draft_interrupted(e))
                 raise
+
+        # ── 1b. Parse-failure cheap default (#5b) ────────────────────────────
+        # If _classify could not PARSE the model output (vs. parsed-but-uncertain,
+        # which Step C correctly defaults analytical), the input is effectively
+        # garbage — do NOT build a ~358KB package and run analyze+ground on it
+        # (a bare "ok" would have the classifier invent muscle_groups=['Legs']).
+        # Return a cheap rephrase prompt instead. This ONLY changes the
+        # unparseable/errored case; parsed-but-uncertain still goes analytical.
+        if params.get("_parse_failed"):
+            return self._unparseable_response()
+
         route  = params.get("route", "analytical")
 
         # ── Out-of-scope: refuse at classification time. No package build, no
@@ -495,6 +617,31 @@ class Coordinator:
             "error":          None,
         }
 
+    def _filler_response(self, text: str) -> dict:
+        """
+        Bare-filler reply (#5a). No classify, package, or pipeline was run — this
+        is the entire cost of a greeting/ack turn. Not recorded in history.
+        """
+        return {
+            "answer":         text,
+            "route":          "filler",
+            "flagged_claims": [],
+            "error":          None,
+        }
+
+    def _unparseable_response(self) -> dict:
+        """
+        Cheap default for input the classifier could not PARSE (#5b). Avoids
+        building a large package + analyze/ground on garbage; asks to rephrase.
+        Not recorded in history.
+        """
+        return {
+            "answer":         "I didn't catch that — could you rephrase?",
+            "route":          "unparseable",
+            "flagged_claims": [],
+            "error":          None,
+        }
+
     def _confirm_response(self, text: str) -> dict:
         """
         Transient control-flow reply (the discard-confirmation prompt).
@@ -603,6 +750,10 @@ class Coordinator:
             "query_period_days":  90,
             "needs_custom_sql":   False,
             "custom_sql_intent":  None,
+            # Marks an UNPARSEABLE/errored classify (vs. parsed-but-uncertain).
+            # The caller (#5b) returns a cheap rephrase instead of running the
+            # full analytical pipeline on garbage input.
+            "_parse_failed":      True,
         }
         # Follow-up questions ("what about my squat?") are unclassifiable
         # without the previous turn — give the classifier a compact window.

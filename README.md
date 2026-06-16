@@ -569,6 +569,44 @@ Seven fixes landed; all 73 tests pass.
 
 ## Fixed
 
+**Routing / server-response cluster (#2, #3+#8, #5).** Four post-Step-C
+regressions in the routing front door and the `/chat` response path, fixed
+together:
+
+- **#2 — `/chat` surfaces the coordinator's graceful answer, not the raw error.**
+  The handler discarded the friendly text the Coordinator had already built (for
+  both the operational pipeline-failure fallback and the `DataAgentIntegrityError`
+  case) and returned `result["error"]` verbatim — leaking internal invariant IDs
+  like `B3: …` to the user. `/chat` now mirrors `cli.py`: it returns the answer
+  whenever one exists, logs the real error server-side, and only falls back to a
+  generic "Something went wrong" when there is genuinely no answer. Relatedly,
+  `_reinitialize_session` now **logs** an unexpected `close()` failure instead of
+  `except Exception: pass` (close shouldn't raise after the owner-task lifecycle
+  fix, so a raise is worth surfacing — without breaking the reload).
+- **#3 + #8 — the write-intent pre-guard reworked, both directions.** The old
+  noun-list regex both over- and under-fired post-consolidation. It now (a) does
+  **not** fire on coaching QUESTIONS about writing — "should I add weight to my
+  squat", "can I add a set", "is it ok to remove a set", "when should I update my
+  goal" — which were being force-routed into the now-impoverished operational
+  agent and stranding as non-answers (#3); and (b) **does** fire on bare
+  imperative writes the old regex missed — "log my bench 100x5", "record squat
+  80kg x5", "add 3 sets of deadlift" — via weight×reps / sets×reps / unit
+  shorthand recognition (#8). **Precedence:** question/modal phrasing always
+  wins — when a message is ambiguous between "question about writing" and
+  "command to write", the guard does **not** fire and lets the classifier decide.
+  A missed write is still caught by the classifier and blocked by the operational
+  confirmation gate (recoverable); a false-positive strands a coaching question
+  (no recourse).
+- **#5 — trivial input no longer hits the expensive analytical pipeline.** Two
+  cheap short-circuits run in `route()` before classification: (a) a **filler**
+  guard returns a canned reply for bare greetings/acks/thanks ("hi", "ok",
+  "thanks", "cool", …) with no classify call, no package build, and no pipeline;
+  (b) an **unparseable-classify** guard returns "I didn't catch that — could you
+  rephrase?" instead of building a ~358 KB package and running analyze+ground on
+  garbage (a bare "ok" would otherwise have the classifier invent
+  `muscle_groups=['Legs']`). The Step-C "parsed-but-uncertain → analytical"
+  default is unchanged; only the unparseable/errored case is short-circuited.
+
 **Custom SQL execution is now actually read-only.**
 The docs (and a commit message) claimed `data_agent.query()` had been
 refactored onto `shared/sql_executor`. The code never was — LLM-generated SQL

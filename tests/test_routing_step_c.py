@@ -105,8 +105,13 @@ def test_classify_exception_defaults_analytical(coord):
     "am I making progress",           # trend
 ])
 def test_ambiguous_reads_route_analytical_under_flip(coord, monkeypatch, q):
-    # A low-confidence/parse-fail classifier on a read → analytical end-to-end.
-    coord._client = _client_returning("not parseable")
+    # A parsed-but-uncertain classifier on a read → analytical end-to-end.
+    # (An UNPARSEABLE classify is now the #5b cheap-rephrase path, tested
+    # separately — Step C's "parsed → analytical" default is what this asserts.)
+    coord._client = _client_returning(
+        '{"route":"analytical","exercise_names":null,"muscle_groups":null,'
+        '"query_period_days":90,"needs_custom_sql":false,"custom_sql_intent":null}'
+    )
     seen = _spy_downstream(coord, monkeypatch)
     result = asyncio.run(coord.route(q))
     assert result["route"] == "analytical"
