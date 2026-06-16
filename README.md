@@ -169,6 +169,8 @@ PDF articles stored in data/user_articles/ and chunked into ChromaDB using secti
 MCP (Model Context Protocol)
 All tools exposed via a single combined_server.py subprocess. Single server avoids Windows IOCP deadlock from multiple concurrent stdio sessions. Sentence-transformers pre-loaded in main thread before server.run() to avoid OpenMP deadlock.
 
+MCP session lifecycle (owner-task model): the stdio_client / ClientSession async context managers are entered AND exited inside a single long-lived owner task (`AgentSession._session_owner`). `initialize()` spawns that task and waits on a ready event; `close()` only sets a stop event and awaits the owner task, so teardown always runs in the task that entered the contexts. This fixes a cross-task teardown bug: `initialize()` used to run in a fire-and-forget background task that finished immediately, and `_exit_stack.aclose()` was later called from other tasks (shutdown, reload, upload) — anyio forbids exiting a cancel scope in a different task, so `aclose()` raised "Attempted to exit cancel scope in a different task" (swallowed), aborting teardown and risking an orphaned combined_server subprocess on every reload/upload/shutdown. The owner-task model removes the error entirely; the dead in-place `AgentSession.reload_db()` was retired so `close()` is the one teardown path (the server reloads by closing the old session and starting a fresh one).
+
 Multi-Agent System (multi-agent branch)
 Architecture overview
 User question

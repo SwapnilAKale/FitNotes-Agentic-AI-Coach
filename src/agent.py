@@ -4,7 +4,6 @@ import logging
 import os
 import re
 import sys
-from contextlib import AsyncExitStack
 from datetime import date as _date, datetime as _datetime
 from pathlib import Path
 
@@ -263,7 +262,17 @@ class AgentSession:
         self._session: ClientSession | None = None
         self._client: genai.Client | None = None
         self._all_tools: list[dict] | None = None
-        self._exit_stack = AsyncExitStack()
+        # MCP session lifecycle is owned by a single long-lived task
+        # (_session_owner): the stdio_client / ClientSession async context
+        # managers are ENTERED and EXITED in that one task, because anyio's
+        # stdio_client cancel scope must be exited in the task that entered it.
+        # close() merely signals _stop_event and awaits the owner task — it
+        # never calls aclose() cross-task (the old bug that orphaned the
+        # combined_server subprocess on every reload/upload/shutdown).
+        self._owner_task: asyncio.Task | None = None
+        self._stop_event: asyncio.Event | None = None
+        self._ready_event: asyncio.Event | None = None
+        self._owner_error: Exception | None = None
         self._initialized = False
         self._conversation_history: list = []  # list of exchanges; each exchange = list of message dicts
         self._context_messages: list[dict] = []  # pinned user-context pair, prepended to every call
@@ -311,27 +320,21 @@ class AgentSession:
             args=[str(SERVERS_DIR / "combined_server.py")],
             env=server_env,
         )
-        streams = await self._exit_stack.enter_async_context(
-            stdio_client(params)
-        )
-        self._session = await self._exit_stack.enter_async_context(
-            ClientSession(*streams)
-        )
-        await self._session.initialize()
 
-        tools = (await self._session.list_tools()).tools
-
-        self._all_tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": tool.name,
-                    "description": tool.description,
-                    "parameters": tool.inputSchema,
-                },
-            }
-            for tool in tools
-        ]
+        # Spawn the single owner task that holds the MCP session open, then block
+        # here until it has either become ready or failed. The owner task enters
+        # AND exits stdio_client/ClientSession itself (anyio-legal); this task
+        # only waits on a signal. The session is usable from any task once ready.
+        self._stop_event   = asyncio.Event()
+        self._ready_event  = asyncio.Event()
+        self._owner_error  = None
+        self._owner_task   = asyncio.create_task(self._session_owner(params))
+        await self._ready_event.wait()
+        if self._owner_error is not None:
+            # Owner failed to bring up the session — surface the original error.
+            err = self._owner_error
+            self._owner_task = None
+            raise err
 
         user_context_path = os.path.join(os.path.dirname(abs_db_path), "user_context.json")
         ctx = load_user_context(user_context_path)
@@ -354,6 +357,48 @@ class AgentSession:
         self._effective_system_prompt = self._base_system_prompt
         self._gemini_tools = self._build_gemini_tools(self._all_tools)
         await self._setup_cache()
+
+    async def _session_owner(self, params: "StdioServerParameters") -> None:
+        """
+        Long-lived owner of the MCP session. Enters stdio_client + ClientSession,
+        publishes the session, then parks on _stop_event. Both context managers
+        exit HERE — in this same task — so anyio's stdio_client cancel scope is
+        always exited in the task that entered it, and the combined_server child
+        process is actually terminated (never orphaned).
+
+        On any startup failure the error is recorded and _ready_event is set so
+        initialize() unblocks and re-raises it. _stop_event set before/at startup
+        is handled: the park-wait returns immediately and the contexts unwind
+        cleanly without leaving a half-entered session.
+        """
+        try:
+            async with stdio_client(params) as streams:
+                async with ClientSession(*streams) as session:
+                    await session.initialize()
+                    tools = (await session.list_tools()).tools
+                    self._all_tools = [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": tool.name,
+                                "description": tool.description,
+                                "parameters": tool.inputSchema,
+                            },
+                        }
+                        for tool in tools
+                    ]
+                    self._session = session
+                    self._ready_event.set()      # init complete — unblock initialize()
+                    await self._stop_event.wait()  # park until close() signals stop
+            # Both `async with` blocks exit here, in this task — anyio-legal.
+        except Exception as e:
+            # Startup (or teardown) failure: record so initialize() can re-raise,
+            # and make sure initialize() is never left awaiting _ready_event.
+            self._owner_error = e
+            if self._ready_event is not None and not self._ready_event.is_set():
+                self._ready_event.set()
+        finally:
+            self._session = None
 
     # ------------------------------------------------------------------ #
     #  Schema conversion helpers                                           #
@@ -1142,47 +1187,14 @@ class AgentSession:
         except Exception:
             pass  # Never block shutdown on memory failure
 
-    async def reload_db(self) -> None:
-        if self._memory_only:
-            return
-        self.db_path = str(Path(__file__).parent.parent / "data" / "FitNotes_Backup.fitnotes")
-        # Close the existing MCP subprocess cleanly, then reopen with the updated path.
-        await self._exit_stack.aclose()
-        self._exit_stack = AsyncExitStack()
-        abs_db_path = os.path.abspath(self.db_path)
-        abs_chroma_path = os.path.abspath(
-            os.environ.get("CHROMA_DB_PATH", "./data/chroma_db")
-        )
-        server_env = {
-            **os.environ,
-            "FITNOTES_DB_PATH": abs_db_path,
-            "CHROMA_DB_PATH": abs_chroma_path,
-            "PYTHONIOENCODING": "utf-8",
-        }
-        params = StdioServerParameters(
-            command=sys.executable,
-            args=[str(SERVERS_DIR / "combined_server.py")],
-            env=server_env,
-        )
-        streams = await self._exit_stack.enter_async_context(stdio_client(params))
-        self._session = await self._exit_stack.enter_async_context(
-            ClientSession(*streams)
-        )
-        await self._session.initialize()
-        tools = (await self._session.list_tools()).tools
-        self._all_tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": tool.name,
-                    "description": tool.description,
-                    "parameters": tool.inputSchema,
-                },
-            }
-            for tool in tools
-        ]
-
     async def close(self) -> None:
+        """
+        Stop the MCP session. Teardown happens in the owner task (which entered
+        the contexts), so stdio_client's cancel scope is exited in-task and the
+        combined_server child process is terminated, not orphaned. Idempotent:
+        a second call is a no-op once the owner task is gone. The server creates
+        a fresh AgentSession to reload — there is no in-place reopen.
+        """
         try:
             await self._auto_extract_memories()
         except Exception:
@@ -1194,4 +1206,14 @@ class AgentSession:
             except Exception:
                 pass
             self._cache_name = None
-        await self._exit_stack.aclose()
+        # Signal the owner task to unwind, then wait for it to finish so the old
+        # subprocess is gone before the caller spawns a replacement.
+        if self._owner_task is not None:
+            if self._stop_event is not None:
+                self._stop_event.set()
+            try:
+                await self._owner_task
+            except Exception as e:
+                logger.warning("[agent] MCP owner task ended with error: %s", e)
+            self._owner_task = None
+            self._session = None

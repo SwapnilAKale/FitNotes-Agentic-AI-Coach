@@ -375,8 +375,11 @@ async def lifespan(app: FastAPI):
     if session is not None:
         try:
             await session.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            # close() now tears down in the owner task, so the old cross-task
+            # "exit cancel scope in a different task" error should no longer fire.
+            # If something still does, surface it instead of hiding it.
+            print(f"[Server] Error during agent shutdown: {exc}", file=sys.stderr)
 
 
 app = FastAPI(lifespan=lifespan)
