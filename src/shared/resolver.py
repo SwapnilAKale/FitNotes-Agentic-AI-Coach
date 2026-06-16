@@ -33,7 +33,26 @@ def _connect(db_path: str) -> sqlite3.Connection:
     return conn
 
 
+def _like_escape(term: str) -> str:
+    """
+    Escape LIKE metacharacters so a literal term matches literally. In SQL LIKE,
+    '%' and '_' are wildcards; an un-escaped '_' in a term ("Wrist_Curl") would
+    match any character. Escaped with a backslash; the LIKE clauses pass
+    ESCAPE '\\'. Backslash itself is escaped first so it can be the escape char.
+    """
+    return term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def _resolve(query: str, conn: sqlite3.Connection) -> dict:
+    # Input guard: empty / whitespace-only / too-short (after strip) is NOT a
+    # disambiguation case — it's "no exercise specified". Return a clean no-match
+    # BEFORE any broad LIKE match. Without this, "" survived to Tier 2 as
+    # LIKE '%%', matched everything, and dumped 8 arbitrary candidates — the user
+    # saw "multiple exercises matching ****". The caller treats
+    # {match: None, candidates: []} as no-exercise, not a clarify prompt.
+    if len((query or "").strip()) < 2:
+        return {"match": None, "candidates": []}
+
     # Tier 0: space-normalized exact match — handles compound word variations
     # ("skullcrusher" → "skull crusher", "lateralraise" → "lateral raise", etc.)
     user_term_nospace = query.lower().replace(" ", "")
@@ -74,10 +93,10 @@ def _resolve(query: str, conn: sqlite3.Connection) -> dict:
             )
         ]
 
-    # Tier 2: partial LIKE match
+    # Tier 2: partial LIKE match (term escaped so % / _ match literally)
     cursor = conn.execute(
-        "SELECT name FROM exercise WHERE LOWER(name) LIKE LOWER(?) ORDER BY name LIMIT 8",
-        (f"%{query}%",),
+        "SELECT name FROM exercise WHERE LOWER(name) LIKE LOWER(?) ESCAPE '\\' ORDER BY name LIMIT 8",
+        (f"%{_like_escape(query)}%",),
     )
     candidates = _filter_by_token([r["name"] for r in cursor.fetchall()])
     if candidates:
@@ -108,8 +127,8 @@ def _resolve(query: str, conn: sqlite3.Connection) -> dict:
         words_lower = [w.lower() for w in words]
         min_word_matches = min(2, len(words_lower))
         if words:
-            placeholders = " OR ".join(["LOWER(name) LIKE LOWER(?)"] * len(words))
-            params = tuple(f"%{w}%" for w in words)
+            placeholders = " OR ".join(["LOWER(name) LIKE LOWER(?) ESCAPE '\\'"] * len(words))
+            params = tuple(f"%{_like_escape(w)}%" for w in words)
             cursor = conn.execute(
                 f"SELECT DISTINCT name FROM exercise WHERE {placeholders} ORDER BY name LIMIT 8",
                 params,

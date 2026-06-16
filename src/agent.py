@@ -124,9 +124,6 @@ answers the question:
   verify_set_updated — after execute_staged_set_update
   verify_set_deleted — after execute_staged_set_delete (verified: false = success)
 
-📖 USER KNOWLEDGE BASE:
-  list_user_articles — list PDF articles the user has added to the knowledge base
-
 🧠 MEMORY:
   remember_fact — store a user preference, personal fact, or training convention
   recall_memories — retrieve stored facts relevant to a question

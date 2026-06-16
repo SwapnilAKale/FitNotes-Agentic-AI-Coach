@@ -2,14 +2,9 @@ import sqlite3
 import threading
 from typing import Any
 
-
-def sanitize_sql(sql: str) -> str:
-    """Replace smart/curly quotes with straight quotes to prevent SQL errors."""
-    return (sql
-        .replace('‘', "'").replace('’', "'")  # curly single quotes
-        .replace('“', '"').replace('”', '"')  # curly double quotes
-        .replace('—', '--')  # em dash
-    )
+# Single canonical SQL text-sanitizer (one source of truth). Re-exported here so
+# the public `src.db.sanitize_sql` name keeps working for existing callers.
+from src.shared.sql_sanitize import sanitize_sql
 
 
 def get_connection(db_path: str) -> sqlite3.Connection:

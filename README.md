@@ -292,7 +292,7 @@ Answer judge: 8/8 (100%) where judge quota was available
 
 Future Work
 Multi-Agent System (actively in progress on multi-agent branch)
-Analysis Agent — receives prepare_analysis_package() output, reasons over complete dataset with thinking_budget=4096. Answers questions the single agent can never answer: complete plateau analysis across all 51 exercises, overtraining signal detection, progressive overload quality assessment, pattern detection across muscle groups.
+Analysis Agent — receives prepare_analysis_package() output, reasons over complete dataset with thinking_budget=4096. Answers questions the single agent can never answer: complete plateau analysis across all 67 exercises, overtraining signal detection, progressive overload quality assessment, pattern detection across muscle groups.
 prepare_analysis_package() — wrapper over collect() that strips raw set arrays and returns compact analysis-ready summaries. Target size: 100-300 KB for any question, regardless of database size.
 Coordinator routing logic — single LLM call: is this analytical (multi-agent pipeline) or simple lookup (single-agent tools)? Wire into FastAPI /analyze endpoint.
 End-to-end testing — stress test the full Data Agent → Analysis Agent → Coordinator pipeline. Git commit on multi-agent branch after full verification.
@@ -427,7 +427,7 @@ summary counts instead of period-specific progression data.
 **The name resolver should be the first thing wired into any new data pipeline.**
 A single case mismatch ("walking" vs "Walking") caused the classifier to pass an
 unmatched exercise name to the Data Agent. The filter silently fell back to all
-50 exercises, the package was built for the wrong scope, and the Analysis Agent
+67 exercises, the package was built for the wrong scope, and the Analysis Agent
 produced wrong answers. Hours of debugging the Analysis Agent's "understanding"
 of cardio data. The resolver already existed and solved the problem in one step.
 Wire it early, not as an afterthought.
@@ -568,6 +568,41 @@ analysis agent → grounding → coverage) against the documented behaviour.
 Seven fixes landed; all 73 tests pass.
 
 ## Fixed
+
+**Hygiene sweep (#9–#13).** Five independent low-risk cleanups:
+
+- **#9 — one canonical SQL sanitizer (`src/shared/sql_sanitize.py`), em-dash bug
+  fixed.** Three copies had drifted (`src.db.sanitize_sql`,
+  `sql_executor._sanitize_sql`, `fetch.sanitize_sql`); two of them converted an
+  em-dash `—` into `--`, a SQL **line comment** that silently truncated the rest
+  of the query (including any injected `LIMIT`). All three now delegate to one
+  canonical sanitizer that does the union of the legitimate behaviors (curly/smart
+  quotes `' ' ‚ ‛ " "` → straight) and replaces `—` with a **space**, never `--`.
+  Only the *text normalization* is shared; the SELECT/WITH guard, LIMIT/row-cap
+  injection, and the analytical weight-aggregate fence stay intentionally
+  separate (they're policy, not text cleanup).
+- **#10 — dead code removed.** Deleted `src/answer.py`, `src/router.py`,
+  `mcp_servers/fitnotes_server.py`, `mcp_servers/knowledge_server.py`, and
+  `scripts/test_stage2.py`. Each was confirmed unreferenced (the two old servers
+  were replaced by `combined_server.py`; the only importers of `answer`/`router`
+  were the dead files themselves — dead-importing-dead). `combined_server.py` is
+  the only server `agent.py` launches.
+- **#11 — duplicate knowledge-base prompt block merged.** The operational
+  `SYSTEM_PROMPT` had two near-identical headers ("USER KNOWLEDGE BASE" listing
+  only `list_user_articles`, and "KNOWLEDGE BASE" listing both
+  `list_user_articles` + `delete_user_article`). Merged to the single complete
+  block; verified against the live 31-tool exposed list that both named tools
+  exist and are exposed.
+- **#12 — exercise-count doc drift corrected.** Prose said "all 51 / 50
+  exercises"; the live DB has **67** distinct exercises with logged sets (136
+  total exercise rows). Corrected the four trained/analyzed-exercise instances
+  (README ×2, lessons.md ×2) to 67.
+- **#13 — `resolve_exercise_name` input guards.** Empty / whitespace-only /
+  too-short (< 2 chars after strip) input now returns a clean no-match
+  (`{match: None, candidates: []}`) **before** any broad match, instead of `""`
+  surviving to a `LIKE '%%'` that dumped 8 arbitrary candidates ("multiple
+  exercises matching \*\*\*\*"). LIKE metacharacters `%` and `_` in a term are
+  escaped (`ESCAPE '\'`) so a literal term matches literally.
 
 **Routing / server-response cluster (#2, #3+#8, #5).** Four post-Step-C
 regressions in the routing front door and the `/chat` response path, fixed

@@ -2,14 +2,10 @@ import re
 import sqlite3
 import threading
 
-
-def _sanitize_sql(sql: str) -> str:
-    """Replace smart/curly quotes and em-dashes to prevent SQL errors."""
-    return (sql
-        .replace('‘', "'").replace('’', "'")  # curly single quotes
-        .replace('“', '"').replace('”', '"')  # curly double quotes
-        .replace('—', '--')                        # em dash
-    )
+# Single canonical SQL text-sanitizer (one source of truth) — replaces the local
+# copy whose '—' -> '--' turned an em-dash into a SQL line comment (truncating
+# the query and any injected LIMIT). See src/shared/sql_sanitize.py.
+from src.shared.sql_sanitize import sanitize_sql as _sanitize_sql
 
 
 def run_query(sql: str, db_path: str) -> list[dict]:

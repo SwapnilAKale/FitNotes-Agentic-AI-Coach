@@ -17,6 +17,12 @@ import logging
 from typing import Optional
 
 from src.shared.sql_executor import run_query as _run_ro_query
+# Single canonical SQL text-sanitizer (one source of truth). Imported (not
+# redefined) and re-exported so `from src.data_agent import sanitize_sql` and the
+# call below keep working. NOTE: the analytical weight-aggregate FENCE
+# (_weight_aggregate_reason) stays separate from sanitizing — it is a policy
+# guard, not text cleanup.
+from src.shared.sql_sanitize import sanitize_sql
 
 logger = logging.getLogger(__name__)
 
@@ -241,17 +247,6 @@ def fetch_data(end_str: str) -> dict:
 
 
 # ── Dynamic SQL fallback ───────────────────────────────────────────────────────
-
-def sanitize_sql(sql: str) -> str:
-    """
-    Replace Unicode curly quotes with straight quotes before execution.
-    LLM-generated SQL frequently contains curly quotes which cause OperationalError.
-    """
-    return (sql
-            .replace("‘", "'").replace("’", "'")
-            .replace("“", '"').replace("”", '"')
-            .replace("‚", "'").replace("‛", "'"))
-
 
 def query(sql: str) -> dict:
     """
