@@ -11,7 +11,6 @@ Two functions:
   analyze()      — one Gemini call, thinking_budget=4096, returns draft
   ground_check() — separate Gemini call, verifies every claim in the
                    draft against the package, edits directly
-  run()          — chains both, returns (grounded_answer, flagged_claims)
 
 The draft goes to ground_check() before the Coordinator's coverage check.
 """
@@ -24,6 +23,8 @@ from typing import Optional
 
 from google import genai
 from google.genai import types
+
+from src.citations import build_citable_schema
 
 logger = logging.getLogger(__name__)
 
@@ -99,25 +100,62 @@ FORMAT (exact): [[collection|match-key|field-path]]
   field-path  — the dotted path to the leaf (e.g. pr.weight,
                 progression.weight_change_pct, training_frequency.session_count).
 
+ONLY CITE LISTED LEAVES: a [CITABLE SCHEMA] block is provided with the package.
+It lists the EXACT field-path leaves that exist for THIS question. You may cite
+ONLY a leaf that appears in that block — never guess or invent a field name
+(there is no "highest_volume", "best_e1rm", "most_frequent", or per-group
+"pct_of_..." — use the listed leaves like period_volume_lbs, pr.estimated_1rm,
+muscle_group_summary's total_volume_lbs, muscle_group_balance's push_volume_lbs).
+If a claim's support is not a listed leaf, DO NOT MAKE THE CLAIM.
+
+RANKING / SUPERLATIVE CLAIMS ("strongest", "highest-volume", "most stagnant",
+"fastest-improving", "most frequent", "weakest", "X% of total"): cite a
+PER-ENTITY SCALAR leaf that actually holds the number — ONE number → one scalar
+leaf. The rankings / exercise_lifecycle / muscle_group_balance sections are now
+flat-addressable BY ENTITY, so cite the entity form, e.g.:
+  • highest / most volume  → [[rankings|<name>|highest_volume_lbs]] (or _kg),
+                             or [[exercises|<name>|period_volume_lbs]];
+                             per-group → [[muscle_group_summary|<group>|total_volume_lbs]]
+  • best estimated 1RM     → [[rankings|<name>|best_e1rm]] or [[exercises|<name>|pr.estimated_1rm]]
+  • most stagnant          → [[rankings|<name>|most_stagnant]]
+  • per-group % of total   → [[muscle_group_balance|<group>|pct_of_lbs_total]]
+  • lifecycle counts       → [[exercise_lifecycle|<name>|total_sessions]]
+  Example: "Seated Narrow V Shaped Row is your highest-volume lift at 234,340 lbs"
+           → [[rankings|Seated Narrow V Shaped Row|highest_volume_lbs]] (the scalar).
+  NEVER cite the LIST form rankings|-|… or muscle_group_balance|-|distribution —
+  the bare "-" form resolves to a ranked LIST, not the scalar your number needs.
+  Use the per-entity (<name>/<group>) form above, which IS in the schema.
+
 Place the tag IMMEDIATELY AFTER the claim's number/assertion. Three kinds of
 claim, three citation targets — ALL must cite, nothing is exempt:
   1. NUMERIC / FACTUAL — "your PR is 63 lbs"
-       → tag the value leaf:  [[exercises|Barbell Curl|pr.weight]]
+       → tag the value LEAF:  [[exercises|Barbell Curl|pr.weight]]
   2. HEDGE / UNCERTAINTY — "only 13 sessions, too few to be sure"
-       → tag the leaf that JUSTIFIES the hedge (the session count, or a
-         correlation block's confidence_label / n leaf):
+       → tag the leaf that JUSTIFIES the hedge (a count or confidence leaf):
          [[exercises|Barbell Curl|training_frequency.session_count]]
-  3. ABSENCE — "no Walking logged"
+  3. ABSENCE — "you've never logged Hip Thrust"
        → tag the collection with the ABSENT marker:
-         [[exercises|Walking|ABSENT]]
+         [[exercises|Hip Thrust|ABSENT]]
 A COMPARATIVE or RELATIONAL claim ("A is stronger than B", "X rose while Y fell")
-carries MORE THAN ONE tag — tag BOTH constituent leaves, plus the n /
+carries MORE THAN ONE tag — tag BOTH constituent leaves, plus the
 confidence_label leaf when you assert the pattern is reliable.
 
+ABSENT is ONLY for an exercise/entity with NO logged history in the package
+(genuinely missing from the collection). It is NEVER for "a stat couldn't be
+computed" or "no trend yet" — that is a HEDGE: cite the count/confidence leaf
+that justifies the limitation, not ABSENT. Contrast:
+  • "you've never logged Hip Thrust"  → [[exercises|Hip Thrust|ABSENT]]            ✓
+  • "only one session, no trend yet"  → [[exercises|Flat Barbell Bench Press|training_frequency.session_count]]  ✓ (NOT ABSENT)
+
+GRANULARITY — always tag the specific LEAF, never the parent object: pr.weight,
+NOT pr. Each distinct number gets its OWN tag — a PR "130 lbs for 3 reps on
+2026-05-18" carries THREE tags: [[…|pr.weight]] [[…|pr.reps]] [[…|pr.date]].
+Tags have EXACTLY three parts ([[collection|match-key|field-path]]) — never four
+(no "full_comments|date|reps"); comment/session detail is not citable.
+
   • Tag every numeric, factual, hedge, and absence claim — no exceptions.
-  • The match-key and field-path must address a value that genuinely exists in
-    the package. Never invent a tag for a value that is not there.
-  • If you cannot cite a claim, do not make the claim.
+  • The field-path must appear in the [CITABLE SCHEMA] block — never invent one.
+  • If you cannot cite a claim with a listed leaf, do not make the claim.
 
 ════════════════════════════
 DATA RULES
@@ -381,17 +419,23 @@ named); DIAGNOSING or TREATING a condition = refuse + redirect. Never cross into
 
 
 _GROUNDING_SYSTEM = """
-You are a fact-checker verifying an AI coach's answer against the
-actual workout data package it was given.
+You are a fact-checker verifying an AI coach's answer against its source data.
 
-Your job: find every specific numerical claim in the answer and verify
-it against the provided package. Edit the answer directly and return
-the result as JSON.
+You are given the answer plus EITHER a [CITED VALUES] block (each numeric claim
+in the answer is backed by one source value, written "location = value") OR a
+full [WORKOUT PACKAGE]. Find every specific numerical claim in the answer and
+verify it against whichever source block is present. Edit the answer directly and
+return the result as JSON.
+
+  MISQUOTE: the claim's number ≠ its cited value (or the package value) → REMOVE
+  or correct it to the source value.
 
 REMOVE if EITHER:
-  1. The claim is directly contradicted by a specific value in the package
+  1. The claim is directly contradicted by a specific value in the source
+     (CITED VALUES or the package)
   2. The claim contains a specific number (count, total, measurement, date)
-     that cannot be found anywhere in the package
+     with no backing value — not among the [CITED VALUES] and (when given a
+     package) not found anywhere in it. A fabricated number is removed.
 
 QUALIFY only if the claim makes a causal or comparative assertion
 (e.g. "you perform better with X") that rests on fewer than 5 sessions
@@ -404,19 +448,19 @@ Default to PASS — only flag genuine problems.
 
 Examples:
   "your plateau is 76 days"
-    → package: plateau_days = 76  → PASS
+    → cited: exercises|Lat Pulldown|progression.plateau_span_days = 76  → PASS
 
   "your rest days correlate strongly with performance"
-    → package: rest_performance_buckets, n=2 per bucket
+    → cited: …rest_performance_buckets…confidence_label = "weak", …n = 2
     → QUALIFY: "...with only 2 sessions per bucket, this is
       suggestive rather than conclusive"
 
   "your PR on 2026-05-18 was 140 lbs"
-    → package: pr.weight = 130.0
-    → REMOVE (directly contradicted)
+    → cited: exercises|Lat Pulldown|pr.weight = 130.0
+    → REMOVE (claim number 140 ≠ cited value 130 — misquote)
 
   "you typically perform better on Mondays"
-    → package: dow_e1rm_pattern, Monday n=1
+    → cited value present but based on n = 1
     → REMOVE (too specific to qualify credibly)
 
 Return ONLY valid JSON. No preamble, no markdown fences.
@@ -513,8 +557,19 @@ def _build_user_message(
         logger.warning("[analysis_agent] package serialisation failed: %s", e)
         package_json = "{}"
 
+    # Citable-field schema — generated FROM this exact package (per-scope correct),
+    # so the draft can only cite leaves that actually exist. Prevents the model
+    # confabulating plausible-but-nonexistent field names (the Stage-1 YELLOW).
+    try:
+        citable_schema = build_citable_schema(package)
+    except Exception as e:
+        logger.warning("[analysis_agent] citable schema build failed: %s", e)
+        citable_schema = "(citable schema unavailable)"
+
     sections = [
         "[WORKOUT PACKAGE]\n" + package_json,
+        "[CITABLE SCHEMA] — you may ONLY cite these exact field-path leaves; "
+        "never cite a field not listed here:\n" + citable_schema,
         _fmt_research(research),
     ]
     custom_block = _fmt_custom_query(custom_query)
@@ -581,36 +636,62 @@ async def analyze(
     return draft.strip()
 
 
+def _build_grounding_prompt(draft: str, grounding_context: dict) -> str:
+    """
+    Build the grounding user prompt from the Stage-2 grounding context
+    (citations.build_grounding_context). Pure — no LLM — so it is unit-testable.
+
+      mode == "cheap": [DRAFT ANSWER] + a small [CITED VALUES] block (one line per
+                       claim: location = value (answer stated: N)). A few KB.
+      mode == "full":  [DRAFT ANSWER] + the whole [WORKOUT PACKAGE] (today's exact
+                       input — the safety fallback when any claim isn't cleanly cited).
+    """
+    if grounding_context.get("mode") == "cheap":
+        lines = [
+            f"- {cv['location']} = {cv['value']}   (answer stated: {cv['claim_number']})"
+            for cv in grounding_context.get("cited_values", [])
+        ]
+        cited_block = "\n".join(lines) if lines else "(none)"
+        return (
+            f"[DRAFT ANSWER]\n{draft}\n\n"
+            "[CITED VALUES] — every numeric/factual claim in the answer is backed "
+            "by one of these source values (location = value). Verify each claim's "
+            "number against its cited value; there is no package this turn.\n"
+            f"{cited_block}"
+        )
+
+    # Full-package fallback — byte-for-byte today's behavior.
+    try:
+        package_json = json.dumps(grounding_context.get("package") or {},
+                                  separators=(",", ":"))
+    except Exception:
+        package_json = "{}"
+    return (
+        f"[DRAFT ANSWER]\n{draft}\n\n"
+        f"[WORKOUT PACKAGE]\n{package_json}"
+    )
+
+
 async def ground_check(
-    draft:   str,
-    package: dict,
+    draft:             str,
+    grounding_context: dict,
 ) -> tuple[str, list]:
     """
     Separate Gemini call — NOT the Analysis Agent.
-    Verifies every claim in the draft against the package.
-    Edits the answer directly (qualify or remove).
+    Verifies every claim in the draft against its cited value (cheap path) or the
+    full package (fallback). Edits the answer directly (qualify or remove).
     Returns (cleaned_answer, flagged_claims).
 
-    Using a separate model instance reduces the tendency to re-affirm
-    its own confident wrong statements — the grounding checker has no
-    memory of the reasoning that produced the draft.
+    grounding_context comes from citations.build_grounding_context (Stage 2): the
+    small cited-scalar payload when the answer is fully clean, else the whole
+    package. Using a separate model instance reduces the tendency to re-affirm
+    its own confident wrong statements — the grounding checker has no memory of
+    the reasoning that produced the draft.
     """
     if not draft.strip():
         return draft, []
 
-    # Full compact package for ALL scopes — sending the complete package (not
-    # a subset) means every fact the draft drew on is findable, so the REMOVE
-    # rule can never strip a true claim for a missing source field. Compact
-    # serialization keeps a broad grounding input at ~366 KB (~92k tokens).
-    try:
-        package_json = json.dumps(package, separators=(",", ":"))
-    except Exception:
-        package_json = "{}"
-
-    prompt = (
-        f"[DRAFT ANSWER]\n{draft}\n\n"
-        f"[WORKOUT PACKAGE]\n{package_json}"
-    )
+    prompt = _build_grounding_prompt(draft, grounding_context)
 
     response = await asyncio.to_thread(
         _get_client().models.generate_content,
@@ -657,40 +738,3 @@ async def ground_check(
             "[analysis_agent] grounding check parse failed: %s — returning draft", e
         )
         return draft, []
-
-
-async def run(
-    package:              dict,
-    question:             str,
-    research:             Optional[list] = None,
-    memories:             Optional[list] = None,
-    conversation_context: Optional[list] = None,
-    custom_query:         Optional[dict] = None,
-) -> tuple[str, list]:
-    """
-    Full analysis pipeline: generate draft → ground check.
-
-    Step 2 of the multi-agent pipeline:
-      1. Data Agent:     collect() → prepare_analysis_package()
-      2. Analysis Agent: run()  ← this function
-         a. analyze()      — draft answer, thinking_budget=4096
-         b. ground_check() — verify claims against package, edit inline
-      3. Coordinator:    coverage check (question + answer only, 1 retry)
-
-    Returns:
-        (grounded_answer, flagged_claims)
-
-        grounded_answer — cleaned answer ready for coverage check
-        flagged_claims  — list of {original_claim, action, reason,
-                          package_value} for debugging
-    """
-    draft   = await analyze(
-        package, question, research, memories, conversation_context, custom_query
-    )
-    # Draft now carries internal citation tags (see _ANALYSIS_SYSTEM). Strip them
-    # before grounding so the user never sees a tag — same as the Coordinator's
-    # live path. (This helper is currently unused; the strip keeps it from
-    # becoming a latent tag-leak path if a caller adopts it.)
-    from src.citations import strip_tags
-    grounded, flagged = await ground_check(strip_tags(draft), package)
-    return grounded, flagged

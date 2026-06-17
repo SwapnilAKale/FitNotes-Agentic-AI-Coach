@@ -204,12 +204,17 @@ def test_kept_tools_still_exposed():
     assert not missing, f"unexpectedly removed: {missing}"
 
 
-def test_stripped_functions_remain_for_reuse():
-    # Unexposed, NOT deleted — the handler functions stay for analytical reuse/evals.
+def test_unused_reuse_functions_removed():
+    # Post-#7 cleanup: of the four Step-C-unexposed read functions, the "kept for
+    # reuse/evals" justification only ever held for get_weekly_volume's _sync
+    # (genuinely reused by tests/test_operational_volume.py). The other three had
+    # no caller — grep-proven — and were removed (handler + async wrapper + the
+    # dead call_tool dispatch branch). They must stay gone.
     import mcp_servers.combined_server as srv
-    for fn in ("_get_personal_record_sync", "_get_weekly_volume_sync",
-               "_query_workout_data_sync", "_run_read_only_sql"):
-        assert hasattr(srv, fn), f"{fn} was deleted (should only be unexposed)"
+    for fn in ("_get_personal_record_sync", "_query_workout_data_sync",
+               "_run_read_only_sql"):
+        assert not hasattr(srv, fn), f"{fn} should have been removed (dead code)"
+    assert hasattr(srv, "_get_weekly_volume_sync")   # genuinely reused — kept
 
 
 # ── SYSTEM_PROMPT: removed-tool refs gone, write/display flow intact (no strand)

@@ -16,7 +16,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 DB_PATH = os.environ.get("FITNOTES_DB_PATH", "./data/FitNotes_Backup.fitnotes")
-ALLOWED_TABLES = {"training_log", "exercise", "Category", "Comment"}
 
 server = Server("fitnotes-coach")
 
@@ -552,19 +551,13 @@ async def list_tools() -> list[types.Tool]:
 @server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
     try:
-        if name == "query_workout_data":
-            result = await _query_workout_data(arguments["question"])
-        elif name == "get_personal_record":
-            result = await _get_personal_record(arguments["exercise_name"])
-        elif name == "get_exercise_history":
+        if name == "get_exercise_history":
             result = await _get_exercise_history(
                 arguments["exercise_name"],
                 int(arguments.get("days", 30)),
             )
         elif name == "get_weekly_volume":
             result = await _get_weekly_volume(int(arguments.get("days", 30)))
-        elif name == "run_read_only_sql":
-            result = await _run_read_only_sql(arguments["sql"])
         elif name == "search_fitness_knowledge":
             query = arguments["query"]
             n_results = min(int(arguments.get("n_results", 5)), 10)
@@ -736,24 +729,6 @@ def _list_exercise_quirks_sync() -> str:
     return json.dumps({"quirks": quirks})
 
 
-def _query_workout_data_sync(question: str) -> str:
-    from src.text_to_sql import answer_question
-
-    result = answer_question(question, DB_PATH)
-    return json.dumps(
-        {
-            "sql": result.get("sql", ""),
-            "answer": result.get("answer", ""),
-            "rows_returned": len(result.get("rows", [])),
-            "error": result.get("error"),
-        }
-    )
-
-
-async def _query_workout_data(question: str) -> str:
-    return await asyncio.to_thread(_query_workout_data_sync, question)
-
-
 # Kg-native rule — single source of truth in src/units.py (was a local copy).
 from src.units import (
     KG_NATIVE_EXERCISES as KG_NATIVE,
@@ -813,142 +788,6 @@ def _bar_inclusive_weight(ctx: dict, exercise_name: str, date_str: str,
     bar_lbs = _proc_bar_weight_lbs(ctx, exercise_name, date_str)
     bar     = bar_lbs / 2.2046 if is_kg else bar_lbs
     return round(plates + bar, 1), ("kg" if is_kg else "lbs"), plates
-
-
-def _get_bar_weight(exercise_name: str, date_str: str, unit: str) -> float:
-    """Return bar weight in the given unit for a given exercise and date. Returns 0 if no bar applies."""
-    from datetime import date
-
-    try:
-        pr_date = date.fromisoformat(date_str)
-    except Exception:
-        return 0.0
-
-    if unit == "kg":
-        if exercise_name == "Deadlift":
-            return 20.0
-        return 0.0
-
-    if exercise_name == "Barbell Row":
-        return 44.09
-    if exercise_name in ("EZ-Bar Curl", "Reverse Zig Zag Barbell Curls"):
-        return 22.05
-
-    if exercise_name == "Barbell Curl":
-        if pr_date <= date(2024, 9, 23):
-            return 22.05
-        elif pr_date <= date(2025, 10, 30):
-            return 27.56
-        else:
-            return 33.07
-
-    if exercise_name == "Barbell Upright Row":
-        if pr_date <= date(2025, 1, 20):
-            return 22.05
-        elif pr_date <= date(2025, 8, 4):
-            return 27.56
-        else:
-            return 33.07
-
-    if exercise_name == "Behind The Back Wrist Curls":
-        if pr_date <= date(2024, 11, 21):
-            return 22.05
-        elif pr_date <= date(2025, 7, 18):
-            return 27.56
-        else:
-            return 33.07
-
-    return 0.0
-
-
-def _get_personal_record_sync(exercise_name: str) -> str:
-    resolved = _resolve_exercise_name_sync(exercise_name)
-    resolved_data = json.loads(resolved)
-    if resolved_data.get("resolved_name"):
-        exercise_name = resolved_data["resolved_name"]
-    elif resolved_data.get("candidates"):
-        return json.dumps({
-            "found": False,
-            "message": f"Ambiguous exercise name '{exercise_name}'. Did you mean: {', '.join(resolved_data['candidates'])}?",
-        })
-    else:
-        return json.dumps({
-            "found": False,
-            "message": f"Exercise '{exercise_name}' not found in database.",
-        })
-
-    sql = """
-        SELECT e.name,
-               tl.metric_weight * 2.2046 AS typed_value,
-               tl.reps,
-               tl.date
-        FROM training_log tl
-        JOIN exercise e ON e._id = tl.exercise_id
-        WHERE e.name = :exercise_name
-          AND tl.metric_weight = (
-              SELECT MAX(tl2.metric_weight)
-              FROM training_log tl2
-              JOIN exercise e2 ON e2._id = tl2.exercise_id
-              WHERE e2.name = :exercise_name
-          )
-        ORDER BY tl.reps DESC, tl.date DESC
-        LIMIT 1
-    """
-
-    def _execute():
-        import sqlite3
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        try:
-            return [dict(r) for r in conn.execute(sql, {"exercise_name": exercise_name}).fetchall()]
-        finally:
-            conn.close()
-
-    rows = _execute()
-    if not rows:
-        return json.dumps({
-            "found": False,
-            "message": f"No sets found for '{exercise_name}'.",
-        })
-
-    row = rows[0]
-    raw_date = row.get("date", "")
-    unit = "kg" if exercise_name in KG_NATIVE else "lbs"
-    bar_value = _get_bar_weight(exercise_name, raw_date, unit)
-
-    from datetime import datetime
-    try:
-        row["date"] = datetime.strptime(raw_date, "%Y-%m-%d").strftime("%d/%m/%y")
-    except (ValueError, KeyError):
-        pass
-
-    if exercise_name in KG_NATIVE:
-        plates_kg = round(row["typed_value"], 2)
-        row["weight_kg"] = round(plates_kg + bar_value, 2)
-        if bar_value > 0:
-            row["weight_note"] = f"plates: {plates_kg} kg + bar: {bar_value} kg"
-        del row["typed_value"]
-    else:
-        plates_lbs = round(row["typed_value"], 2)
-        row["weight_lbs"] = round(plates_lbs + bar_value, 2)
-        if bar_value > 0:
-            row["weight_note"] = f"plates: {plates_lbs} lbs + bar: {bar_value} lbs"
-        del row["typed_value"]
-
-    out = {
-        "exercise": exercise_name,
-        "rows": [row],
-        "rows_returned": 1,
-        "error": None,
-    }
-    if row.get("reps") == 1:
-        out["single_rep_warning"] = True
-        out["warning_message"] = "This PR is a single-rep set. Check comments — it may be a failed attempt or form break rather than a true max."
-    return json.dumps(out)
-
-
-async def _get_personal_record(exercise_name: str) -> str:
-    return await asyncio.to_thread(_get_personal_record_sync, exercise_name)
 
 
 def _get_exercise_history_sync(exercise_name: str, days: int = 30) -> str:
@@ -1080,47 +919,6 @@ def _get_weekly_volume_sync(days: int = 30) -> str:
 
 async def _get_weekly_volume(days: int = 30) -> str:
     return await asyncio.to_thread(_get_weekly_volume_sync, days)
-
-
-async def _run_read_only_sql(sql: str) -> str:
-    normalized = sql.lstrip().upper()
-    if not (normalized.startswith("SELECT") or normalized.startswith("WITH")):
-        return json.dumps({"error": "Rejected: SQL must start with SELECT or WITH."})
-
-    table_refs = re.findall(r"\b(?:FROM|JOIN)\s+(\w+)", sql, re.IGNORECASE)
-    referenced = {t for t in table_refs}
-    disallowed = referenced - ALLOWED_TABLES
-    if disallowed:
-        return json.dumps({"error": f"Rejected: references disallowed tables: {sorted(disallowed)}"})
-
-    def _execute():
-        import sqlite3
-        from src.db import run_query
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        try:
-            return run_query(conn, sql, 100, 5)
-        finally:
-            conn.close()
-
-    try:
-        rows = await asyncio.to_thread(_execute)
-        return json.dumps({
-            "rows": rows,
-            "rows_returned": len(rows),
-            # Verbatim passthrough — cannot bucket arbitrary SQL. Caveat so a
-            # blended SUM(metric_weight*2.2046*reps) over multiple exercises is
-            # not treated as authoritative: that mixes pounds and kilograms.
-            "note": (
-                "Raw values. metric_weight*2.2046 = the TYPED number, which is "
-                "kilograms for kg-native exercises (post-2025-12-26 Deadlift, "
-                "Seated Machine Curl (Kg), Machine Wrist Extension, Hand Gripper) "
-                "and pounds otherwise — do NOT SUM weight or volume across both "
-                "frames in one number; bar weight and offsets are not included."
-            ),
-        })
-    except Exception as exc:
-        return json.dumps({"error": str(exc)})
 
 
 def _get_article_boundary_chunks(collection, filename: str) -> list[dict]:

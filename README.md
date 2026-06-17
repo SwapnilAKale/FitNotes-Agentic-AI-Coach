@@ -569,7 +569,27 @@ Seven fixes landed; all 73 tests pass.
 
 ## Fixed
 
-**Broad-question latency — citation layer, Stage 1 of 2 (#7, in progress).** A
+**Dead-code cleanup (post-#7 audit).** A read-only audit after the #7 arc found
+code with zero callers, removed in two passes (full suite green throughout, 367):
+- `analysis_agent.run()` — an unused `analyze→ground_check` convenience wrapper
+  (zero callers, grep-proven); the module docstring now correctly says "Two
+  functions". The `CONFABULATED` test constant — orphaned when Stage 1.7 renamed
+  its only test — was removed too.
+- The three Step-C-unexposed read functions whose "kept for reuse/evals"
+  justification never materialized: `_get_personal_record_sync`,
+  `_query_workout_data_sync`, and `_run_read_only_sql` (each with its async
+  wrapper and its now-unreachable `call_tool` dispatch branch). A grep confirmed
+  **no analytical/eval caller** — they were pinned only by an existence-asserting
+  test and the dead dispatch. Of the four Step-C-unexposed reads, **only
+  `_get_weekly_volume_sync` was genuinely reused** (`tests/test_operational_volume.py`
+  calls it directly) and is kept; the existence test was retargeted to assert the
+  three stay removed. `list_tools` is unchanged (these were already unexposed).
+  A follow-up pass then removed the two helpers left transitively orphaned —
+  `combined_server`'s local `_get_bar_weight` and `ALLOWED_TABLES` (their only
+  callers were the removed functions); the shared `process._get_bar_weight_lbs`
+  is distinct and was untouched.
+
+**Broad-question latency — citation layer (#7, DONE; Stages 1 → 2 complete).** A
 broad analytical answer takes ~133s, dominated by the **grounding** stage
 re-sending the full ~415 KB / ~106K-token package a second time (the draft
 already sent it once) to fact-check the draft's numbers — a job that only needs
@@ -588,9 +608,64 @@ the *cited* values, not the whole package. The fix is two-staged:
   net while the citation machinery is proven on every real turn (resolution health
   is logged; a bad match-key or a false `ABSENT` claim flags loud, never silently).
   **No user-visible change and no grounding behavior change.**
-- **Stage 2 (pending):** switch grounding's input from the full package to the
-  small extracted cited-values payload (`extract_cited_values`, built + tested
-  now) — the actual latency win (~10–40× smaller grounding input).
+- **Stage 1.5 (done) — tag reliability:** a live re-check showed the draft model
+  reliably emits a tag on nearly every claim and never drifts names, but ~27% of
+  tags (≈50% on broad/ranking questions) resolved to nothing because it was taught
+  the tag *format* but not the package's real field *schema* — so it invented
+  plausible-but-nonexistent leaf names (`highest_volume`, `best_e1rm`,
+  `pct_of_lbs_total`). Fix: `citations.build_citable_schema(package)` generates a
+  compact (~6 KB) whitelist of the **real** citable leaves **from the live
+  package** (always in sync — no hand-maintained list that could drift), injected
+  per-question into the draft prompt; the model may cite only listed leaves. Each
+  scope gets its own correct menu automatically (broad-dropped fields aren't
+  listed). Also tightened: `ABSENT` is only for a never-logged entity (not "no
+  derived stat" — that's a hedge citing a count/confidence leaf), and per-leaf tag
+  granularity (`pr.weight`, not `pr`; each number its own tag).
+- **Stage 1.6 (done) — usable, not just resolvable:** the post-1.5 re-check
+  showed `NOT_FOUND` down to 3.7%, but the ranking/strongest-weakest class cited
+  ranked-aggregate *lists* (`rankings|-|highest_volume`,
+  `muscle_group_balance|-|distribution`) that resolved "OK" while giving grounding
+  **no scalar to check** — hiding the problem. Two fixes: (1) the draft prompt now
+  steers ranking/superlative claims to the **per-entity scalar leaf** that holds
+  the number (`exercises|<name>|period_volume_lbs`, `pr.estimated_1rm`,
+  `progression.plateau_span_days`) instead of a `rankings`/`exercise_lifecycle`/
+  `distribution` aggregate; (2) `resolve_tag` now distinguishes a **scalar** leaf
+  (`OK`) from a **list/dict** (`OK_NONSCALAR`), so a resolves-to-list no longer
+  counts as clean — it's added to `FLAG_STATUSES` and counted separately in the
+  health log. `OK_NONSCALAR` (alongside `NOT_FOUND`/`UNKNOWN_COLLECTION`) is the
+  "not cleanly cited" signal Stage 2's graceful fallback will trigger on.
+- **Stage 1.7 (done) — flat-address the ranking sections at the source:** the
+  ranking class still resolved `OK_NONSCALAR` because `rankings`,
+  `exercise_lifecycle`, and `muscle_group_balance.distribution` are dict-of-lists
+  with no flat scalar leaf. `build_index` now builds an **entity view** for each —
+  inverting them into `{entity: {leaf: scalar}}` — so a claim cites a scalar
+  directly: `[[rankings|<name>|highest_volume_lbs]]` → `234340.0`,
+  `[[muscle_group_balance|<group>|pct_of_lbs_total]]` → `39.5`,
+  `[[exercise_lifecycle|<name>|total_sessions]]` → a count. The original section
+  dict is kept as `dict_row`, so the old `|-|` forms still resolve exactly as
+  before (backward-compatible). `build_citable_schema` lists the new flat leaves
+  (schema ~6.9 KB), and the steer points at them. Accepted trade-off (locked with
+  the user): a ranking number is now citable two ways (entity-view leaf *and* the
+  per-exercise leaf) — a duplicated-but-correct citation path beats an unreliable
+  section-fallback.
+- **Stage 2 (DONE) — the latency win.** The post-1.7 live re-check came back
+  GREEN (0 `OK_NONSCALAR`, 0 `NOT_FOUND`, 7/7 answers 100% clean), so grounding's
+  input was switched from the whole package to the **extracted cited-scalar
+  payload**. `citations.build_grounding_context(cited, package)` does a **binary
+  per-answer split**: if every claim is cleanly cited (`OK` scalar / `ABSENT_OK`)
+  → grounding gets the draft + a small `[CITED VALUES]` block (the cheap path —
+  measured **0.6–~8 KB** vs the ~415 KB / ~106K-token package, **~50–600× smaller**,
+  killing the second full-package send and the per-minute-429 it triggered); if
+  ANY claim isn't cleanly cited (or the draft has no tags, e.g. a resumed stripped
+  draft) → it falls back to the **full package** — byte-for-byte today's grounding.
+  `ground_check` verifies each claim against its cited value (misquote = claim
+  number ≠ cited scalar; fabrication = a number with no backing value) on the
+  cheap path, and uses the unchanged REMOVE/QUALIFY/PASS package check on the
+  fallback; same `{cleaned_answer, flagged_claims}` output. The fallback is the
+  safety path and fires ~never, so it's deliberately the **complete** check, not
+  an optimized subset (no subset-trap). The coordinator logs which path each turn
+  took. **The draft (analyze) still gets the full package — only grounding's input
+  shrank. #7 is DONE (all stages).**
 
 **Hygiene sweep (#9–#13).** Five independent low-risk cleanups:
 
@@ -1226,9 +1301,15 @@ corrupt data — worst case it isn't logged and the user rephrases.
 
 `get_personal_record`, `get_weekly_volume`, `query_workout_data`, and
 `run_read_only_sql` are removed from the operational agent's exposed tool list
-(`combined_server.list_tools`, 35 → 31 tools). Their dispatch handlers and
-`_sync` functions **remain** in `combined_server.py` for analytical reuse and
-evals — this is unexposing, not deleting. Kept exposed: `get_exercise_sessions`,
+(`combined_server.list_tools`, 35 → 31 tools). At the time they were unexposed
+rather than deleted, on the rationale that their `_sync` handlers might be reused
+by the analytical path or evals. **(Post-#7 update: that reuse never materialized
+for three of the four — a grep found no analytical/eval caller — so
+`_get_personal_record_sync`, `_query_workout_data_sync`, and `_run_read_only_sql`
+were removed (handler + async wrapper + the dead dispatch branch). Only
+`_get_weekly_volume_sync` proved genuinely reused — `tests/test_operational_volume.py`
+calls it directly — and is kept. See "Dead-code cleanup" in the Fixed section.)**
+Kept exposed: `get_exercise_sessions`,
 `resolve_exercise_name`, `read_exercise_comments`, `get_exercise_history`, all
 write tools, RAG, memory, and quirks. The operational `SYSTEM_PROMPT` was updated
 to match: the four tools are dropped from the READ-WORKOUT group; the

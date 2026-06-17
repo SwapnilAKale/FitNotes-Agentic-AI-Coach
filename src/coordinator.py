@@ -828,10 +828,15 @@ class Coordinator:
         """
         if not cited:
             return
-        problems = [c for c in cited if c["status"] in _cite.FLAG_STATUSES]
+        problems  = [c for c in cited if c["status"] in _cite.FLAG_STATUSES]
+        # Count non-scalar resolutions separately — a tag that resolves to a
+        # list/dict (e.g. a ranked list) "exists" but gives grounding no scalar
+        # to check, so it must not be hidden inside the clean "resolved" count.
+        nonscalar = sum(1 for c in cited if c["status"] == _cite.OK_NONSCALAR)
+        clean     = len(cited) - len(problems)
         logger.info(
-            "[coordinator] citation health: %d tag(s), %d resolved, %d flagged",
-            len(cited), len(cited) - len(problems), len(problems),
+            "[coordinator] citation health: %d tag(s), %d clean, %d non-scalar, "
+            "%d flagged", len(cited), clean, nonscalar, len(problems),
         )
         for c in problems:
             logger.warning(
@@ -1016,6 +1021,9 @@ class Coordinator:
                 "[coordinator] resume: stored draft (%d chars) used verbatim — "
                 "draft LLM call skipped", len(draft),
             )
+            # The stored draft is already stripped (no tags), so there are no
+            # cited values to extract — grounding uses the full-package fallback.
+            gctx = _cite.build_grounding_context([], pkg)
         else:
             try:
                 # Custom SQL generation is an LLM call — it belongs to the
@@ -1039,14 +1047,18 @@ class Coordinator:
                     raise _ckpt.QuotaInterrupted(e, _ckpt.msg_draft_interrupted(e))
                 raise
 
-            # ── Stage 1 citation layer (separate verification path) ─────────
-            # The draft now carries inline [[collection|match-key|field]] tags.
-            # Resolve them against the package (verification-only log), then STRIP
-            # so the clean prose is what flows to grounding + checkpoint + the
-            # user. Grounding behaviour is UNCHANGED — it still receives the full
-            # package and the stripped draft (the same prose shape as before).
-            self._log_citation_health(_cite.extract_cited_values(draft_tagged, pkg))
+            # ── Citation layer: resolve tags → grounding context → strip ────
+            # The draft carries inline [[collection|match-key|field]] tags. Resolve
+            # them, log health, then build the Stage-2 grounding context: if every
+            # claim is cleanly cited the grounding call gets only the small
+            # cited-scalar payload (the ~10–40× input cut); if any claim isn't
+            # cleanly cited it falls back to the full package (today's behaviour).
+            # Strip the tags so the clean prose flows to grounding + checkpoint +
+            # the user.
+            cited = _cite.extract_cited_values(draft_tagged, pkg)
+            self._log_citation_health(cited)
             draft = _cite.strip_tags(draft_tagged)
+            gctx  = _cite.build_grounding_context(cited, pkg)
 
         # ── Stage: GROUNDING ───────────────────────────────────────────────────
         # POLICY: the user never sees unverified draft text. On interruption
@@ -1057,9 +1069,10 @@ class Coordinator:
             # is already verified; only the coverage stage remains.
             answer = draft
         else:
+            logger.info("[coordinator] grounding path: %s", gctx.get("mode"))
             try:
                 answer, flagged = await self._call_with_per_minute_retry(
-                    analysis_agent.ground_check, draft, pkg)
+                    analysis_agent.ground_check, draft, gctx)
             except Exception as e:
                 if _is_rate_limit(e):
                     _ckpt.save_checkpoint(
@@ -1090,13 +1103,15 @@ class Coordinator:
                 retry_draft_tagged = await self._call_with_per_minute_retry(
                     analysis_agent.analyze,
                     pkg, scoped_question, research, memories, retry_context, custom_query)
-                # Same Stage-1 citation path as the first draft: verify, then
-                # strip before grounding (grounding gets stripped prose).
-                self._log_citation_health(
-                    _cite.extract_cited_values(retry_draft_tagged, pkg))
+                # Same citation path + Stage-2 split as the first draft.
+                retry_cited = _cite.extract_cited_values(retry_draft_tagged, pkg)
+                self._log_citation_health(retry_cited)
                 retry_draft = _cite.strip_tags(retry_draft_tagged)
+                retry_gctx  = _cite.build_grounding_context(retry_cited, pkg)
+                logger.info("[coordinator] grounding path (retry): %s",
+                            retry_gctx.get("mode"))
                 answer, flagged2 = await self._call_with_per_minute_retry(
-                    analysis_agent.ground_check, retry_draft, pkg)
+                    analysis_agent.ground_check, retry_draft, retry_gctx)
                 flagged.extend(flagged2)
                 # No second coverage check — return best effort
         except Exception as e:
