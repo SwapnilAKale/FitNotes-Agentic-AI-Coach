@@ -569,6 +569,82 @@ Seven fixes landed; all 73 tests pass.
 
 ## Fixed
 
+**Demographics feature status.** Where the memory/demographics work stands:
+- **Done** — memory-extraction wired into the analytical path (coaching turns now
+  reach extraction, stripped answer only); **Stage A** storage layer (3-tier model,
+  anchors-not-computed-values, `set_demographic`/`get_demographic`/`get_derived`,
+  sensitive-data policy, demographics out of ChromaDB); **Stage B** follow-up asking
+  (mention-triggered, answer-first one-line aside, parse→write, drop-if-unanswered,
+  clarify-once). See the entries below for each.
+- **Deferred — Stage C** (RAG personalization gate, Option B) and **Stage D**
+  (volatile-stat history). *Why:* the RAG path has no personalization step at all —
+  stored demographics never reach the answer context (the prompt injects facts, not
+  demographics), there's no notion of a paper's required population, the gate's two
+  halves straddle the operational(RAG)/coordinator(follow-up) boundary, and the
+  gate's canonical stat (bodyfat %) is tier-3 never-store. Building the gate now =
+  building the whole personalization feature on nothing. Deferred until RAG
+  personalization exists.
+- **Resume sequence** (upcoming, when RAG is built out): (1) inject demographics
+  into the operational answer context — the single hard blocker; (2) paper-requirement
+  extraction (answer-time LLM vs ingestion-time pre-tagging); (3) boundary bridge —
+  agent emits a "missing anchor K" signal the coordinator reads to arm Stage B's
+  follow-up; (4) a tier-3 ask-fresh path if bodyfat/bodyweight gating is in scope.
+
+**Demographics follow-up asking (Stage B of 3).** The conversational layer that
+collects the anchors Stage A stores. When the user mentions a demographic in
+passing and that anchor isn't already stored — "for a 22-year-old…", "I've been
+training 3 years", "I'm 5'9" — the agent **answers the question fully first**,
+then appends **one** gentle, new-line aside offering to remember the *precise*
+anchor ("…if you tell me your birthday I can factor your exact age in going
+forward"). It does **not** scrape the ambiguous mentioned value (a passing "22");
+it asks for the exact anchor. On the user's **immediate next reply** the answer is
+parsed deterministically (no LLM) and written via `set_demographic` ("2003-06-18",
+"male", "176cm", a bare "2021" for a start-date → Jan 1) with a brief ack; a
+malformed attempt gets **one** clarification, then it gives up — no looping. If
+the next message isn't an answer (the user moved on), the follow-up is **dropped**
+— and because it's appended *after* the clean answer was recorded into history, an
+unanswered aside never accretes in the memory-extraction/grounding history. The
+follow-up is rule-based, conservative (a bare number from reps/weight never
+fires), one-at-a-time, and lives exactly one turn. (Stage C — the point-of-use
+RAG/answer gate that asks when a personalized answer *needs* a missing anchor —
+and Stage D — volatile-stat history — are upcoming.)
+
+**Demographics storage layer (Stage A of 3).** Foundation for personalizing
+coaching with user demographics. **Anchors only** are stored — birthdate (not
+age), training-start-date (not years-trained), sex, height — and derived values
+(age, years-trained) are computed **fresh at point-of-use**, never cached: the
+input is today's date, so a stored derived value would go stale daily for zero
+perf gain (same "one source of truth, compute fresh" discipline as `src/units.py`).
+A **three-tier model** (the single source of truth, `src/demographics.py`) governs
+storage and use: **T1 use-freely** (sex; birthdate→age; training-start→years-trained —
+stable or accurately derivable), **T2 confirm-on-use** (height — monotonic, the
+stored value is a safe floor; a later stage confirms "changed since?" before
+applying it), **T3 never-stored** (bodyfat %, bodyweight — volatile, asked fresh
+at use). `memory.set_demographic(key, value)` validates the value (real date,
+accepted sex, positive height+unit) and **refuses tier-3** writes; `get_derived`
+computes age/years-trained fresh and never persists them. A lightweight
+**sensitive-data storage policy** (new — none existed): only T1/T2 keys store, as
+a structured `demographics` map (not free-text facts, **not** embedded in
+ChromaDB); tier-3 never stored; the anchor stored, never the identity-derived
+value. (Stage B — follow-up asking that writes these — and Stage C — the
+RAG/answer gate that reads them — are upcoming.)
+
+**Memory extraction wired into the analytical path.** End-of-session memory
+extraction (`_auto_extract_memories`) scans `AgentSession._conversation_history`,
+which was populated only by the operational `answer()` loop. The Coordinator's
+**analytical** path runs the analysis pipeline directly and never appended to it,
+so analytical/coaching Q&A was invisible to extraction — the coordinator docstring
+marked this "NOT YET WIRED." Now `_run_analytical`, at its final return, records
+the `(question, final stripped answer)` via a new
+`AgentSession.record_external_exchange` — the same exchange shape operational
+turns use, so extraction treats them identically. It records the **stripped**
+user-facing answer only (never the tagged draft, the cited-values payload, or the
+package); `out_of_scope` / filler / parse-failure turns short-circuit before
+`_run_analytical` and record nothing. (Scope note: this closes the *path* gap —
+the foundation for capturing durable user facts from coaching questions. The
+end-of-session extraction *timing* model, e.g. an abrupt terminal kill skipping
+`close()`, is a separate known item deferred to the web-deployment rework.)
+
 **Dead-code cleanup (post-#7 audit).** A read-only audit after the #7 arc found
 code with zero callers, removed in two passes (full suite green throughout, 367):
 - `analysis_agent.run()` — an unused `analyze→ground_check` convenience wrapper

@@ -39,9 +39,14 @@ MAX_FACTS = 30
 
 def load_memory() -> dict:
     if not MEMORY_PATH.exists():
-        return {"facts": [], "last_updated": None, "summary": None}
+        return {"facts": [], "last_updated": None, "summary": None,
+                "demographics": {}}
     with open(MEMORY_PATH) as f:
-        return json.load(f)
+        memory = json.load(f)
+    # `demographics` (structured anchor map) was added later — default it so
+    # older stores load cleanly.
+    memory.setdefault("demographics", {})
+    return memory
 
 
 def save_memory(memory: dict):
@@ -53,6 +58,12 @@ def save_memory(memory: dict):
 def add_fact(category: str, content: str,
              source: str = "user_stated",
              confidence: str = "high") -> dict:
+    # SENSITIVE-DATA POLICY: this stores FREE-TEXT facts (preferences, injuries,
+    # goals). Demographic/identity ANCHORS (birthdate, sex, height,
+    # training_start_date) must NOT be stored here as prose — use
+    # set_demographic() (structured, validated, kept out of ChromaDB). Volatile
+    # stats (bodyfat %, bodyweight) are NEVER stored anywhere — asked fresh at
+    # use. See src/demographics.py for the tier model + full policy.
     memory = load_memory()
 
     for fact in memory["facts"]:
@@ -102,6 +113,80 @@ def delete_fact(fact_id: str) -> dict:
             pass
         return {"status": "deleted"}
     return {"status": "not_found", "message": f"No fact found with id {fact_id}"}
+
+
+# ── Demographics: structured ANCHOR storage (Stage A) ───────────────────────
+# Anchors only (birthdate/sex/height/training_start_date); derived values (age,
+# years_trained) are computed FRESH at point-of-use and NEVER stored. Stored in a
+# dedicated `demographics` map (NOT in `facts`, NOT embedded in ChromaDB), keyed
+# by stat name. Stage B (follow-ups) calls set_demographic; Stage C (RAG gate)
+# calls get_demographic / get_derived. The tier model + validation + the
+# sensitive-data policy live in src/demographics.py.
+from src import demographics as _demo
+
+
+def set_demographic(key: str, value, unit: str | None = None,
+                    source: str = "user_stated") -> dict:
+    """
+    Store a demographic ANCHOR. Enforces the storage policy:
+      - TIER3 keys (bodyfat_pct, bodyweight) are REFUSED — never stored.
+      - Unknown / non-storable keys are refused.
+      - The value is validated for shape (real date / accepted sex / positive
+        height + unit) before storing.
+    Stores only the anchor — never a computed value. Overwrites an existing
+    anchor for the same key (a correction/update). Returns a status dict.
+    """
+    spec = _demo.DEMOGRAPHIC_STATS.get(key)
+    if spec is None:
+        return {"status": "refused",
+                "reason": f"'{key}' is not a recognized demographic anchor"}
+    if key in _demo.TIER3_KEYS:
+        return {"status": "refused",
+                "reason": (f"'{key}' is volatile (tier-3) and is never stored — "
+                           f"ask fresh at point of use")}
+    if not spec.get("stored"):
+        return {"status": "refused", "reason": f"'{key}' is not a storable demographic"}
+
+    ok, normalized, error = _demo.validate_value(key, value, unit)
+    if not ok:
+        return {"status": "invalid", "reason": error}
+
+    memory = load_memory()
+    demos = memory.setdefault("demographics", {})
+    record = {
+        "value":      normalized,
+        "tier":       spec["tier"],
+        "source":     source,
+        "updated_at": datetime.now().isoformat(),
+    }
+    if key == "height":
+        record["unit"] = unit
+    demos[key] = record
+    save_memory(memory)
+    return {"status": "saved", "key": key, "record": record}
+
+
+def get_demographic(key: str) -> dict | None:
+    """Return the stored anchor record for a demographic key, or None."""
+    return load_memory().get("demographics", {}).get(key)
+
+
+def get_all_demographics() -> dict:
+    """Return the full stored demographics anchor map."""
+    return load_memory().get("demographics", {})
+
+
+def get_derived(key: str, today=None):
+    """
+    Compute the FRESH derived value for a demographic anchor (age from birthdate,
+    years_trained from training_start_date). Computed every call from today's
+    date — NEVER stored. Returns None if the anchor isn't stored or has no
+    derived value. `today` is injectable for testing.
+    """
+    record = get_demographic(key)
+    if not record or record.get("value") is None:
+        return None
+    return _demo.compute_derived(key, record["value"], today)
 
 
 def format_memory_for_prompt() -> str:

@@ -674,6 +674,23 @@ class AgentSession:
         if len(self._conversation_history) > 10:
             self._conversation_history = self._conversation_history[-10:]
 
+    def record_external_exchange(self, question: str, answer: str) -> None:
+        """
+        Record a (question, answer) turn produced OUTSIDE the operational answer()
+        loop — i.e. the Coordinator's ANALYTICAL path, which runs the analysis
+        pipeline directly and never touches this history. Without this, analytical/
+        coaching Q&A is invisible to _auto_extract_memories (it only scans
+        _conversation_history). Stores the SAME exchange shape operational turns
+        use (a list of {role, content} dicts), so extraction treats them
+        identically. `answer` must already be the STRIPPED, user-facing text — no
+        citation tags, no package, no cited-values payload.
+        """
+        if not (question and answer):
+            return
+        self._save_exchange(
+            [{"role": "user",      "content": question},
+             {"role": "assistant", "content": answer}], 0)
+
     # ------------------------------------------------------------------ #
     #  Main answer loop                                                    #
     # ------------------------------------------------------------------ #

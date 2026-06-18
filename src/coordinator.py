@@ -16,9 +16,9 @@ Shared modules wired into the analytical path:
   shared/rag.py      → research pre-fetch (best-effort, None on failure)
   shared/memory.py   → read-only memory retrieval (best-effort)
   shared/sql_executor (via data_agent.query) → supplementary custom SQL
-
-NOT YET WIRED:
-  Memory extraction from mixed analytical+memory messages
+  memory extraction → _run_analytical records (question, final stripped answer)
+    via agent.record_external_exchange so session-end extraction sees analytical
+    turns too (operational turns already record via agent.answer()).
 
 ROUTING RULE (Step C): reads default ANALYTICAL. Operational is a positive
 allowlist — writes (caught first by the write-intent regex pre-guard),
@@ -46,6 +46,8 @@ from src.data_agent import (
 from src import analysis_agent
 from src import checkpoint as _ckpt
 from src import citations as _cite
+from src import demographic_followup as _followup
+from src import memory as _memory
 
 # Rate-limit error types: re-raised instead of swallowed so CLI/server
 # countdown UX works for analytical-path quota exhaustion.
@@ -399,12 +401,95 @@ class Coordinator:
         self._agent   = agent_session
         self._client  = genai.Client(api_key=_GEMINI_API_KEY)
         self._history: list[dict] = []   # {role, content} pairs, last CONTEXT_WINDOW*2
+        # Stage B: a one-turn pending demographic follow-up — {"key", "clarified"}.
+        # In-memory, per session. Lives exactly the immediate next turn (+1 turn
+        # only if the user attempts an answer that needs one clarification).
+        self._pending_followup: dict | None = None
 
     # ── Public entry point ────────────────────────────────────────────────────
 
     async def route(self, question: str) -> dict:
         """
-        Route a question to the appropriate pipeline.
+        Public entry point. Wraps the checkpoint+routing flow with the Stage-B
+        demographic follow-up layer:
+          PRE  — if a follow-up is pending, the user's reply either answers it
+                 (ack/clarify, this IS the turn's response) or doesn't (drop it,
+                 route the message normally).
+          POST — after a real answer, optionally append ONE gentle follow-up
+                 offering to remember a demographic anchor the user just mentioned.
+        The follow-up is a pure presentation addendum: it is appended AFTER the
+        answer was already recorded into history (record_external_exchange /
+        agent.answer), so an unanswered aside never enters extraction/grounding
+        history.
+        """
+        # ── PRE: consume or drop a pending follow-up (before checkpoint logic).
+        # A bare follow-up answer ("2003-06-18") is never a continue/discard
+        # intent, so handling it here can't collide with the checkpoint block.
+        if self._pending_followup is not None:
+            consumed = self._consume_pending_followup(question)
+            if consumed is not None:
+                return consumed
+            self._pending_followup = None     # not an answer → drop, route normally
+
+        result = await self._route_with_checkpoint(question)
+
+        # ── POST: append at most one follow-up (only on a real answer).
+        if (result.get("route") in ("analytical", "operational")
+                and result.get("answer")):
+            self._append_followup_if_relevant(question, result)
+        return result
+
+    # ── Stage B: demographic follow-up helpers ─────────────────────────────────
+
+    def _consume_pending_followup(self, question: str) -> dict | None:
+        """
+        Interpret the user's immediate next reply against the pending follow-up.
+        Returns the turn's response dict (ack / clarification) when the reply is
+        an answer-attempt, or None when it isn't (caller drops + routes normally).
+        """
+        pending = self._pending_followup
+        key = pending["key"]
+        r = _followup.interpret_answer(key, question)
+
+        if r["kind"] == "answer":
+            res = _memory.set_demographic(key, r["value"], unit=r.get("unit"))
+            if res.get("status") == "saved":
+                self._pending_followup = None
+                return self._followup_response(_followup.ACK, "followup_ack")
+            # parsed but the validator rejected it → treat like a malformed attempt
+            r = {"kind": "clarify"}
+
+        if r["kind"] == "clarify":
+            if not pending.get("clarified"):
+                pending["clarified"] = True          # one clarification, one more turn
+                return self._followup_response(
+                    _followup.CLARIFY.get(key, ""), "followup_clarify")
+            self._pending_followup = None            # already clarified → give up
+            return None
+
+        return None                                   # not_answer → drop, route normally
+
+    def _append_followup_if_relevant(self, question: str, result: dict) -> None:
+        """
+        After a real answer, if the user mentioned a demographic anchor that ISN'T
+        already stored, append ONE gentle new-line offer to remember it and mark
+        it pending. (Pending is always None here — the PRE-step cleared it — so at
+        most one follow-up is ever active: no stacking.)
+        """
+        for key in _followup.detect_mentions(question):
+            if _memory.get_demographic(key) is None:
+                result["answer"] = result["answer"].rstrip() + "\n\n" + \
+                    _followup.followup_text(key)
+                self._pending_followup = {"key": key, "clarified": False}
+                return
+
+    def _followup_response(self, text: str, route: str) -> dict:
+        return {"answer": text, "route": route, "flagged_claims": [], "error": None}
+
+    async def _route_with_checkpoint(self, question: str) -> dict:
+        """
+        The checkpoint + routing flow (resume / confirm-before-discard / classify
+        + dispatch). Wrapped by route(), which adds the Stage-B follow-up layer.
 
         Returns:
             {
@@ -1143,6 +1228,17 @@ class Coordinator:
                     f"so this answer covers your overall training instead.\n\n"
                     + answer
                 )
+
+        # Record the analytical turn so memory extraction sees it. The analytical
+        # path runs the analysis pipeline directly and never enters the agent's
+        # operational answer() loop, so without this the (question, answer) is
+        # invisible to _auto_extract_memories. Feed the FINAL STRIPPED answer (the
+        # text the user saw) + the original question — not the tagged draft, the
+        # cited-values payload, or the package. out_of_scope / filler /
+        # parse-failure short-circuit before _run_analytical, so they record
+        # nothing. (Operational turns already record via agent.answer().)
+        if self._agent is not None and answer:
+            self._agent.record_external_exchange(question, answer)
 
         return answer, flagged
 
