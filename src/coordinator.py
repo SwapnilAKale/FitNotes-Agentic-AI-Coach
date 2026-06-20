@@ -224,14 +224,15 @@ across multiple sessions. Requires computing statistics over training history.
     "What patterns do you see in my training?"
     "How consistent have I been?"
     "Which muscle groups am I neglecting?"
+    "Show me my last chest session"          (session display — muscle group)
+    "Show me my last Lat Pulldown session"   (session display — one exercise)
+    "How was my back ROM split in the last back session"  (category session display)
 
 OPERATIONAL — use only for questions that require MCP tools:
   - Write operations: logging, goal setting, corrections, deletions
   - Research: fitness science questions
-  - Session display: "show me my last X session"
 
   Examples → operational:
-    "Show me my last chest session"       (session display)
     "Log today's workout"                 (write operation)
     "Set a goal for 150 lbs on Lat Pulldown" (write operation)
     "Fix my last set — it was 12 reps not 10" (correction)
@@ -254,12 +255,13 @@ OPERATIONAL — use only for questions that require MCP tools:
     Exercise comparisons — fastest improving, most stagnant
     Goal projections     — will current rate of progress reach a target
     Any historical trend — any question about what happened over time
+    Session display      — what was done on a specific date / most-recent
+                           session, with full set breakdown, for ONE exercise
+                           OR all exercises in a muscle group
 
   Route OPERATIONAL only for things that require MCP tools:
     Writes      — log workout, set goal, update set, delete anything
     Research    — fitness science questions, what does science say
-    Session display — show me exactly what I did on a specific date
-                      with full set breakdown
 
 OUT_OF_SCOPE — refuse politely WITHOUT any tool, search, or analysis. Decide
 this by a FITNESS-CONNECTION test, NOT a keyword blocklist:
@@ -301,8 +303,9 @@ medical/symptom question to out_of_scope. A medical/symptom question is a
 read/coaching question → ANALYTICAL by the default below.
 
 DEFAULT: operational is a POSITIVE allowlist — route "operational" ONLY for the
-three cases listed above (writes/corrections/goals, research/RAG, and
-specific-date session display), and "out_of_scope" only per the test above.
+two cases listed above (writes/corrections/goals, and research/RAG), and
+"out_of_scope" only per the test above. Session display — single-exercise or
+muscle-group level — is ANALYTICAL.
 EVERYTHING ELSE is "analytical": every read, trend, stat, PR, volume, frequency,
 plateau, comparison, projection, and coaching question — including terse ones
 ("my squat?", "Lat Pulldown PR"). When uncertain, default to "analytical". The

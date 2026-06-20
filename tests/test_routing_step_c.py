@@ -3,9 +3,10 @@ Step C, Parts 2 & 3: flip the read default to ANALYTICAL, then unexpose the four
 analysis-read tools from the operational agent.
 
 Part 2 — operational is a positive allowlist (writes via the write-intent regex
-pre-guard, research/RAG, specific-date session display, + out_of_scope). Every
-other read/coaching question, and anything uncertain (parse/exception fail),
-defaults ANALYTICAL.
+pre-guard, research/RAG, + out_of_scope). Every other read/coaching question,
+and anything uncertain (parse/exception fail), defaults ANALYTICAL. (Stage 3
+moved session-display from operational to analytical — it is no longer an
+operational allowlist case.)
 
 Part 3 — get_personal_record / get_weekly_volume / query_workout_data /
 run_read_only_sql are removed from the operational agent's exposed tool list
@@ -136,7 +137,7 @@ def test_writes_still_route_operational(coord, monkeypatch, q):
 
 
 def test_classifier_operational_decision_dispatches_operational(coord, monkeypatch):
-    # When the classifier positively says operational (RAG/display), op path runs.
+    # When the classifier positively says operational (RAG), op path runs.
     async def fake(question):
         return {"route": "operational", "exercise_names": None, "muscle_groups": None,
                 "query_period_days": 90, "needs_custom_sql": False, "custom_sql_intent": None}
@@ -158,14 +159,104 @@ def test_out_of_scope_unchanged(coord, monkeypatch):
     assert seen["operational"] == 0 and seen["analytical"] == 0
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# STAGE 3.5 · dispatch given a classification
+#
+# These tests gate the DISPATCH layer only: GIVEN a classification result, does
+# the coordinator send the question to the correct lane? They stub _classify (the
+# instance method, no Gemini call) and observe which lane runs via _spy_downstream.
+# They do NOT prove the live model classifies any question correctly — that is
+# classification ACCURACY, covered by stage 4's live two-run check. The seam is
+# clean: _classify is already monkeypatch-stubbable; no production testability
+# change is needed. (Writes are the one exception — they dispatch via the
+# write-intent pre-guard BEFORE _classify; see the pre-guard test below.)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _classify_returning(route):
+    """An async _classify stub returning a params dict with the given route."""
+    async def fake(question):
+        return {"route": route, "exercise_names": None, "muscle_groups": None,
+                "query_period_days": 90, "needs_custom_sql": False,
+                "custom_sql_intent": None}
+    return fake
+
+
+@pytest.mark.parametrize("question,stub_route,exp_an,exp_op", [
+    # Load-bearing display cases (the category row was the live-misrouting one).
+    ("show me my last Lat Pulldown session",                "analytical",  1, 0),
+    ("how was my back ROM split in the last back session",  "analytical",  1, 0),
+    # Non-display analytical read.
+    ("am I progressing on squat",                           "analytical",  1, 0),
+    # Research / RAG → operational.
+    ("what does science say about creatine",                "operational", 0, 1),
+])
+def test_dispatch_classification_to_lane(coord, monkeypatch, question,
+                                         stub_route, exp_an, exp_op):
+    """Dispatch given a classification: a question classified `stub_route` is sent
+    to the matching lane. This pins DISPATCH, not whether the live model
+    classifies these questions correctly (stage 4's two-run check covers that).
+    The two display rows lock display→analytical dispatch in place."""
+    monkeypatch.setattr(coord, "_classify", _classify_returning(stub_route))
+    seen = _spy_downstream(coord, monkeypatch)
+    result = asyncio.run(coord.route(question))
+    assert result["route"] == stub_route
+    assert seen["analytical"] == exp_an
+    assert seen["operational"] == exp_op
+
+
+def test_dispatch_out_of_scope_zero_spend(coord, monkeypatch):
+    """Dispatch given an out_of_scope classification: refuse with ZERO pipeline
+    spend (neither lane invoked). Dispatch contract, not model accuracy."""
+    monkeypatch.setattr(coord, "_classify", _classify_returning("out_of_scope"))
+    seen = _spy_downstream(coord, monkeypatch)
+    result = asyncio.run(coord.route("write me a poem about squats"))
+    assert result["route"] == "out_of_scope"
+    assert seen["analytical"] == 0 and seen["operational"] == 0
+
+
+def test_dispatch_write_via_preguard_ignores_classification(coord, monkeypatch):
+    """Writes dispatch via the write-intent pre-guard BEFORE _classify is even
+    consulted. Stub _classify to the 'wrong' lane (analytical) and assert an
+    imperative write STILL routes operational — proving the pre-guard owns write
+    dispatch. Dispatch contract, not model accuracy."""
+    monkeypatch.setattr(coord, "_classify", _classify_returning("analytical"))
+    seen = _spy_downstream(coord, monkeypatch)
+    result = asyncio.run(coord.route("log my bench 100x5"))
+    assert result["route"] == "operational"
+    assert seen["operational"] == 1 and seen["analytical"] == 0
+
+
+def test_dispatch_follows_route_not_text(coord, monkeypatch):
+    """Inverse of the display rows of test_dispatch_classification_to_lane: the
+    SAME display question, but classified `operational`, dispatches operational.
+    Paired with that test (same text, classified analytical → analytical), this
+    permanently proves the coordinator dispatches on the classification RESULT,
+    not the question TEXT — so the display→analytical tests are non-tautological.
+    Pins dispatch-follows-route; it is NOT a claim about how display SHOULD be
+    classified (post-stage-3 the model classifies display analytical)."""
+    question = "how was my back ROM split in the last back session"
+    monkeypatch.setattr(coord, "_classify", _classify_returning("operational"))
+    seen = _spy_downstream(coord, monkeypatch)
+    result = asyncio.run(coord.route(question))
+    assert result["route"] == "operational"
+    assert seen["operational"] == 1 and seen["analytical"] == 0
+
+
 # ── Prompt / docstring presence for the flip ────────────────────────────────
 
 def test_classify_prompt_default_is_analytical():
     from src.coordinator import _CLASSIFY_SYSTEM
+    low = _CLASSIFY_SYSTEM.lower()
     assert 'default to "analytical"' in _CLASSIFY_SYSTEM
-    assert "positive allowlist" in _CLASSIFY_SYSTEM.lower()
-    # operational still constrained to the three cases; out_of_scope intact
-    assert "research" in _CLASSIFY_SYSTEM.lower() and "session display" in _CLASSIFY_SYSTEM.lower()
+    assert "positive allowlist" in low
+    # operational now constrained to TWO cases (writes + research/RAG); session
+    # display moved to the analytical lane (stage 3 boundary flip).
+    assert "research" in low
+    assert "two cases" in low
+    # session display is now ANALYTICAL (single-line fragment, robust to wrapping)
+    assert "session display — single-exercise or" in low
+    # the old operational allowlist phrasing for display is gone
+    assert "specific-date session display" not in low
     # medical is a read → analytical by default, never out_of_scope
     assert "NEVER out_of_scope" in _CLASSIFY_SYSTEM
 
