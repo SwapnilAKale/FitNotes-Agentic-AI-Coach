@@ -16,7 +16,9 @@ downstream analysis are stubbed where needed.
 """
 
 import asyncio
+import json
 import os
+import sqlite3
 import sys
 from types import SimpleNamespace
 
@@ -217,8 +219,35 @@ def test_raw_volume_demoted_under_crosscheck_value_unchanged():
     assert "total_volume_raw_typed_kg" not in ats
     assert "total_volume_raw_note" not in ats
 
-    # New nested location, values unchanged (pinned to the current snapshot)
+    # Structural: new nested location + note text
     cc = ats["_raw_volume_crosscheck"]
-    assert cc["typed_lbs"] == pytest.approx(3204631.0)
-    assert cc["typed_kg"] == pytest.approx(85370.0)
     assert "NOT the user's volume" in cc["note"]
+
+    # RECOMPUTE-AND-RELATE: independently re-sum the typed plates-only volume per
+    # unit frame via raw SQL. The kg-native list is read straight from
+    # user_context.json (not process.py) and the category exclusion (10/11/12) is
+    # reproduced here — so this path shares no logic with the code under test.
+    # Production stores round(vol, 0); allow abs=1.0 for that rounding.
+    kg_names = json.load(open(os.environ["USER_CONTEXT_PATH"])) \
+        ["unit_overrides"]["exercises_in_kg"]
+    quoted = ", ".join("'" + n.replace("'", "''") + "'" for n in kg_names)
+    kg_pred = (f"(e.name IN ({quoted}) "
+               f"AND NOT (e.name = 'Deadlift' AND tl.date < '2025-12-26'))")
+
+    conn = sqlite3.connect(f"file:{os.environ['FITNOTES_DB_PATH']}?mode=ro", uri=True)
+    try:
+        indep_lbs = conn.execute(
+            "SELECT SUM(tl.metric_weight * 2.2046 * tl.reps) v FROM training_log tl "
+            "JOIN exercise e ON tl.exercise_id = e._id "
+            f"WHERE e.category_id NOT IN (10, 11, 12) AND NOT {kg_pred}"
+        ).fetchone()[0]
+        indep_kg = conn.execute(
+            "SELECT SUM(tl.metric_weight * 2.2046 * tl.reps) v FROM training_log tl "
+            "JOIN exercise e ON tl.exercise_id = e._id "
+            f"WHERE e.category_id NOT IN (10, 11, 12) AND {kg_pred}"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    assert cc["typed_lbs"] == pytest.approx(indep_lbs, abs=1.0)
+    assert cc["typed_kg"] == pytest.approx(indep_kg, abs=1.0)
