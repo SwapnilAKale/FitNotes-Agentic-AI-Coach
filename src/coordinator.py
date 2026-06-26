@@ -54,8 +54,10 @@ from src import memory as _memory
 try:
     from google.genai import errors as _genai_errors
     _GenaiClientError = _genai_errors.ClientError
+    _GenaiServerError = _genai_errors.ServerError
 except (ImportError, AttributeError):
     _GenaiClientError = None  # type: ignore[assignment]
+    _GenaiServerError = None  # type: ignore[assignment]
 
 try:
     from google.api_core.exceptions import ResourceExhausted as _ResourceExhausted
@@ -75,6 +77,15 @@ CONTEXT_WINDOW     = 6     # number of recent turns passed to Analysis Agent
 PER_MINUTE_WAIT_CAP    = 70   # s — cap on ONE wait; bounds the held request even if retryDelay is large
 PER_MINUTE_MAX_RETRIES = 2    # per stage — 2 waits clear all but pathological bursts before the daily fallback
 PER_MINUTE_BUFFER      = 2    # s added to retryDelay so we retry just AFTER the window resets
+
+# ── Transient 503 (model-overload) retry tuning ───────────────────────────────
+# A 503 UNAVAILABLE is a transient infra error, unrelated to routing. It carries
+# no retryDelay, so we use a fixed small wait (capped by PER_MINUTE_WAIT_CAP) and a
+# small retry bound. If it survives the retries, the caller fails clean — it must
+# NEVER fall back to the operational lane (operational has no read tools post-strip
+# and would fabricate an analytical answer).
+TRANSIENT_MAX_RETRIES = 2    # 503 is transient — a couple of capped waits, then clean-fail
+TRANSIENT_BACKOFF      = 5    # s — 503 carries no retryDelay; fixed small wait
 
 # ── Write-intent guard (#3/#8 rework) ─────────────────────────────────────────
 # The pre-guard's job is to catch IMPERATIVE writes (commands to RECORD data) so
@@ -194,6 +205,21 @@ def _filler_reply(message: str) -> Optional[str]:
     return None
 
 
+# ── Clean-fail messages for analytical-pipeline failures ──────────────────────
+# These ship to the user when the analytical pipeline cannot complete. The lane is
+# NEVER downgraded to operational (operational has no read tools post-strip and
+# would fabricate an analytical answer). No "say continue" — these are terminal
+# clean failures, not checkpoint/resume statuses.
+_MSG_MODEL_BUSY = (
+    "The analysis service is busy right now (high demand). "
+    "I couldn't complete that analysis — please try again in a moment."
+)
+_MSG_PIPELINE_ERROR = (
+    "I couldn't complete that analysis right now. "
+    "Please try again, or contact support if this keeps happening."
+)
+
+
 def _is_rate_limit(exc: Exception) -> bool:
     """True if exc is a Gemini/google-api 429 / ResourceExhausted error."""
     if _ResourceExhausted is not None and isinstance(exc, _ResourceExhausted):
@@ -203,6 +229,54 @@ def _is_rate_limit(exc: Exception) -> bool:
             return True
     msg = str(exc)
     return "429" in msg or "RESOURCE_EXHAUSTED" in msg
+
+
+def _is_transient_server_error(exc: Exception) -> bool:
+    """
+    True ONLY for a transient 503 / UNAVAILABLE model-overload error (retryable).
+
+    Deliberately NOT 500/INTERNAL: a 500 may be a genuine bug, not a transient
+    overload, so it must fail clean rather than be retried (and never reroute).
+    502/504 are likewise excluded for now — match 503/UNAVAILABLE only. 5xx errors
+    surface as google.genai ServerError (4xx, incl. 429, are ClientError), so the
+    isinstance check disambiguates 503 from 500 via .code/.status; the string
+    fallback covers cases where the genai types are unavailable.
+    """
+    if _GenaiServerError is not None and isinstance(exc, _GenaiServerError):
+        code   = getattr(exc, "code", None)
+        status = (getattr(exc, "status", "") or "").upper()
+        return code == 503 or status == "UNAVAILABLE"   # ServerError(500) → False
+    msg = str(exc)
+    return "503" in msg or "UNAVAILABLE" in msg          # "500" not matched
+
+
+def _normalize_cardio_lock(raw: Optional[dict]) -> Optional[dict]:
+    """
+    Deterministic unit normalization for a cardio PR lock (6b) — NOT the LLM.
+    The classifier emits {field, value, unit} (e.g. {"distance",5,"km"},
+    {"duration",10,"min"}); convert to base units the data layer expects:
+      duration → SECONDS  (min→×60; s/sec→as-is)
+      distance → KM       (km→as-is; m→/1000; mi/mile→×1.609)
+    Returns {"field","value"} or None when field/value are missing/invalid.
+    """
+    if not isinstance(raw, dict):
+        return None
+    field = raw.get("field")
+    value = raw.get("value")
+    if field not in ("distance", "duration") or not isinstance(value, (int, float)):
+        return None
+    unit = (raw.get("unit") or "").strip().lower()
+    if field == "duration":
+        secs = value * 60 if unit in ("min", "minute", "minutes") else value
+        return {"field": "duration", "value": secs}
+    # distance → km
+    if unit in ("m", "meter", "meters", "metre", "metres"):
+        km = value / 1000
+    elif unit in ("mi", "mile", "miles"):
+        km = value * 1.609
+    else:                                   # km (default) / unspecified
+        km = value
+    return {"field": "distance", "value": km}
 
 
 # ── Classification prompt ─────────────────────────────────────────────────────
@@ -333,6 +407,14 @@ PARAMETER EXTRACTION (analytical route only):
     "last year"          → 365
     "all time" / "ever"  → null
     not specified        → 90  (default)
+  rep_target:        integer rep count ONLY when the question asks for a PR at a
+                     specific rep count ("5-rep PR", "PR for 3 reps", "best set of 8")
+                     → 5 / 3 / 8. null otherwise (an ordinary "what's my bench PR" is null).
+  cardio_lock:       for a cardio PR that fixes one quantity, an object
+                     {"field": "distance"|"duration", "value": <number>, "unit": "<unit>"};
+                     null otherwise. Examples: "fastest 5km" → {"field":"distance","value":5,"unit":"km"};
+                     "most distance in 10 minutes" → {"field":"duration","value":10,"unit":"min"}.
+                     Emit the value and unit as stated — do NOT convert units yourself.
 
 CUSTOM SQL (analytical route only):
   Set needs_custom_sql=true ONLY for analytical questions that require a
@@ -351,6 +433,8 @@ Return ONLY valid JSON, no preamble, no markdown fences:
   "exercise_names": ["..."] | null,
   "muscle_groups": ["..."] | null,
   "query_period_days": 90 | null,
+  "rep_target": 5 | null,
+  "cardio_lock": {"field": "distance"|"duration", "value": 5, "unit": "km"} | null,
   "needs_custom_sql": false,
   "custom_sql_intent": null
 }
@@ -626,13 +710,27 @@ class Coordinator:
                     f"Please try again or contact support if this persists."
                 )
             except Exception as e:
+                # An analytical-pipeline failure NEVER falls back to operational:
+                # post-strip, operational has no read tools and would fabricate an
+                # answer. Mirror the resume path's contract — retry/clean-fail only.
                 if _is_rate_limit(e):
-                    raise
-                logger.error("[coordinator] analytical pipeline failed: %s", e)
-                # Fall back to operational on pipeline failure
-                route  = "operational"
-                error  = str(e)
-                answer = await self._run_operational(question)
+                    raise                              # 429 → server countdown (unchanged)
+                elif _is_transient_server_error(e):
+                    # The per-stage retry already tried; this 503 is persistent.
+                    # Clean-fail (no checkpoint, no reroute) — say try again.
+                    logger.warning(
+                        "[coordinator] analytical pipeline hit a transient 503: %s", e)
+                    error  = str(e)
+                    answer = _MSG_MODEL_BUSY
+                else:
+                    # Genuine pipeline bug — surface a clean failure, never operational.
+                    # logger.exception captures the traceback: the user only sees the
+                    # clean _MSG_PIPELINE_ERROR, so the log is the sole debug surface.
+                    logger.exception("[coordinator] analytical pipeline failed: %s", e)
+                    error  = str(e)
+                    answer = _MSG_PIPELINE_ERROR
+                # route stays "analytical": the request WAS analytical and simply
+                # could not complete.
         else:
             answer = await self._run_operational(question)
 
@@ -660,10 +758,16 @@ class Coordinator:
         or exhausted per-minute retries, propagates unchanged so the caller's
         daily path (checkpoint + QuotaInterrupted) runs.
 
+        Also absorbs TRANSIENT 503s (model overload): a fixed capped wait, retried
+        up to TRANSIENT_MAX_RETRIES (503 carries no retryDelay). An exhausted 503
+        propagates unchanged so the caller fails clean — it is NEVER rerouted to
+        operational.
+
         NOTE: agent_lock is held for the duration of the wait (single-user
         assumption — a concurrent /chat gets the existing 'busy' 429).
         """
         attempt = 0
+        transient_attempt = 0
         while True:
             try:
                 return await fn(*args, **kwargs)
@@ -679,6 +783,17 @@ class Coordinator:
                     )
                     await asyncio.sleep(wait)
                     attempt += 1
+                    continue
+                if (_is_transient_server_error(e)
+                        and transient_attempt < TRANSIENT_MAX_RETRIES):
+                    wait = min(TRANSIENT_BACKOFF, PER_MINUTE_WAIT_CAP) + PER_MINUTE_BUFFER
+                    logger.warning(
+                        "[coordinator] transient 503 — waiting %ds then retrying "
+                        "(attempt %d/%d), request held open",
+                        wait, transient_attempt + 1, TRANSIENT_MAX_RETRIES,
+                    )
+                    await asyncio.sleep(wait)
+                    transient_attempt += 1
                     continue
                 raise
 
@@ -894,6 +1009,8 @@ class Coordinator:
             params.setdefault("exercise_names",    None)
             params.setdefault("muscle_groups",     None)
             params.setdefault("query_period_days", 90)
+            params.setdefault("rep_target",        None)
+            params.setdefault("cardio_lock",       None)
             params.setdefault("needs_custom_sql",  False)
             params.setdefault("custom_sql_intent", None)
             return params
@@ -993,7 +1110,11 @@ class Coordinator:
             )
             resolved = []
             for name in exercise_names:
-                result = resolve_exercise_name(name, db_path)
+                # READ path → permissive: auto-resolve a clear-margin LIKE-tier
+                # winner (e.g. "walk" → Walking) instead of disambiguating. The
+                # write/MCP path keeps the strict default (a wrong write is
+                # unrecoverable).
+                result = resolve_exercise_name(name, db_path, permissive=True)
                 match = result.get("match")
                 candidates = result.get("candidates") or []
                 if match:
@@ -1020,6 +1141,12 @@ class Coordinator:
         muscle_groups     = muscle_groups or None
         query_period_days = params.get("query_period_days", 90)
 
+        # 6b: parameterized PR targets. rep_target threads straight through; the cardio
+        # lock is unit-normalized here (deterministic Python — the LLM emits {value,unit},
+        # never seconds). Both default None → the unchanged static PR.
+        reps_floor  = params.get("rep_target")
+        cardio_lock = _normalize_cardio_lock(params.get("cardio_lock"))
+
         # Build compact package (scope-aware trim: BROAD 365d ≈ 396 KB)
         pkg = await asyncio.to_thread(
             prepare_analysis_package,
@@ -1027,6 +1154,8 @@ class Coordinator:
             exercise_names=exercise_names,
             muscle_groups=muscle_groups,
             include_phase2=True,
+            reps_floor=reps_floor,
+            cardio_lock=cardio_lock,
         )
 
         # Pop unresolved exercise names before the LLM sees the package.
@@ -1212,6 +1341,43 @@ class Coordinator:
                 )
                 raise _ckpt.QuotaInterrupted(e, _ckpt.MSG_VERIFY_INTERRUPTED)
             raise
+
+        # ── Stage: DISPLAY SETS CHECK (deterministic verbatim-integrity) ───────
+        # When the package carries pre-formatted display strings, grounding
+        # ignores them (correct — not citable). This check guarantees they
+        # survive verbatim into the answer: re-prompt ONCE for a verbatim
+        # reproduction, else assemble them raw from the package (no LLM).
+        if pkg.get("display_sets"):
+            base_answer = answer
+
+            async def _reframe_display():
+                reframe_context = list(conversation_context or []) + [
+                    {"role": "assistant", "content": base_answer},
+                    {"role": "user", "content": (
+                        "Reproduce the per-set display lines from the package EXACTLY "
+                        "and VERBATIM — character-for-character, including weights, "
+                        "reps, comments, and arrows. Do not paraphrase, round, or "
+                        "summarise them."
+                    )},
+                ]
+                tagged = await self._call_with_per_minute_retry(
+                    analysis_agent.analyze,
+                    pkg, scoped_question, research, memories,
+                    reframe_context, custom_query)
+                return _cite.strip_tags(tagged)
+
+            try:
+                answer = await analysis_agent.enforce_display_fidelity(
+                    base_answer, pkg, _reframe_display)
+            except Exception as e:
+                # The re-frame is an LLM call; if it fails, APPEND the deterministic
+                # raw block to the existing answer so the strings reach the user
+                # WITHOUT discarding the generated analysis (repair, never replace).
+                logger.warning(
+                    "[coordinator] display-fidelity re-frame failed (%s) — appending raw block", e)
+                answer = (analysis_agent.append_missing_display(base_answer, pkg)
+                          if analysis_agent.display_sets_missing(base_answer, pkg)
+                          else base_answer)
 
         # Prefix answer when requested exercises weren't found in the DB.
         # Partial resolution (some names matched) covers the matched

@@ -272,8 +272,12 @@ def test_module_docstring_rationale_flipped():
 
 _STRIPPED = {"get_personal_record", "get_weekly_volume",
              "query_workout_data", "run_read_only_sql"}
-_KEPT_READS = {"get_exercise_sessions", "resolve_exercise_name",
-               "read_exercise_comments", "get_exercise_history"}
+# Stage 4a: the three read/display tools moved off the operational agent —
+# session-display is served by the analytical lane (src/data_agent/session_display.py).
+_UNEXPOSED_DISPLAY = {"get_exercise_sessions", "read_exercise_comments",
+                      "get_exercise_history"}
+# resolve_exercise_name STAYS exposed — writes need a pre-resolved exact name.
+_KEPT_READS = {"resolve_exercise_name"}
 _KEPT_OTHER = {"log_workout", "execute_staged_workout", "update_workout_set",
                "delete_workout_set", "set_goal", "search_fitness_knowledge",
                "remember_fact", "recall_memories"}
@@ -287,6 +291,25 @@ def _exposed_tool_names():
 def test_four_analysis_read_tools_unexposed():
     names = _exposed_tool_names()
     assert _STRIPPED.isdisjoint(names), f"still exposed: {_STRIPPED & names}"
+
+
+def test_display_read_tools_unexposed_stage4a():
+    # Stage 4a: the three read/display tools are no longer exposed to the
+    # operational agent; resolve_exercise_name remains (writes depend on it).
+    names = _exposed_tool_names()
+    assert _UNEXPOSED_DISPLAY.isdisjoint(names), (
+        f"still exposed to operational: {_UNEXPOSED_DISPLAY & names}")
+    assert "resolve_exercise_name" in names
+
+
+def test_display_handlers_still_exist_unexposed_not_deleted():
+    # Unexpose, don't delete: the _sync handlers stay for analytical reuse /
+    # evals / tests (e.g. tests/test_session_display.py imports
+    # _get_exercise_sessions_sync as the equality oracle).
+    import mcp_servers.combined_server as srv
+    for fn in ("_get_exercise_sessions_sync", "_get_exercise_history_sync",
+               "_read_exercise_comments_sync"):
+        assert hasattr(srv, fn), f"{fn} must remain (unexpose, not delete)"
 
 
 def test_kept_tools_still_exposed():
@@ -312,16 +335,19 @@ def test_unused_reuse_functions_removed():
 
 def test_system_prompt_drops_removed_tools():
     from src.agent import SYSTEM_PROMPT
-    for t in _STRIPPED:
+    # Stage 4a prompt cleanup: the prompt must not advertise ANY unexposed read
+    # tool — the four Step-C reads AND the three display reads. A prompt that still
+    # names a tool the model can't call is the fabrication mechanism.
+    for t in (_STRIPPED | _UNEXPOSED_DISPLAY):
         assert t not in SYSTEM_PROMPT, f"SYSTEM_PROMPT still references {t}"
 
 
-def test_system_prompt_keeps_write_and_display_flow():
+def test_system_prompt_keeps_write_flow_and_resolve():
     from src.agent import SYSTEM_PROMPT
     # write/edit flow still uses the kept tools and reaches the confirmation gate
     assert "WRITE ACTIONS" in SYSTEM_PROMPT
-    assert "get_exercise_sessions" in SYSTEM_PROMPT
-    assert "resolve_exercise_name" in SYSTEM_PROMPT
+    assert "resolve_exercise_name" in SYSTEM_PROMPT          # kept — writes need it
     assert "update_workout_set" in SYSTEM_PROMPT and "delete_workout_set" in SYSTEM_PROMPT
-    # session-display rule intact
-    assert "SESSION DISPLAY RULE" in SYSTEM_PROMPT
+    # the prompt now states operational does NOT read/analyze workout data, so a
+    # misrouted read declines honestly instead of fabricating
+    assert "DO NOT READ OR ANALYZE WORKOUT DATA" in SYSTEM_PROMPT

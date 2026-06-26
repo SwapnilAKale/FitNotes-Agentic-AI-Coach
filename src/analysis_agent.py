@@ -156,6 +156,9 @@ Tags have EXACTLY three parts ([[collection|match-key|field-path]]) — never fo
   • Tag every numeric, factual, hedge, and absence claim — no exceptions.
   • The field-path must appear in the [CITABLE SCHEMA] block — never invent one.
   • If you cannot cite a claim with a listed leaf, do not make the claim.
+  • EXCEPTION — DISPLAY lines: when a [DISPLAY] block is present, the pre-formatted
+    per-set strings you reproduce verbatim are NOT claims to cite. Leave them
+    tag-free; their fidelity is verified by a separate step.
 
 ════════════════════════════
 DATA RULES
@@ -519,6 +522,44 @@ def _fmt_conversation(conversation_context: Optional[list]) -> str:
     return "\n".join(lines)
 
 
+def _fmt_display(package: dict) -> str:
+    """
+    Approach (b): when the package carries pre-formatted session-display strings
+    (`display_sets`), guide the model to reproduce them VERBATIM for display-shaped
+    questions and to leave them tag-free (their fidelity is checked separately, and
+    grounding ignores them). Empty string when no display_sets are present.
+    """
+    display = package.get("display_sets") if package else None
+    if not display:
+        return ""
+    listing = "\n".join(display)
+    return (
+        "[DISPLAY] — the package contains pre-formatted, per-set display strings "
+        "for the session(s) in scope (listed below). If the QUESTION is "
+        "display-shaped (\"show me\", \"what did I do\", \"my last session\"), "
+        "reproduce these strings VERBATIM — character-for-character, including "
+        "weights, reps, comments, and any arrows — adding only light framing prose "
+        "around them. If the question is analytical, reason over the data normally. "
+        "These display lines are NOT citable: do NOT attach citation tags to them. "
+        "Cite only the analytical claims you make about the data.\n"
+        f"{listing}"
+    )
+
+
+def _fmt_pr_targets(package: dict) -> str:
+    """One-line pointer (6b): if a parameterized PR field is present, tell the model it
+    exists and that null means 'no qualifying set'. No behavioral rules."""
+    exes = (package or {}).get("exercises") or []
+    if not any(("pr_repfloor" in e or "pr_cardio_locked" in e) for e in exes):
+        return ""
+    return (
+        "[PR TARGET] — the question asked for a specific PR. An exercise may carry "
+        "`pr_repfloor` (heaviest set for a rep floor) or `pr_cardio_locked` (a locked "
+        "cardio PR). Answer from that field when present; if it is null, say there is "
+        "no qualifying set at that rep count / lock. The default `pr` is also present."
+    )
+
+
 def _fmt_custom_query(custom_query: Optional[dict]) -> str:
     if not custom_query:
         return ""
@@ -572,6 +613,12 @@ def _build_user_message(
         "never cite a field not listed here:\n" + citable_schema,
         _fmt_research(research),
     ]
+    display_block = _fmt_display(package)
+    if display_block:
+        sections.append(display_block)
+    pr_target_block = _fmt_pr_targets(package)
+    if pr_target_block:
+        sections.append(pr_target_block)
     custom_block = _fmt_custom_query(custom_query)
     if custom_block:
         sections.append(custom_block)
@@ -738,3 +785,64 @@ async def ground_check(
             "[analysis_agent] grounding check parse failed: %s — returning draft", e
         )
         return draft, []
+
+
+# ── DISPLAY SETS CHECK (deterministic — NO LLM in the check itself) ─────────────
+# Approach (b): grounding deliberately ignores `display_sets` (it is not a citable
+# scalar). This separate check owns VERBATIM fidelity of the pre-formatted display
+# strings: every one must survive into the final answer as a substring. If one was
+# altered/paraphrased/dropped, re-prompt the Analysis Agent ONCE to reproduce them
+# verbatim; if it still fails, emit the strings directly from the package (raw
+# assembly — no LLM). This is a containment check, not equality: light framing
+# prose around the strings is fine.
+
+
+def display_sets_missing(answer: str, package: dict) -> list:
+    """The display strings NOT present verbatim (as substrings) in the answer."""
+    display = (package or {}).get("display_sets") or []
+    return [s for s in display if s not in (answer or "")]
+
+
+def raw_display_assembly(package: dict) -> str:
+    """The no-LLM fallback: the package's display_sets joined plainly."""
+    return "\n".join((package or {}).get("display_sets") or [])
+
+
+def append_missing_display(answer: str, package: dict) -> str:
+    """
+    Non-destructive fallback: keep the generated answer and APPEND the verbatim
+    display block, guaranteeing the sets are present WITHOUT discarding analysis.
+    A fidelity-check failure means "the verbatim sets aren't all present" — the
+    safe repair is to add them, never to delete whatever analysis was written.
+
+    Empty package block → answer unchanged. Empty/blank answer → block alone.
+    """
+    block = raw_display_assembly(package)
+    if not block:
+        return answer
+    return f"{answer.rstrip()}\n{block}" if answer and answer.strip() else block
+
+
+async def enforce_display_fidelity(answer: str, package: dict, reframe) -> str:
+    """
+    Guarantee every `display_sets` string appears verbatim in the answer.
+
+      reframe: async callable () -> str — re-prompts the Analysis Agent to
+               reproduce the display strings verbatim (already tag-stripped by the
+               caller). Injected so this is testable without a live model.
+
+    Clean → return as-is. Missing → reframe ONCE; still missing → APPEND the raw
+    block to the original answer (repair, never replace — never discard analysis).
+    """
+    if not (package or {}).get("display_sets"):
+        return answer
+    if not display_sets_missing(answer, package):
+        return answer
+    logger.info("[analysis_agent] display-sets check: missing strings — re-framing once")
+    reframed = await reframe()
+    if not display_sets_missing(reframed, package):
+        return reframed
+    # Re-frame failed: APPEND the verbatim block to the ORIGINAL answer (not the
+    # failed reframe) so the real analysis survives and the exact sets are present.
+    logger.info("[analysis_agent] display-sets check: re-frame failed — appending raw block")
+    return append_missing_display(answer, package)
