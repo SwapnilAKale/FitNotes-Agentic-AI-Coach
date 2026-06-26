@@ -296,6 +296,8 @@ Analysis Agent — receives prepare_analysis_package() output, reasons over comp
 prepare_analysis_package() — wrapper over collect() that strips raw set arrays and returns compact analysis-ready summaries. Target size: 100-300 KB for any question, regardless of database size.
 Coordinator routing logic — single LLM call: is this analytical (multi-agent pipeline) or simple lookup (single-agent tools)? Wire into FastAPI /analyze endpoint.
 End-to-end testing — stress test the full Data Agent → Analysis Agent → Coordinator pipeline. Git commit on multi-agent branch after full verification.
+display_sets dedup — When a resolved exercise's category is also in muscle_groups (e.g. Lat Pulldown + Back), the category block already contains that exercise's session, so the package carries the session twice. Both blocks are built today (accepted, correct-but-unoptimized). Add a precise structural dedup later: skip the redundant exercise block when its category is present. Defer until the agent is otherwise solid; the dedup must remove the duplicate completely or not at all — a partial removal is worse than honest duplication.
+Multi-question / multi-task decomposition — The pipeline is single-question, single-route, single-lane end-to-end. A compound message ("is my squat progressing AND show me my last bench"; "log my bench then tell me my PR") is not served — one route is picked, the rest dropped. Needs a coordinator decomposition stage that splits the message, routes each sub-request independently, and assembles the results. Quota-heavy (N× classify+pipeline against 500 RPD / 250K TPM) — design as its own arc, likely the web-deployment phase. Requires a read-only diagnosis of current classifier behavior on compound input first.
 Single-Agent (near-term)
 Write-ahead log + DB merge — Currently agent-written workout data lives in the SQLite DB. When user uploads a fresh FitNotes backup, agent-written sets are overwritten. Fix: log every agent write to agent_writes.json. On new DB upload, replay the write log onto the new file before replacing the old one. Teaches transaction logging, SQLite conflict resolution, and data integrity across two sources.
 Session & Memory Architecture (Pre-Deployment)
@@ -376,13 +378,32 @@ present — weights and reps for strength, distance and duration for
 cardio, comments for any exercise type. "Every exercise logged was
 deliberately tracked and deserves performance analysis."
 
+Session-display is a normal package field, not a separate pipeline:
+`prepare_analysis_package()` builds a display block for every resolved exercise
+and muscle group in scope and concatenates them into one flat `display_sets`
+`list[str]` of pre-formatted per-set lines (built by
+`src/data_agent/session_display.py`). No exclusive choice between scopes — a
+question that names an exercise and its parent group gets both blocks. The agent
+decides display-vs-analyze from the question — there is no routing flag, and
+superset display data is safe (analytical questions ignore it). Grounding ignores
+`display_sets` (it is not a citable scalar); a separate deterministic DISPLAY SETS
+CHECK owns verbatim fidelity (re-prompt once, then raw assembly — no LLM).
+
 **Coordinator (`src/coordinator.py`) — complete**
 
 Single entry point for every user message. One classification call
 (temperature=0, thinking_budget=0) extracts route, exercise_names,
-muscle_groups, query_period_days. Routes to:
+muscle_groups, query_period_days, and PR targets — `rep_target` (e.g.
+"5-rep PR") and `cardio_lock` (e.g. "fastest 5km"). The coordinator
+normalizes lock units deterministically (min→seconds, km→km — the LLM
+never emits seconds) and threads them into the package, which then carries
+`pr_repfloor` / `pr_cardio_locked` alongside the unchanged default `pr`
+(a null value means "no qualifying set", not an error). The rep-floor PR is
+deliberately NOT warmup-filtered (unlike the default max-weight PR), so a
+wrongly-flagged warmup can never drop a real working-set PR. Routes to:
 - Analytical: Data Agent → prepare_analysis_package() → Analysis Agent
   → grounding check → coverage check (1 retry if incomplete)
+  → display-sets check (verbatim integrity, only when `display_sets` is present)
 - Operational: existing AgentSession.answer() via MCP tools
 
 Exercise names from the classifier are resolved through
@@ -403,8 +424,18 @@ Cardio exercises (is_cardio=True) receive a clean, purpose-built
 structure in `prepare_analysis_package()` with no strength fields:
 `sessions` (date, distance_km, duration_seconds), `progression`
 (distance and duration trend), `last_session_date`, `days_since_last`,
-`all_time_sessions`, `total_sessions_period`. Strength-specific fields
-(max_working_weight, reps_at_max, estimated_1rm, volume, etc.) are
+`all_time_sessions`, `total_sessions_period`, and a cardio-native `pr`
+(distance/duration, never weight/reps — default = farthest distance, or
+longest duration for duration-only exercises like Cycling). Mirroring strength's
+dual field, `pr` is **all-time** (computed over the all-time session list threaded
+from `process_data`) while `pr_period` is the within-window stat; a parameterized
+`pr_cardio_locked` ("fastest 5km") is likewise all-time. Every cardio PR carries
+its session comment — including an all-time PR whose date falls outside the query
+period (the comment enrichment sources from the all-time session superset).
+Session display renders cardio as "{distance} km in {duration}s ({pace} min/km)"
+(or "{duration}s" for duration-only), never the strength weight×reps template.
+Strength-specific
+fields (max_working_weight, reps_at_max, estimated_1rm, volume, etc.) are
 stripped entirely. The exercise is also removed from
 `exercise_lifecycle` so the Analysis Agent cannot anchor on all-time
 summary counts instead of period-specific progression data.
@@ -931,7 +962,7 @@ names the bug it catches:
 | B5 | every `max_working_weight` equals an actual set headline in that session | invented session max |
 | B6 | no negative weight/reps/distance/duration | sign/parse errors |
 | B7 | cross-unit comparisons are kg-normalized (Deadlift lbs→kg), never raw display | 150 lbs ranked above 70 kg |
-| B8 | `is_pr_session`/`pr_velocity`/`pr_count`/`pr_context`/`learning_curve` from real weights, not the flag | flag leakage (tracked gap until fully refactored) |
+| B8 | `total_prs_alltime`/`prs_per_month_alltime`/`is_pr_session`/`pr_velocity`/`pr_count`/`pr_context`/`learning_curve` recomputed from PR-EVENT dates (`_pr_event_dates`: running-max walk over working sets — new max weight OR more reps at the top weight — same kg-normalized headline basis as the all-time PR), never the `is_personal_record` flag. The flag under-counts (it misses same-weight-more-reps beats: real-DB 155 flagged vs 559 true events). Excluded only for CARDIO (own distance/duration PR object), by `category == "Cardio"` — NOT a weight=0 proxy, which would wrongly drop bodyweight reps-progression | flag leakage (flag fetch/bundle removal is sub-stage 2) |
 | C1 | cardio `distance>0` ⇒ `distance_progression` non-null and > 0 | H3 single-session distance null |
 | C2 | cardio `duration_seconds>0` ⇒ duration progression populated | duration dropped |
 | C3 | `all_time_sessions` non-null when ≥1 all-time session | H2 `total_sessions_alltime` key typo |

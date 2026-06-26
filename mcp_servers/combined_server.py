@@ -51,27 +51,14 @@ def _get_kb():
 async def list_tools() -> list[types.Tool]:
     # Step C, Part 3: get_personal_record / query_workout_data / get_weekly_volume /
     # run_read_only_sql are UNEXPOSED from the operational agent (their reads now
-    # route analytical, where the package answers them deterministically). The
-    # dispatch handlers and _sync functions remain below for analytical reuse and
-    # evals — this is unexposing, not deleting.
+    # route analytical, where the package answers them deterministically).
+    # Stage 4a: get_exercise_history / read_exercise_comments / get_exercise_sessions
+    # are ALSO unexposed — session-display now lives on the analytical lane
+    # (src/data_agent/session_display.py). resolve_exercise_name stays exposed
+    # (writes require a pre-resolved exact name). The dispatch handlers and _sync
+    # functions remain below for analytical reuse / evals / tests — unexposing,
+    # not deleting.
     return [
-        types.Tool(
-            name="get_exercise_history",
-            description="get_exercise_history(exercise_name, days) -> [{date, weight, reps}] — recent sets for an exercise",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "exercise_name": {
-                        "type": "string",
-                        "description": "exercise name",
-                    },
-                    "days": {
-                        "description": "number of days to look back (default 30)",
-                    },
-                },
-                "required": ["exercise_name"],
-            },
-        ),
         types.Tool(
             name="list_user_articles",
             description="list_user_articles() -> {articles} — list PDF articles user has added to knowledge base",
@@ -120,35 +107,6 @@ async def list_tools() -> list[types.Tool]:
                     }
                 },
                 "required": ["user_term"],
-            },
-        ),
-        types.Tool(
-            name="read_exercise_comments",
-            description="SCHEMA_GAMMA_9981: read_exercise_comments(exercise_name) -> [{set, comment}] + interpretation_note — form and notation notes",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "exercise_name": {
-                        "type": "string",
-                        "description": "exact exercise name (use resolve_exercise_name first if unsure)",
-                    },
-                    "date": {
-                        "type": "string",
-                        "description": "Session date to fetch comments for (YYYY-MM-DD). Required — always pass the date from the session data you already fetched.",
-                    },
-                    "date_from": {
-                        "type": "string",
-                        "description": "start date YYYY-MM-DD (optional, for range queries)",
-                    },
-                    "date_to": {
-                        "type": "string",
-                        "description": "end date YYYY-MM-DD (optional, for range queries)",
-                    },
-                    "limit": {
-                        "description": "max comments to return, default 15, max 15 (optional)",
-                    },
-                },
-                "required": ["exercise_name", "date"],
             },
         ),
         types.Tool(
@@ -402,41 +360,6 @@ async def list_tools() -> list[types.Tool]:
                     "unit": {"type": "string", "enum": ["lbs", "kg"]},
                 },
                 "required": ["exercise_name", "date", "weight", "reps", "unit"],
-            },
-        ),
-        types.Tool(
-            name="get_exercise_sessions",
-            description="get_exercise_sessions(exercise_name, mode, ...) -> [{date, sets, max_weight}] — find sessions by date",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "exercise_name": {
-                        "type": "string",
-                        "description": "exact exercise name",
-                    },
-                    "mode": {
-                        "type": "string",
-                        "enum": ["recent", "approximate", "range"],
-                        "description": "recent: last N sessions; approximate: within ±7 days of a date; range: between two dates",
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "number of sessions to return (default 10, max 20); used for mode 'recent'",
-                    },
-                    "approximate_date": {
-                        "type": "string",
-                        "description": "YYYY-MM-DD centre date; used for mode 'approximate'",
-                    },
-                    "date_from": {
-                        "type": "string",
-                        "description": "YYYY-MM-DD start of range; used for mode 'range'",
-                    },
-                    "date_to": {
-                        "type": "string",
-                        "description": "YYYY-MM-DD end of range; used for mode 'range'",
-                    },
-                },
-                "required": ["exercise_name", "mode"],
             },
         ),
         types.Tool(
