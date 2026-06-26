@@ -98,9 +98,32 @@ def _strip_set_label(text):
 
 
 # ── display_sets assembly (verbatim port of combined_server.py:2294-2333) ────────
-def _build_display_sets(sess_sets, unit):
+def _cardio_set_line(s) -> str:
+    """Cardio per-set content: distance/duration/pace, never weight×reps.
+    Pace uses the SAME formula + rounding as the package's pace_min_per_km
+    (process.py `_build_session_dict`), so display and PR-layer pace never disagree.
+    """
+    dist = s.get("distance") or 0
+    dur  = s.get("duration_seconds") or 0
+    if dist > 0:
+        line = f"{dist} km in {dur}s"
+        if dur > 0:
+            pace = round((dur / 60) / dist, 2)
+            line += f" ({pace} min/km)"
+    else:
+        line = f"{dur}s"
+    if s.get("comment"):
+        line += f" ({s['comment'].strip()})"
+    return line
+
+
+def _build_display_sets(sess_sets, unit, is_cardio=False):
     if not sess_sets:
         return []
+    if is_cardio:
+        # Cardio has no weight/reps, warmups, or drop-sets — render distance/
+        # duration/pace directly, one "Set N" line per logged entry.
+        return [f"Set {i}: {_cardio_set_line(s)}" for i, s in enumerate(sess_sets, 1)]
     # Display the bar-inclusive weight, but compute the warmup ratio on
     # PLATES (pre-bar) so the constant bar doesn't shift which opener is a
     # warmup — preserves the prior plates-based behavior.
@@ -141,13 +164,16 @@ def _build_display_sets(sess_sets, unit):
 
 
 # ── Shared display core (verbatim port of combined_server.py:2237-2349) ──────────
-def _build_session_displays(raw_rows, ctx, exercise_name) -> list:
+def _build_session_displays(raw_rows, ctx, exercise_name, is_cardio=False) -> list:
     """
     The SINGLE shared display core, called by both modes.
 
-    raw_rows: rows carrying _id, date, typed_weight, reps, comment (same shape and
-    aliases as the operational base_select; comment bound by FK at fetch time).
-    Caller controls row ORDER (date DESC, _id ASC) — grouping preserves it.
+    raw_rows: rows carrying _id, date, typed_weight, reps, distance, duration_seconds,
+    comment (same shape and aliases as the operational base_select; comment bound by FK
+    at fetch time). Caller controls row ORDER (date DESC, _id ASC) — grouping preserves it.
+
+    is_cardio: render distance/duration/pace lines instead of weight×reps (cardio rows
+    store weight=reps=0).
 
     Returns [{date, unit, max_weight, total_sets, display_sets}] in the order the
     dates first appear in raw_rows (recency order for the standard ORDER BY).
@@ -169,6 +195,8 @@ def _build_session_displays(raw_rows, ctx, exercise_name) -> list:
             "plates":    plates,                   # plates-only, for warmup ratio
             "unit":      unit,
             "reps":      r["reps"],
+            "distance":  r["distance"],            # cardio: km (may be 0/None)
+            "duration_seconds": r["duration_seconds"],   # cardio: seconds (may be 0/None)
             "comment":   r["comment"],             # bound by id at fetch time (may be None)
         })
 
@@ -192,7 +220,7 @@ def _build_session_displays(raw_rows, ctx, exercise_name) -> list:
             s["drop_group"] = _parse_set_num(raw_comment)
             s["comment"] = _strip_set_label(raw_comment)
 
-        session["display_sets"] = _build_display_sets(session["sets"], session["unit"])
+        session["display_sets"] = _build_display_sets(session["sets"], session["unit"], is_cardio)
         del session["sets"]
 
     return sessions
@@ -201,6 +229,7 @@ def _build_session_displays(raw_rows, ctx, exercise_name) -> list:
 # ── Single-exercise mode (faithful port of _get_exercise_sessions_sync) ──────────
 _BASE_SELECT = """
     SELECT tl._id, tl.date, tl.metric_weight AS typed_weight, tl.reps,
+           tl.distance, tl.duration_seconds,
            c.comment AS comment
     FROM training_log tl
     LEFT JOIN Comment c ON c.owner_id = tl._id
@@ -225,10 +254,13 @@ def get_exercise_sessions(exercise_name: str, mode: str = "recent",
     date_from == date_to, matching the operational tool's surface.
     """
     conn = get_connection(DB_PATH)
-    row = conn.execute("SELECT _id FROM exercise WHERE name = ?", (exercise_name,)).fetchone()
+    row = conn.execute(
+        "SELECT _id, category_id FROM exercise WHERE name = ?", (exercise_name,)
+    ).fetchone()
     if not row:
         return {"error": f"Exercise '{exercise_name}' not found."}
     exercise_id = row["_id"]
+    is_cardio = CATEGORY_NAMES.get(row["category_id"]) == "Cardio"
 
     try:
         if mode == "recent":
@@ -260,7 +292,7 @@ def get_exercise_sessions(exercise_name: str, mode: str = "recent",
     except Exception:
         ctx = {}
 
-    sessions = _build_session_displays(raw_rows, ctx, exercise_name)
+    sessions = _build_session_displays(raw_rows, ctx, exercise_name, is_cardio)
     if mode == "recent":
         sessions = sessions[:limit]
 
@@ -283,6 +315,7 @@ def get_exercise_sessions(exercise_name: str, mode: str = "recent",
 # ── Category mode (NEW) ──────────────────────────────────────────────────────────
 _CATEGORY_SELECT = """
     SELECT tl._id, tl.date, tl.metric_weight AS typed_weight, tl.reps,
+           tl.distance, tl.duration_seconds,
            e.name AS exercise_name, c.comment AS comment
     FROM training_log tl
     JOIN exercise e ON tl.exercise_id = e._id
@@ -294,6 +327,21 @@ _CATEGORY_SELECT = """
 
 def _empty_category(canon, category):
     return {"category": canon or category, "date": None, "exercises": [], "count": 0}
+
+
+def _resolve_cat_id(category: str):
+    """
+    (canon, cat_id) for a muscle-group category. cat_id is None when the category
+    is unknown OR is an excluded non-muscle category (Time/Place/Neck). canon is
+    still returned when the name matched a muscle group, so callers can name it.
+    """
+    canon = match_muscle_group(category)
+    if not canon:
+        return None, None
+    cat_id = {v: k for k, v in CATEGORY_NAMES.items()}.get(canon)
+    if cat_id is None or cat_id in EXCLUDED_CATEGORY_IDS:
+        return canon, None
+    return canon, cat_id
 
 
 def get_category_session(category: str, target: str = "recent") -> dict:
@@ -311,12 +359,8 @@ def get_category_session(category: str, target: str = "recent") -> dict:
     Time/Place/Neck (ids 10/11/12) are not muscle-group categories and resolve to
     an empty result.
     """
-    canon = match_muscle_group(category)
-    if not canon:
-        return _empty_category(canon, category)
-    name_to_id = {v: k for k, v in CATEGORY_NAMES.items()}
-    cat_id = name_to_id.get(canon)
-    if cat_id is None or cat_id in EXCLUDED_CATEGORY_IDS:
+    canon, cat_id = _resolve_cat_id(category)
+    if cat_id is None:
         return _empty_category(canon, category)
 
     conn = get_connection(DB_PATH)
@@ -355,9 +399,10 @@ def get_category_session(category: str, target: str = "recent") -> dict:
     for r in rows:
         by_exercise.setdefault(r["exercise_name"], []).append(r)
 
+    cat_is_cardio = canon == "Cardio"
     exercises = []
     for ex_name, ex_rows in by_exercise.items():
-        sess = _build_session_displays(ex_rows, ctx, ex_name)[0]  # single date → one session
+        sess = _build_session_displays(ex_rows, ctx, ex_name, cat_is_cardio)[0]  # single date → one session
         block = {
             "exercise":    ex_name,
             "unit":        sess["unit"],
@@ -378,3 +423,105 @@ def get_category_session(category: str, target: str = "recent") -> dict:
         "exercises": exercises,
         "count": len(exercises),
     }
+
+
+# ── Approach (b): flat display_sets for the analytical package ────────────────────
+# build_display_sets is the ONLY new entry point the package builder calls. It
+# reuses get_exercise_sessions / get_category_session for the verbatim formatting
+# (unchanged — their byte-equality tests stay valid), applies the ≤1 prior-session
+# trigger, and flattens the result to a flat list[str] of self-contained header +
+# per-set lines (the package's `display_sets` field).
+
+
+def _exercise_prior_needed(sessions: list) -> bool:
+    """Single-exercise ≤1 trigger (SETS-ONLY): the exercise-count is structurally
+    1, so include the prior session iff the most-recent date had ≤1 set."""
+    return bool(sessions) and sessions[0]["total_sets"] <= 1 and len(sessions) > 1
+
+
+def _category_prior_needed(blocks: list) -> bool:
+    """Category ≤1 trigger: include the prior category date iff the most-recent
+    date was thin — ≤1 distinct exercise OR ≤1 set total across the date."""
+    if not blocks:
+        return False
+    return len(blocks) <= 1 or sum(b["total_sets"] for b in blocks) <= 1
+
+
+def _prior_category_date(category: str, before_date: str):
+    """Next-most-recent date (< before_date) ANY exercise in this category was
+    trained, or None when none exists."""
+    _, cat_id = _resolve_cat_id(category)
+    if cat_id is None:
+        return None
+    conn = get_connection(DB_PATH)
+    _excl = ", ".join(str(c) for c in EXCLUDED_CATEGORY_IDS)
+    row = conn.execute(
+        f"""SELECT MAX(tl.date) AS d
+            FROM training_log tl
+            JOIN exercise e ON tl.exercise_id = e._id
+            WHERE e.category_id = ? AND e.category_id NOT IN ({_excl})
+              AND tl.date < ?""",
+        (cat_id, before_date),
+    ).fetchone()
+    return row["d"] if row and row["d"] else None
+
+
+def _flatten_exercise_sessions(sessions: list, exercise_name: str) -> list:
+    """[{date, total_sets, display_sets}] → flat header + set-line strings."""
+    out: list = []
+    for s in sessions:
+        out.append(f"{s['date']} — {exercise_name} ({s['total_sets']} sets):")
+        out.extend(s["display_sets"])
+    return out
+
+
+def _flatten_category_blocks(date_str: str, category: str, blocks: list) -> list:
+    """One date's per-exercise blocks → flat header + set-line strings."""
+    out: list = [f"{date_str} — {category}:"]
+    for b in blocks:
+        out.append(f"{b['exercise']} ({b['total_sets']} sets):")
+        out.extend(b["display_sets"])
+        # bar_weight_note is an INTERNAL hint (kept as a dict key on the structured
+        # return) — it must NOT enter the flat display_sets list, or the verbatim
+        # DISPLAY SETS CHECK forces it into the user-facing answer.
+    return out
+
+
+def build_display_sets(kind: str, target: str) -> list:
+    """
+    The flat list[str] attached to the analytical package as `display_sets`.
+
+      kind == "exercise"  → target is the resolved exercise name.
+      kind == "category"  → target is the muscle-group name.
+
+    "Last session" semantics: the single most-recent date in scope, PLUS the prior
+    session when the ≤1 trigger fires (sets-only for an exercise; ≤1 exercise OR
+    ≤1 set for a category). Returns [] when the scope has no logged sessions.
+    """
+    if kind == "exercise":
+        r = get_exercise_sessions(target, mode="recent")
+        sessions = r.get("sessions") or []
+        if not sessions:
+            return []
+        included = sessions[:2] if _exercise_prior_needed(sessions) else sessions[:1]
+        out = _flatten_exercise_sessions(included, r["exercise"])
+        # bar_weight_note stays a dict key on r (structured return); never appended
+        # to the flat list (the verbatim DISPLAY SETS CHECK would leak it to the user).
+        return out
+
+    if kind == "category":
+        r = get_category_session(target, "recent")
+        blocks = r.get("exercises") or []
+        if not blocks or not r.get("date"):
+            return []
+        out = _flatten_category_blocks(r["date"], r["category"], blocks)
+        if _category_prior_needed(blocks):
+            prior = _prior_category_date(r["category"], r["date"])
+            if prior:
+                pr = get_category_session(r["category"], prior)
+                pblocks = pr.get("exercises") or []
+                if pblocks:
+                    out += _flatten_category_blocks(pr["date"], pr["category"], pblocks)
+        return out
+
+    return []

@@ -305,7 +305,8 @@ def _detect_warmup_flags(sets: list,
                           exercise_name: str = "",
                           ctx: dict = None,
                           weight_eligible: bool = True,
-                          exercise_alltime_max: float = 0.0) -> None:
+                          exercise_alltime_max: float = 0.0,
+                          session_date: str = None) -> None:
     """
     Tier 1 pre-pass — mark AT MOST ONE warmup set per session, always the
     first set (lowest set_id).
@@ -318,7 +319,12 @@ def _detect_warmup_flags(sets: list,
     on that day (category-first-exercise gate). Explicit "warmup" always wins.
 
     exercise_alltime_max: the exercise's all-time max headline weight (plates +
-    bar), used only for the 0-weight-opener gate.
+    bar), kg-NORMALIZED, used only for the 0-weight-opener gate.
+
+    session_date: the session's date, used to resolve its unit frame so working_max
+    is kg-normalized to match exercise_alltime_max (both sides kg) — prevents the
+    0.5x compare from straddling unit frames across a mid-history switch. When None
+    (legacy/direct callers that supply a single-frame raw max), the compare is raw.
 
     The first set is the warmup if:
       • it carries an explicit 'warmup' / 'warm up' comment (no gate), OR
@@ -379,10 +385,18 @@ def _detect_warmup_flags(sets: list,
     # left side and genuine empty-bar warmups are missed. (s1 stays plates: an
     # "empty bar" opener is 0 PLATES.) headline_weight is absent only on the
     # daily-workouts set dicts, where it harmlessly falls back to plates.
+    # Both sides are kg-NORMALIZED: exercise_alltime_max is already kg, and
+    # working_max is converted via the session's frame (session_date). A raw
+    # compare straddles unit frames across a mid-history switch (Deadlift lbs->kg)
+    # and mis-gates. For a single-frame exercise the normalization is a no-op
+    # (both sides divided by the same constant — the >= ratio is unchanged).
     if s1 == 0:
         if exercise_alltime_max > 0:
             working_max = max(s.get("headline_weight", s.get("weight", 0))
                               for s in rest)
+            if session_date is not None:
+                _u = "kg" if _is_kg_native(ctx or {}, exercise_name, session_date) else "lbs"
+                working_max = _to_kg(working_max, _u)
             if working_max >= HEAVY_FRACTION * exercise_alltime_max:
                 first["is_warmup"] = True
         return   # 0-openers never fall through to gap/flat-ratio logic
@@ -682,14 +696,14 @@ def _build_sessions_from_rows(rows: list, ctx: dict,
                 "is_pain_flag":       _is_pain_comment(comment),
                 "technique_variants": _detect_technique_variants(comment),
                 "keyword_counts":     _count_keyword_categories(comment),
-                "is_personal_record": bool(r["is_personal_record"]),
                 "is_warmup":          False,
             })
 
         eligible = warmup_eligible is None or (exercise_name, session_date) in warmup_eligible
         _detect_warmup_flags(sets, exercise_name=exercise_name, ctx=ctx,
                              weight_eligible=eligible,
-                             exercise_alltime_max=exercise_alltime_max)
+                             exercise_alltime_max=exercise_alltime_max,
+                             session_date=session_date)
         working_sets = [s for s in sets if not s["is_warmup"]] or sets
         warmup_sets  = [s for s in sets if s["is_warmup"]]
 
@@ -728,7 +742,11 @@ def _build_sessions_from_rows(rows: list, ctx: dict,
             "working_sets_count": len(working_sets),
             "warmup_weight":      warmup_sets[0]["weight"] if warmup_sets else None,
             "warmup_weight_plates_only": True,
-            "is_pr_session":      any(s["is_personal_record"] for s in sets),
+            # Placeholder — overwritten by the all-time PR-event post-pass in
+            # process_data (a session is a PR session iff its date is a PR-event
+            # date per _pr_event_dates). NOT the is_personal_record flag, which
+            # under-counts ("more reps at top weight" beats are unflagged).
+            "is_pr_session":      False,
             "form_quality":       form_quality,
             "form_detail":        form_detail,
             "comment_count":      sum(1 for s in sets if s["comment"]),
@@ -1159,8 +1177,57 @@ def _compute_progression(sessions: list) -> dict:
     }
 
 
-def _compute_pr(sessions: list, unit: str) -> Optional[dict]:
+def _rep_floor_pr(sessions: list, unit: str, reps_floor: int,
+                  kg_normalize: bool) -> Optional[dict]:
+    """
+    Rep-floor PR (B2): the heaviest single set ever done for >= reps_floor reps. This
+    is a SET-LEVEL query — the qualifying set can be a lighter set inside a heavier
+    session (e.g. a 120x8 alongside a 140x3), so a session-aggregate filter on
+    reps_at_max would miss it. Selection mirrors the overall PR rule: max weight ->
+    most reps -> most recent date, on the bar-inclusive headline weight, carrying the
+    set's comment. NOTE: warmups are NOT excluded here (see the guard below) — unlike
+    the default max-weight PR which uses a working-sets basis. kg_normalize matches the
+    caller: _compute_pr compares raw (period, single unit frame); _compute_alltime_pr
+    normalizes for mid-history unit switches. Returns None if no set meets the floor.
+    """
+    cands = []  # (cmp_weight, headline_weight, reps, date, comment, e1rm, sess_unit)
+    for s in sessions:
+        su = s.get("unit", unit)
+        for st in s.get("sets", []):
+            # DELIBERATELY no is_warmup filter (overrides "warmup can never shift a
+            # PR" for the rep-floor path ONLY): at realistic floors warmups never win
+            # (they are light; rep-floor maximizes weight), and importing the
+            # imperfect warmup heuristic here would let a FALSE-positive flag drop a
+            # real working-set PR — the costlier error. The default max-weight PR
+            # keeps its working-sets basis. Do not re-add the filter.
+            if st.get("reps", 0) < reps_floor:
+                continue
+            hw    = st["headline_weight"]
+            cmp_w = _to_kg(hw, su) if kg_normalize else hw
+            cands.append((cmp_w, hw, st["reps"], s["date"],
+                          st.get("comment"), st.get("estimated_1rm", 0.0), su))
+    if not cands:
+        return None
+    best_cmp  = max(c[0] for c in cands)
+    at_best   = [c for c in cands if abs(c[0] - best_cmp) < 0.01]
+    best_reps = max(c[2] for c in at_best)
+    pick      = sorted((c for c in at_best if c[2] == best_reps),
+                       key=lambda c: c[3])[-1]          # most recent date
+    return {
+        "weight":        pick[1],
+        "reps":          pick[2],
+        "date":          pick[3],
+        "comment":       pick[4],
+        "estimated_1rm": pick[5],
+        "unit":          pick[6] if kg_normalize else unit,
+        "reps_floor":    reps_floor,
+    }
+
+
+def _compute_pr(sessions: list, unit: str, reps_floor: Optional[int] = None) -> Optional[dict]:
     if not sessions: return None
+    if reps_floor is not None:
+        return _rep_floor_pr(sessions, unit, reps_floor, kg_normalize=False)
     best_weight = max(s["max_working_weight"] for s in sessions)
     best_reps   = max(s["reps_at_max"] for s in sessions
                       if s["max_working_weight"] == best_weight)
@@ -1185,16 +1252,22 @@ def _compute_pr(sessions: list, unit: str) -> Optional[dict]:
     }
 
 
-def _compute_alltime_pr(alltime_sessions: list, unit: str) -> Optional[dict]:
+def _compute_alltime_pr(alltime_sessions: list, unit: str,
+                        reps_floor: Optional[int] = None) -> Optional[dict]:
     """
     Compute all-time PR from the full alltime_sessions history (B2 — not the app flag).
 
     Uses kg-normalized comparison to handle exercises that changed units
     mid-history (e.g. Deadlift: lbs before 2025-12-26, kg after).
     Returns the bar-inclusive headline weight, reps, date, comment (B2a), and e1rm.
+
+    reps_floor=N restricts to the heaviest WORKING set done for >= N reps (set-level,
+    B2); reps_floor=None (default) is the unchanged single overall max.
     """
     if not alltime_sessions:
         return None
+    if reps_floor is not None:
+        return _rep_floor_pr(alltime_sessions, unit, reps_floor, kg_normalize=True)
 
     def _mww_kg(s: dict) -> float:
         return _to_kg(s["max_working_weight"], s.get("unit", unit))
@@ -1226,6 +1299,109 @@ def _compute_alltime_pr(alltime_sessions: list, unit: str) -> Optional[dict]:
         "estimated_1rm": best_e1rm,
         "unit":          pr_session.get("unit", unit),
     }
+
+
+def _pr_event_dates(alltime_sessions: list, default_unit: str = "lbs",
+                    is_cardio: bool = False) -> list:
+    """
+    PR-EVENT dates for ONE exercise — the single source for every PR *count* in the
+    package (total_prs_alltime, is_pr_session, pr_velocity). NOT the in-app
+    is_personal_record flag, which encodes only "was-true-at-the-time" and massively
+    under-counts (all-time it saw 155 flagged sets vs 557 true PR events) — it misses
+    "more reps at the same top weight" beats entirely.
+
+    A deterministic running-max walk over WORKING sets in chronological order (date
+    order, then set order within a date). A PR EVENT fires when a working set beats the
+    running best by the PR rule (_is_new_best, both locked measures): a new highest
+    weight, OR — at the existing top weight — more reps than the previous best at that
+    weight. This counts reps-progression at a CONSTANT or ZERO top weight too: for a
+    bodyweight exercise, 0×5 then later 0×8 is a PR event (more reps at the 0 top
+    weight). _is_new_best does not short-circuit on weight==0, so zero is valid data,
+    never "no data / skip".
+
+    Basis is IDENTICAL to _compute_alltime_pr: the bar-inclusive headline weight,
+    kg-normalized via _to_kg for mid-history unit switches (so a lbs→kg switch never
+    creates phantom or missed events). Warmup sets are excluded (mirroring the
+    max_working_weight basis, with the same `or sets` fallback for all-warmup days).
+
+    Excluded iff is_cardio (category == "Cardio") — cardio owns a distance/duration PR
+    object and contributes ZERO strength PR events. The exclusion is by the REAL reason
+    (a different PR object), NOT a weight=0 proxy: a weight=0 proxy silently drops
+    bodyweight-only exercises (dips, pull-ups), whose reps-progression IS a strength PR.
+    Returns the list of PR-event dates, one entry per event (a date repeats if it holds
+    more than one PR event).
+    """
+    if not alltime_sessions or is_cardio:
+        return []
+
+    best_w_kg = best_r = None
+    event_dates: list = []
+    for s in sorted(alltime_sessions, key=lambda s: s["date"]):
+        s_unit  = s.get("unit", default_unit)
+        all_sets = s.get("sets", [])
+        working  = [st for st in all_sets if not st.get("is_warmup", False)] or all_sets
+        for st in working:
+            w_kg = _to_kg(st.get("headline_weight", 0), s_unit)
+            r    = st.get("reps", 0) or 0
+            if _is_new_best(w_kg, r, best_w_kg, best_r):
+                event_dates.append(s["date"])
+                best_w_kg, best_r = w_kg, r
+    return event_dates
+
+
+def _compute_cardio_pr(cardio_sessions: list, lock: Optional[str] = None,
+                       lock_value: Optional[float] = None) -> Optional[dict]:
+    """
+    Cardio PR — distance/duration only, NEVER weight/reps (cardio rows store 0 for
+    both). "Lock one field, optimize the free one":
+
+      lock=None (default): the session with the MAX distance (distance > 0). Duration-
+                  only data (all distance == 0, e.g. Cycling) has no distance to
+                  maximize, so it falls back to MAX duration.
+      lock="distance", lock_value=D: among sessions with distance >= D, MIN duration.
+                  None if none qualify.
+      lock="duration", lock_value=T: among sessions with duration >= T, MAX distance.
+                  None if no qualifying session has distance > 0 (e.g. duration-only).
+
+    Always carries the session comment (assisted / terrain / pain context), same
+    principle as the strength PR. Operates on the BUILT cardio session dicts
+    ({date, distance_km, duration_seconds, comment?, pace_min_per_km?}) so pace is
+    reused, never recomputed. The result carries NO 'weight' key (validator: a pr with
+    weight-but-no-unit is flagged; cardio PRs are distance/duration). None if empty.
+    """
+    if not cardio_sessions:
+        return None
+    lv = lock_value if lock_value is not None else 0
+
+    def _dist(s): return s.get("distance_km", 0) or 0
+    def _dur(s):  return s.get("duration_seconds", 0) or 0
+
+    def _emit(s: dict) -> dict:
+        out = {
+            "distance_km":      _dist(s),
+            "duration_seconds": _dur(s),
+            "date":             s.get("date"),
+            "comment":          s.get("comment"),
+        }
+        if s.get("pace_min_per_km") is not None:
+            out["pace_min_per_km"] = s["pace_min_per_km"]
+        if lock:
+            out["lock"] = lock
+        return out
+
+    if lock == "distance":
+        pool = [s for s in cardio_sessions if _dist(s) >= lv]
+        return _emit(min(pool, key=_dur)) if pool else None
+
+    if lock == "duration":
+        pool = [s for s in cardio_sessions if _dur(s) >= lv and _dist(s) > 0]
+        return _emit(max(pool, key=_dist)) if pool else None
+
+    # lock=None — max distance; duration-only data falls back to max duration.
+    with_dist = [s for s in cardio_sessions if _dist(s) > 0]
+    if with_dist:
+        return _emit(max(with_dist, key=_dist))
+    return _emit(max(cardio_sessions, key=_dur))
 
 
 def _compute_duration_progression(sessions: list) -> Optional[dict]:
@@ -1534,14 +1710,19 @@ def _compute_pain_analysis(sessions: list) -> dict:
     }
 
 
-def _compute_pr_velocity(pr_history: list, exercise_name: str) -> dict:
-    exercise_prs = [r for r in pr_history if r["exercise_name"] == exercise_name]
-    if not exercise_prs: return {"total_prs": 0, "monthly_counts": [], "velocity_trend": "none"}
+def _compute_pr_velocity(pr_event_dates: list) -> dict:
+    """
+    PR velocity from recomputed PR-EVENT dates (_pr_event_dates), NOT the
+    is_personal_record flag rows. total_prs / monthly_counts / velocity_trend are
+    derived from the per-exercise event dates; a date repeats once per event, so a
+    month with several PR events counts them all.
+    """
+    if not pr_event_dates: return {"total_prs": 0, "monthly_counts": [], "velocity_trend": "none"}
     by_month: dict = defaultdict(int)
-    for pr in exercise_prs: by_month[pr["date"][:7]] += 1
+    for d in pr_event_dates: by_month[d[:7]] += 1
     monthly = [{"month": m, "pr_count": c} for m, c in sorted(by_month.items())]
     return {
-        "total_prs":      len(exercise_prs),
+        "total_prs":      len(pr_event_dates),
         "monthly_counts": monthly,
         "velocity_trend": _trend([m["pr_count"] for m in monthly], up_pct=0.20, down_pct=0.20),
     }
@@ -1711,7 +1892,8 @@ def _build_daily_workouts(all_rows: list, ctx: dict,
             amax     = ex_alltime_max_map.get(ex_name, 0.0) if ex_alltime_max_map else 0.0
             _detect_warmup_flags(ex_sets, exercise_name=ex_name, ctx=ctx,
                                  weight_eligible=eligible,
-                                 exercise_alltime_max=amax)
+                                 exercise_alltime_max=amax,
+                                 session_date=training_date)
             working = [s for s in ex_sets if not s["is_warmup"]] or ex_sets
             # Bar-inclusive (B1a): max_weight and estimated_1rm are headline
             # (plates + bar), matching the per-session values. bar_weight is in
@@ -1922,9 +2104,21 @@ def _compute_seasonal_patterns(all_dates: list) -> list:
 
 
 def _compute_alltime_summary(all_dates: list, alltime_rows: list,
-                              pr_history: list, today, ctx: dict = None) -> dict:
+                              today, ctx: dict = None,
+                              pr_event_count: int = 0,
+                              total_training_day_count: int = 0) -> dict:
     """
     All-time summary stats.
+
+    pr_event_count — the recomputed all-time PR-EVENT total (sum of per-exercise
+    _pr_event_dates across all non-cardio exercises). The retired is_personal_record
+    flag under-counted it (it missed "more reps at top weight" beats).
+
+    total_training_day_count — Bug 2.5 scope split: the headline "how many days did you
+    train" count over ALL categories (Time/Place/Neck INCLUDED, 317-basis). `all_dates`
+    stays the EXCLUDED strength scope (308-basis) and still drives first/last_training_date,
+    streaks, gaps, current-streak, and months_total — those are strength-pattern stats, not
+    attendance. Only total_training_days uses the inclusive count.
 
     today       — passed in explicitly (facade supplies date.today()).
     alltime_rows — all raw set rows; total_sets and total_volume are
@@ -1960,7 +2154,9 @@ def _compute_alltime_summary(all_dates: list, alltime_rows: list,
     return {
         "first_training_date":   all_dates[0],
         "last_training_date":    all_dates[-1],
-        "total_training_days":   len(set(all_dates)),
+        # Bug 2.5: attendance count over ALL categories (Time/Place/Neck included),
+        # NOT len(set(all_dates)) which is the excluded strength scope.
+        "total_training_days":   total_training_day_count,
         "total_sets":            total_sets,
         # Demoted under an underscore-prefixed sub-object so it no longer sits at
         # the same level as authoritative volume fields, tempting the LLM to quote
@@ -1981,8 +2177,8 @@ def _compute_alltime_summary(all_dates: list, alltime_rows: list,
         "longest_streak_days":   max_streak,
         "longest_gap_days":      max_gap,
         "current_streak_days":   cur_now,
-        "total_prs_alltime":     len(pr_history),
-        "prs_per_month_alltime": round(len(pr_history) / months_total, 2),
+        "total_prs_alltime":     pr_event_count,
+        "prs_per_month_alltime": round(pr_event_count / months_total, 2),
     }
 
 
@@ -2313,12 +2509,12 @@ def process_data(
     exercise_names,     # Optional[list]
     agg_level: str,
     include_phase2: bool,
+    reps_floor: Optional[int] = None,   # 6b: rep-floor strength PR target (None = none)
 ) -> dict:
     """
     Pure processing stage.  No DB, no file I/O, no clock.
 
-    bundle keys: alltime_rows, bodyweight, goals, lifecycle, pr_history,
-                 training_dates
+    bundle keys: alltime_rows, bodyweight, goals, lifecycle, training_dates
     today      : the facade's date.today() — used for current-streak and
                  goal-projection calculations to preserve original behaviour.
     """
@@ -2326,8 +2522,8 @@ def process_data(
     all_bw_entries     = bundle["bodyweight"]
     raw_goals          = bundle["goals"]
     lifecycle_rows     = bundle["lifecycle"]
-    pr_history         = bundle["pr_history"]
     alltime_rows       = bundle["alltime_rows"]
+    total_training_day_count = bundle["total_training_day_count"]  # Bug 2.5: all-scope (317)
 
     # Derive period rows from the already-fetched alltime set
     all_period_rows   = [r for r in alltime_rows if start_str <= r["date"] <= end_str]
@@ -2351,7 +2547,10 @@ def process_data(
     #   first performed in its category on that day (min set_id).  Only these
     #   pairs may receive a weight-based warmup flag; explicit comments win always.
     # _ex_alltime_max: per-exercise max headline weight (plates + bar) across all
-    #   time — used by the 0-weight opener gate in _detect_warmup_flags.
+    #   time, kg-NORMALIZED per row before maxing — used by the 0-weight opener gate
+    #   in _detect_warmup_flags. Normalizing per row (not maxing raw display numbers)
+    #   is required: a mid-history unit switch (Deadlift lbs->kg) otherwise maxes lbs
+    #   numbers against kg numbers and the gate's 0.5x compare straddles frames.
     _first_in_cat: dict = {}   # (date, category_id) → (min_set_id, exercise_name)
     _ex_alltime_max: dict = {}  # exercise_name → float
     for r in alltime_rows:
@@ -2361,9 +2560,11 @@ def process_data(
             _first_in_cat[key] = (sid, r["exercise_name"])
         _ek  = r["exercise_name"]
         _off = _get_numeric_offset(ctx, _ek)
+        _kg  = _is_kg_native(ctx, _ek, r["date"])
         _bar_lbs = _get_bar_weight_lbs(ctx, _ek, r["date"])
-        _bar     = _bar_lbs / 2.2046 if _is_kg_native(ctx, _ek, r["date"]) else _bar_lbs
-        _hw      = _recover_typed_weight(r["metric_weight"], _off) + _bar
+        _bar     = _bar_lbs / 2.2046 if _kg else _bar_lbs
+        _hw      = _to_kg(_recover_typed_weight(r["metric_weight"], _off) + _bar,
+                          "kg" if _kg else "lbs")
         if _hw > _ex_alltime_max.get(_ek, 0.0):
             _ex_alltime_max[_ek] = _hw
     warmup_eligible: frozenset = frozenset(
@@ -2388,6 +2589,12 @@ def process_data(
 
     exercise_results = []
     end_date_obj = datetime.strptime(end_str, "%Y-%m-%d").date()
+
+    # Per-exercise PR-EVENT dates (the recompute that replaces the is_personal_record
+    # flag). Populated in the loop for exercises in scope; completed after the loop for
+    # any exercise the period/muscle filter excluded — total_prs_alltime is an all-time,
+    # all-exercise number and must not be narrowed by the query filter.
+    _pr_event_dates_by_ex: dict = {}
 
     # Tier 1 unit pre-pass: accumulate disagreements across all exercises/sessions.
     # Both period and alltime sessions are scanned; we deduplicate at the end.
@@ -2469,6 +2676,18 @@ def process_data(
                                                        counterbalance_review_log=_raw_counterbalance_log)
                              if alltime_cache.get(ex_name) else sessions)
 
+        # ── All-time PR-EVENT post-pass (replaces the is_personal_record flag) ────
+        # Single source for every PR count: a session is a PR session iff its date is
+        # a PR-event date. Fixes is_pr_session on BOTH the period `sessions` (yearly
+        # pr_count, pr_context) and `alltime_sessions` (learning-curve
+        # sessions_to_first_pr) before any consumer reads it below. pr_velocity is
+        # recomputed from the same dates. Stored per-exercise for the all-time total.
+        pr_event_dates = _pr_event_dates(alltime_sessions, unit, is_cardio=is_cardio)
+        _pr_event_dates_by_ex[ex_name] = pr_event_dates
+        _pr_date_set = set(pr_event_dates)
+        for s in sessions:         s["is_pr_session"] = s["date"] in _pr_date_set
+        for s in alltime_sessions: s["is_pr_session"] = s["date"] in _pr_date_set
+
         exercise_results.append({
             "name":           ex_name,
             "category":       category,
@@ -2491,8 +2710,21 @@ def process_data(
             "distance_progression":  distance_progression,
             "pr":                    _safe_compute(_compute_alltime_pr,  alltime_sessions, unit,                    default=None, label="pr_alltime"),
             "pr_period":             pr,
+            # Cardio all-time PR source: the cardio PR is rebuilt in trim_package
+            # (where alltime_cache is OUT of scope), so thread the all-time session
+            # list (carries total_distance/total_duration_seconds AND per-set
+            # comments) for it to compute an all-time cardio pr/pr_cardio_locked.
+            # Transient — dropped by trim_package's ex.clear() rebuild.
+            **({"_alltime_cardio_sessions": alltime_sessions} if is_cardio else {}),
+            # Parameterized rep-floor PR (6b): present ONLY when the question named a
+            # rep target. The static pr/pr_period above are unchanged. A null value =
+            # "no qualifying set at that rep count" (NOT an error, NOT the overall max).
+            **({"pr_repfloor": _safe_compute(_compute_alltime_pr, alltime_sessions, unit,
+                                             reps_floor=reps_floor, default=None,
+                                             label="pr_repfloor")}
+               if (reps_floor is not None and not is_cardio) else {}),
             "pr_context":            _safe_compute(_compute_pr_context,  sessions, all_training_dates, all_bw_entries, default=[],   label="pr_context"),
-            "pr_velocity":           _safe_compute(_compute_pr_velocity, pr_history, ex_name,                        default={"total_prs": 0, "monthly_counts": [], "velocity_trend": "none"}, label="pr_velocity"),
+            "pr_velocity":           _safe_compute(_compute_pr_velocity, pr_event_dates,                              default={"total_prs": 0, "monthly_counts": [], "velocity_trend": "none"}, label="pr_velocity"),
 
             # Period volume per typed-unit frame (computed from sessions BEFORE
             # any session wipe; lbs and kg are separate frames, never added)
@@ -2567,6 +2799,25 @@ def process_data(
                       for e in counterbalance_review_log),
         )
 
+    # ── All-time PR-event total (all exercises, unfiltered) ────────────────────
+    # Complete the per-exercise map for any exercise the period/muscle filter dropped
+    # from the loop: total_prs_alltime spans ALL exercises all-time (it replaces
+    # len(pr_history), which was unfiltered). Build their alltime sessions on the same
+    # basis; throwaway review logs (None) — the in-scope pass already logged them.
+    for _ex_name, _rows in alltime_cache.items():
+        if _ex_name in _pr_event_dates_by_ex:
+            continue
+        _ex_sessions = _build_sessions_from_rows(
+            _rows, ctx, _ex_name, units_review_log=None,
+            warmup_eligible=warmup_eligible,
+            exercise_alltime_max=_ex_alltime_max.get(_ex_name, 0.0),
+            counterbalance_review_log=None)
+        _ex_is_cardio = CATEGORY_NAMES.get(_rows[0]["category_id"]) == "Cardio"
+        _pr_event_dates_by_ex[_ex_name] = _pr_event_dates(
+            _ex_sessions, "kg" if _is_kg_native(ctx, _ex_name, end_str) else "lbs",
+            is_cardio=_ex_is_cardio)
+    pr_event_count = sum(len(d) for d in _pr_event_dates_by_ex.values())
+
     # ── Global ─────────────────────────────────────────────────────────────────
     mg_summary = _compute_muscle_group_summary(exercise_results)
 
@@ -2599,7 +2850,7 @@ def process_data(
         "total_exercises_analyzed": len(exercise_results),
         "units_review_log":         units_review_log,
         "counterbalance_review_log": counterbalance_review_log,
-        "all_time_summary":         _safe_compute(_compute_alltime_summary,    all_training_dates, alltime_rows, pr_history, today, ctx, default={},  label="alltime_summary"),
+        "all_time_summary":         _safe_compute(_compute_alltime_summary,    all_training_dates, alltime_rows, today, ctx, pr_event_count, total_training_day_count, default={},  label="alltime_summary"),
         "muscle_group_summary":     mg_summary,
         "muscle_group_balance":     _safe_compute(_compute_muscle_group_balance, mg_summary,                               default={},  label="mg_balance"),
         "training_consistency":     _safe_compute(_compute_training_consistency, all_training_dates, start_str, end_str,   default={},  label="training_consistency"),
@@ -2660,13 +2911,17 @@ def _cap_full_comments(full_comments: list, recent_limit: int = 30) -> list:
     return [full_comments[i] for i in sorted(pain_indices | recent_indices)]
 
 
-def trim_package(package: dict, scope: str = "focused") -> dict:
+def trim_package(package: dict, scope: str = "focused",
+                 cardio_lock: Optional[dict] = None) -> dict:
     """
     In-place trim of the full package for the Analysis Agent.
     Strips raw set arrays and bulk enumerations; keeps all analytics.
     Mirrors the post-collect() body of the original prepare_analysis_package.
 
-    scope -- "focused" | "group" | "broad"
+    scope       -- "focused" | "group" | "broad"
+    cardio_lock -- 6b: {"field": "distance"|"duration", "value": <km|seconds>} when the
+                   question named a cardio lock; adds pr_cardio_locked to cardio blocks
+                   (default pr unchanged). None = none.
       focused : full detail unchanged -- all stat blocks, all agg levels.
       group   : full_comments capped (30 most recent + all pain-flagged);
                 exactly one aggregation level retained.
@@ -2682,7 +2937,11 @@ def trim_package(package: dict, scope: str = "focused") -> dict:
         if not ex.get("is_cardio"):
             continue
         per_sess: dict = {}
-        for s in ex.get("sessions", []):
+        # Source from the ALL-TIME session superset when present (built by the same
+        # _build_sessions_from_rows, so it carries per-set comments) so an all-time
+        # cardio PR whose date falls OUTSIDE the query period still resolves its
+        # comment — the PR-carries-its-comment invariant holds for all-time too.
+        for s in (ex.get("_alltime_cardio_sessions") or ex.get("sessions", [])):
             raw_sets = s.get("sets") or []
             texts = [st["comment"] for st in raw_sets if st.get("comment")]
             has_pain = any(st.get("is_pain_flag", False) for st in raw_sets)
@@ -2760,6 +3019,13 @@ def trim_package(package: dict, scope: str = "focused") -> dict:
                 prog["pace_end_min_per_km"]   = pace_values[-1]
                 prog["pace_best_min_per_km"]  = min(pace_values)   # lower = faster
 
+            built_sessions = [_build_session_dict(s) for s in raw_sessions]
+            # All-time built sessions (threaded from process_data, where alltime_cache
+            # lives). A PR is all-time by definition; the period list feeds pr_period.
+            # Falls back to period when absent (e.g. query_period_days=None == all-time).
+            raw_alltime = ex.get("_alltime_cardio_sessions") or raw_sessions
+            alltime_built_sessions = [_build_session_dict(s) for s in raw_alltime]
+
             cardio_ex = {
                 "name":     ex_name,
                 "category": ex.get("category"),
@@ -2768,7 +3034,24 @@ def trim_package(package: dict, scope: str = "focused") -> dict:
                 # C3: fixed key — _compute_learning_curve returns "total_sessions_alltime"
                 # (the old code read "total_alltime_sessions", which was always None).
                 "all_time_sessions": ex.get("learning_curve", {}).get("total_sessions_alltime"),
-                "sessions": [_build_session_dict(s) for s in raw_sessions],
+                "sessions": built_sessions,
+                # B2: cardio PR (distance/duration, never the weight=0 garbage from
+                # _compute_alltime_pr). Default lock = max distance (duration-only →
+                # max duration). A PR is ALL-TIME (mirrors strength's pr/pr_period):
+                # pr over the all-time list, pr_period over the period list. Both carry
+                # the session comment (all-time dates enriched via _cardio_sess_info).
+                "pr": _safe_compute(_compute_cardio_pr, alltime_built_sessions,
+                                    default=None, label="cardio_pr"),
+                "pr_period": _safe_compute(_compute_cardio_pr, built_sessions,
+                                           default=None, label="cardio_pr_period"),
+                # Parameterized locked cardio PR (6b): present ONLY when the question
+                # named a lock. All-time ("fastest 5km" is all-time). null = "no
+                # qualifying session at that lock".
+                **({"pr_cardio_locked": _safe_compute(
+                        _compute_cardio_pr, alltime_built_sessions,
+                        lock=cardio_lock.get("field"), lock_value=cardio_lock.get("value"),
+                        default=None, label="pr_cardio_locked")}
+                   if cardio_lock else {}),
                 "progression": prog,
                 "last_session_date":  tf.get("last_session_date"),
                 "days_since_last":    tf.get("days_since_last"),

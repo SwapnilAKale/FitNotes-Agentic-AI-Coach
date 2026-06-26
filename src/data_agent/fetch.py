@@ -125,7 +125,6 @@ def _fetch_all_sets_in_period(conn: sqlite3.Connection,
             tl.reps,
             tl.distance,
             tl.duration_seconds,
-            tl.is_personal_record,
             e.name               AS exercise_name,
             e.category_id,
             c.comment
@@ -151,19 +150,6 @@ def _fetch_exercise_lifecycle(conn: sqlite3.Connection) -> list:
         WHERE e.category_id NOT IN {_EXCL_SQL}
         GROUP BY e._id, e.name, e.category_id
         ORDER BY e.category_id, e.name
-    """)
-    return [dict(row) for row in cur.fetchall()]
-
-
-def _fetch_pr_history(conn: sqlite3.Connection) -> list:
-    cur = conn.cursor()
-    cur.execute(f"""
-        SELECT tl.date, tl.metric_weight, tl.reps, e.name AS exercise_name
-        FROM training_log tl
-        JOIN exercise e ON tl.exercise_id = e._id
-        WHERE tl.is_personal_record = 1
-          AND e.category_id NOT IN {_EXCL_SQL}
-        ORDER BY tl.date ASC
     """)
     return [dict(row) for row in cur.fetchall()]
 
@@ -214,6 +200,23 @@ def _fetch_all_training_dates(conn: sqlite3.Connection) -> list:
     return [row["date"] for row in cur.fetchall()]
 
 
+def _fetch_total_training_day_count(conn: sqlite3.Connection) -> int:
+    # SCOPE SPLIT (Bug 2.5): the training-day COUNT is "how many days did you show
+    # up to train", so it deliberately does NOT apply _EXCL_SQL — Time/Place/Neck
+    # (cats 10/11/12) are logged ON training days, so those dates ARE training days
+    # and must be counted. This is the ONLY query that drops the exclusion; every
+    # other query (sets/volume/strength/lifecycle, and the _fetch_all_training_dates
+    # list that drives streaks/gaps/consistency/dow/seasonal/pr-context) keeps
+    # _EXCL_SQL. Mirrors _fetch_all_training_dates exactly except the missing WHERE.
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT COUNT(DISTINCT tl.date)
+        FROM training_log tl
+        JOIN exercise e ON tl.exercise_id = e._id
+    """)
+    return cur.fetchone()[0]
+
+
 # ── Main fetch entry point ─────────────────────────────────────────────────────
 
 def fetch_data(end_str: str) -> dict:
@@ -228,8 +231,10 @@ def fetch_data(end_str: str) -> dict:
         bodyweight    — all BodyWeight entries
         goals         — all Goal rows
         lifecycle     — per-exercise lifecycle summary
-        pr_history    — all is_personal_record=1 rows
-        training_dates — all distinct training dates (no date cap)
+        training_dates — distinct training dates, EXCLUDED scope (cats 10/11/12 dropped,
+                         308-basis); drives streaks/gaps/consistency/dow/seasonal/pr-context
+        total_training_day_count — distinct training dates, ALL scope (Time/Place/Neck
+                         included, 317-basis); the headline training-day count only
     """
     conn = _get_connection()
     try:
@@ -239,8 +244,8 @@ def fetch_data(end_str: str) -> dict:
             "bodyweight":      _fetch_all_bodyweight(conn),
             "goals":           _fetch_goals(conn),
             "lifecycle":       _fetch_exercise_lifecycle(conn),
-            "pr_history":      _fetch_pr_history(conn),
             "training_dates":  training_dates,
+            "total_training_day_count": _fetch_total_training_day_count(conn),
         }
     finally:
         conn.close()

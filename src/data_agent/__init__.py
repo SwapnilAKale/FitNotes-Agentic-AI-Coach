@@ -94,6 +94,31 @@ def _derive_scope_from_package(
     return "broad", unresolved
 
 
+def _display_scope(
+    exercise_names: Optional[list],
+    muscle_groups:  Optional[list],
+    unresolved:     Optional[list],
+) -> list:
+    """
+    Display targets for the package's `display_sets` (pure — no SQL, no LLM):
+    ONE per resolved scope present — each resolved exercise AND each muscle group.
+
+    No XOR, no precedence, no dedup. The Analysis Agent picks display-vs-analyze
+    from the QUESTION (analytical questions ignore display_sets), so building a
+    block for every present scope is always safe. This deliberately supersedes the
+    old strict XOR, which dropped display entirely when a single-exercise question
+    also carried an inferred parent-group tag (e.g. Lat Pulldown + Back).
+
+    Returns [("exercise", name), …, ("category", group), …]; [] → no display_sets.
+    """
+    ex = exercise_names or []
+    mg = muscle_groups or []
+    resolved_ex = [n for n in ex if n not in (unresolved or [])]
+    targets = [("exercise", n) for n in resolved_ex]
+    targets += [("category", g) for g in mg]
+    return targets
+
+
 def _report_violations(violations: list, source: str) -> None:
     """
     Log soft violations (G4, G5, D3) as warnings.
@@ -119,6 +144,7 @@ def collect(
     exercise_names:    Optional[list] = None,
     aggregation_level: Optional[str]  = None,
     include_phase2:    bool            = False,
+    reps_floor:        Optional[int]  = None,
 ) -> dict:
     """
     Complete workout data collection. Single source of truth at any time scale.
@@ -131,6 +157,7 @@ def collect(
         exercise_names    : Filter to specific exercises.
         aggregation_level : "session" | "weekly" | "monthly". Auto if None.
         include_phase2    : Fetch full comment history for triggered exercises.
+        reps_floor        : 6b — rep target for a rep-floor strength PR (None = none).
     """
     ctx      = load_user_context()
     today    = date.today()
@@ -151,6 +178,7 @@ def collect(
     package = process_data(
         bundle, ctx, start_str, end_str, today,
         query_period_days, muscle_groups, exercise_names, agg_level, include_phase2,
+        reps_floor=reps_floor,
     )
     _report_violations(validate(package), "collect")
     return package
@@ -164,12 +192,20 @@ def prepare_analysis_package(
     exercise_names:    Optional[list] = None,
     aggregation_level: Optional[str]  = None,
     include_phase2:    bool            = True,
+    reps_floor:        Optional[int]  = None,
+    cardio_lock:       Optional[dict] = None,
 ) -> dict:
     """
     Wrapper over collect() for the analytical pipeline.
     Strips and trims raw data to hit 100-300 KB before sending to the
     Analysis Agent. All pre-computed analytics are preserved. Only
     raw series and full enumerations are trimmed.
+
+    6b parameterized PRs (both default to None = current behavior):
+      reps_floor  : rep target → adds pr_repfloor to strength blocks (all-time basis).
+      cardio_lock : {"field","value"} (value already unit-normalized) → adds
+                    pr_cardio_locked to cardio blocks. The static pr/pr_period are
+                    unchanged either way; a null value = "no qualifying set".
     """
     package = collect(
         query_period_days=query_period_days,
@@ -179,12 +215,28 @@ def prepare_analysis_package(
         exercise_names=exercise_names,
         aggregation_level=aggregation_level,
         include_phase2=include_phase2,
+        reps_floor=reps_floor,
     )
     # Scope is derived from what actually survived filtering, not from
     # classifier intent. A filter that matched nothing must build as BROAD.
     scope, unresolved = _derive_scope_from_package(package, exercise_names, muscle_groups)
-    trimmed = trim_package(package, scope=scope)
+    trimmed = trim_package(package, scope=scope, cardio_lock=cardio_lock)
     if unresolved:
         trimmed["unresolved_exercise_names"] = unresolved
+
+    # Approach (b): session-display is a NORMAL package field. Build a block for
+    # EVERY resolved scope present (each exercise, each muscle group) and flatten
+    # them into one display_sets list. The Analysis Agent decides display-vs-analyze
+    # from the QUESTION — there is no routing flag, and superset display data is
+    # safe (analytical questions ignore it).
+    targets = _display_scope(exercise_names, muscle_groups, unresolved)
+    if targets:
+        from . import session_display  # local import avoids any import cycle
+        flat: list = []
+        for kind, target in targets:
+            flat.extend(session_display.build_display_sets(kind, target))
+        if flat:
+            trimmed["display_sets"] = flat
+
     _report_violations(validate(trimmed), "prepare_analysis_package")
     return trimmed

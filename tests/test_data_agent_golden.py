@@ -180,6 +180,148 @@ def test_PR_LOGIC_kg_native_in_kg():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# PR RECOMPUTE stage 6a — rep-floor strength PR + cardio PR (computation layer)
+# Locked rule B2: recomputed from set history, never the is_personal_record flag.
+# Synthetic TYPE-C (known-by-construction) + one end-to-end build. No LLM.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_PR_REPFLOOR_setlevel_within_session():
+    """A '5-rep PR' is the heaviest single SET done for >=5 reps — even when it is a
+    LIGHTER set inside a heavier session (140x3 + 120x8 → 5-rep PR is 120, not 140).
+    A session-aggregate filter on reps_at_max (=3 here) would wrongly return None."""
+    from src.data_agent.process import _build_sessions_from_rows, _compute_pr
+    rows = [_pr_row(1, "2026-01-01", 140 / 2.2046, 3, comment="heavy triple", is_pr=1),
+            _pr_row(2, "2026-01-01", 120 / 2.2046, 8, comment="rep PR",       is_pr=0)]
+    sessions = _build_sessions_from_rows(rows, ctx={}, exercise_name="Fake Cable Ex")
+    unit = sessions[0]["unit"]
+    # overall PR (no floor) is the heavy 140x3
+    assert _compute_pr(sessions, unit)["weight"] == pytest.approx(140.0, abs=0.1)
+    # 5-rep PR is the lighter, higher-rep set
+    pr5 = _compute_pr(sessions, unit, reps_floor=5)
+    assert pr5["weight"] == pytest.approx(120.0, abs=0.1)
+    assert pr5["reps"] == 8
+    assert pr5["comment"] == "rep PR"
+    assert pr5["reps_floor"] == 5
+
+
+def test_PR_REPFLOOR_crosssession_and_none():
+    from src.data_agent.process import _build_sessions_from_rows, _compute_pr, _compute_alltime_pr
+    rows = [_pr_row(1, "2026-01-01", 100 / 2.2046, 10, comment="ten"),
+            _pr_row(2, "2026-01-08", 140 / 2.2046, 3,  comment="triple"),
+            _pr_row(3, "2026-01-15", 120 / 2.2046, 6,  comment="six")]
+    sessions = _build_sessions_from_rows(rows, ctx={}, exercise_name="Fake Ex")
+    unit = sessions[0]["unit"]
+    # reps_floor=5 → heaviest set with reps>=5 is 120x6 (the 140x3 is excluded)
+    assert _compute_pr(sessions, unit, reps_floor=5)["weight"] == pytest.approx(120.0, abs=0.1)
+    assert _compute_alltime_pr(sessions, unit, reps_floor=5)["weight"] == pytest.approx(120.0, abs=0.1)
+    # reps_floor higher than any set → None
+    assert _compute_pr(sessions, unit, reps_floor=20) is None
+    assert _compute_alltime_pr(sessions, unit, reps_floor=20) is None
+
+
+def test_PR_REPFLOOR_does_not_filter_warmups():
+    """DELIBERATE (6a patch): the rep-floor PR does NOT exclude is_warmup sets — unlike
+    the default max-weight PR. A wrongly-flagged warmup must not drop a real working-set
+    PR, and at realistic floors warmups never win anyway. Here a heavy is_warmup set is
+    the heaviest at the floor → it WINS. Do not re-add a warmup filter."""
+    from src.data_agent.process import _rep_floor_pr
+    sessions = [{
+        "date": "2026-01-01", "unit": "lbs",
+        "sets": [
+            {"headline_weight": 200.0, "reps": 20, "is_warmup": True,
+             "comment": "flagged warmup", "estimated_1rm": 0.0},
+            {"headline_weight": 100.0, "reps": 20, "is_warmup": False,
+             "comment": "working", "estimated_1rm": 0.0},
+        ],
+    }]
+    pr = _rep_floor_pr(sessions, "lbs", reps_floor=20, kg_normalize=False)
+    assert pr["weight"] == 200.0                 # the warmup-flagged set is NOT excluded
+    assert pr["comment"] == "flagged warmup"
+
+
+def test_PR_REPFLOOR_none_is_unchanged():
+    """reps_floor=None (default) must be byte-identical to the no-arg single max."""
+    from src.data_agent.process import _build_sessions_from_rows, _compute_pr, _compute_alltime_pr
+    rows = [_pr_row(1, "2026-01-01", 100 / 2.2046, 5),
+            _pr_row(2, "2026-01-08", 120 / 2.2046, 5)]
+    sessions = _build_sessions_from_rows(rows, ctx={}, exercise_name="Fake Ex")
+    unit = sessions[0]["unit"]
+    assert _compute_pr(sessions, unit) == _compute_pr(sessions, unit, reps_floor=None)
+    assert _compute_alltime_pr(sessions, unit) == _compute_alltime_pr(sessions, unit, reps_floor=None)
+
+
+# ── Cardio PR (distance/duration only — never weight/reps) ───────────────────────
+
+def _cs(date, dist, dur, comment=None):
+    """A built cardio session dict, the shape _compute_cardio_pr consumes."""
+    d = {"date": date, "distance_km": dist, "duration_seconds": dur}
+    if comment is not None:
+        d["comment"] = comment
+    return d
+
+
+def test_CARDIO_PR_default_max_distance():
+    from src.data_agent.process import _compute_cardio_pr
+    s = [_cs("2026-01-01", 3.0, 1800, "easy"),
+         _cs("2026-01-08", 5.0, 3600, "long run"),
+         _cs("2026-01-15", 2.0, 1200)]
+    pr = _compute_cardio_pr(s)
+    assert pr["distance_km"] == 5.0
+    assert pr["duration_seconds"] == 3600
+    assert pr["date"] == "2026-01-08"
+    assert pr["comment"] == "long run"
+    assert "weight" not in pr            # validator-critical: cardio PR has no weight
+
+
+def test_CARDIO_PR_lock_distance_min_duration():
+    from src.data_agent.process import _compute_cardio_pr
+    s = [_cs("2026-01-08", 5.0, 3600, "slow 5k"),
+         _cs("2026-02-01", 5.0, 3000, "fast 5k"),
+         _cs("2026-02-08", 3.0, 1500, "short")]
+    pr = _compute_cardio_pr(s, lock="distance", lock_value=5)
+    assert pr["duration_seconds"] == 3000    # fastest among distance>=5
+    assert pr["distance_km"] == 5.0
+    assert pr["comment"] == "fast 5k"
+
+
+def test_CARDIO_PR_lock_duration_max_distance():
+    from src.data_agent.process import _compute_cardio_pr
+    s = [_cs("2026-01-08", 5.0, 3600, "long"),
+         _cs("2026-02-01", 8.0, 4000, "longest"),
+         _cs("2026-02-08", 2.0, 300, "tiny")]
+    pr = _compute_cardio_pr(s, lock="duration", lock_value=600)
+    assert pr["distance_km"] == 8.0          # farthest among duration>=600
+    assert pr["comment"] == "longest"
+
+
+def test_CARDIO_PR_duration_only_fallback_and_none():
+    from src.data_agent.process import _compute_cardio_pr
+    cyc = [_cs("2025-01-01", 0, 600, "spin"),
+           _cs("2025-02-01", 0, 1200, "long spin")]
+    # lock=None: no distance → fall back to max duration
+    pr = _compute_cardio_pr(cyc)
+    assert pr["duration_seconds"] == 1200
+    assert pr["comment"] == "long spin"
+    assert "weight" not in pr
+    # a distance lock on duration-only data → None
+    assert _compute_cardio_pr(cyc, lock="distance", lock_value=1) is None
+    # empty → None
+    assert _compute_cardio_pr([]) is None
+
+
+def test_CARDIO_PR_endtoend_walking_carries_pr():
+    """Built package: the Walking cardio block now carries a pr (distance/date, no
+    weight key) and the build passes validation (no DataAgentIntegrityError)."""
+    pkg = prepare_analysis_package(query_period_days=None, exercise_names=["Walking"])
+    ex = next(e for e in pkg["exercises"] if e.get("name") == "Walking")
+    assert ex.get("is_cardio") is True
+    pr = ex.get("pr")
+    assert isinstance(pr, dict)
+    assert "distance_km" in pr and "date" in pr
+    assert "weight" not in pr
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # G-WALK · Walking all-time sessions
 # spec invariant: C3
 # ══════════════════════════════════════════════════════════════════════════════
@@ -288,28 +430,39 @@ def test_G_CARDIO0_cycling_dead_hang_duration_no_pace():
 def test_G_ALLTIME_alltime_summary():
     """
     All-time training summary boundary dates + distinct training-day count.
-    RECOMPUTE-AND-RELATE: ground truth is an independent raw-SQL query over the
-    same scope (non-excluded categories 10/11/12), NOT a live literal — so new
-    data moves both sides together and only a code regression diverges.
+    RECOMPUTE-AND-RELATE: ground truth is an independent raw-SQL query, NOT a live
+    literal — so new data moves both sides together and only a code regression diverges.
+
+    SCOPE SPLIT (Bug 2.5): boundaries (first/last_training_date) are the EXCLUDED strength
+    scope (cats 10/11/12 dropped, 308-basis), but total_training_days is the ATTENDANCE
+    count over ALL categories (Time/Place/Neck INCLUDED, 317-basis) — a day you logged
+    time/location/neck is still a training day, so it is counted even though the volume
+    math excludes those categories.
     """
     data = collect(query_period_days=None)
     ats = data["all_time_summary"]
 
     conn = _ro_conn()
     try:
+        # Excluded strength scope — drives the boundary dates.
         r = conn.execute(
-            "SELECT COUNT(DISTINCT tl.date) c, MIN(tl.date) mn, MAX(tl.date) mx "
+            "SELECT MIN(tl.date) mn, MAX(tl.date) mx "
             "FROM training_log tl JOIN exercise e ON tl.exercise_id = e._id "
             "WHERE e.category_id NOT IN (10, 11, 12)"
         ).fetchone()
+        # All-category attendance scope — drives the training-day count.
+        all_days = conn.execute(
+            "SELECT COUNT(DISTINCT tl.date) "
+            "FROM training_log tl JOIN exercise e ON tl.exercise_id = e._id"
+        ).fetchone()[0]
     finally:
         conn.close()
 
-    # E1: boundary dates == independent MIN/MAX over the same scope
+    # E1: boundary dates == independent MIN/MAX over the EXCLUDED (strength) scope
     assert ats["first_training_date"] == r["mn"]
     assert ats["last_training_date"]  == r["mx"]
-    # E4: distinct training day count == independent COUNT(DISTINCT date)
-    assert ats["total_training_days"] == r["c"]
+    # E4: training-day count == independent COUNT(DISTINCT date) over ALL categories
+    assert ats["total_training_days"] == all_days
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -861,51 +1014,11 @@ def test_G_SCOPE_FALLBACK_nonexistent_exercise():
 # (process.py _compute_progression / _evaluate_phase2)
 # ══════════════════════════════════════════════════════════════════════════════
 
-_LAT_KW = dict(query_period_days=400, exercise_names=["Lat Pulldown"],
-               aggregation_level="session", include_phase2=True)
-
-
 def _synth_session(date: str, w: float, reps: int) -> dict:
     """Minimal session dict accepted by _compute_progression (Epley e1RM)."""
     e = round(w * (1 + reps / 30), 1) if reps > 1 else float(w)
     return {"date": date, "unit": "lbs", "max_working_weight": float(w),
             "reps_at_max": reps, "estimated_1rm": e}
-
-
-# ── G-PLATEAU-FALSE · Lat Pulldown rising run must NOT read as a plateau ───────
-
-def test_G_PLATEAU_FALSE_lat_pulldown():
-    data = collect(**_LAT_KW)
-    ex = _ex(data, "Lat Pulldown")
-    p = ex["progression"]
-    # The 12-session 130 run (incl. 130x9) is progression, not a plateau.
-    assert p["is_plateau"] is False, p.get("plateau_note")
-    assert p["plateau_since"] is None
-    assert p["last_new_best_date"] == "2026-05-18"      # the 130x9 rep-gain session
-    assert p["sessions_since_best"] < 5                  # below the plateau threshold
-    # "current ability" reflects the established 130, NOT today's 120 back-off day
-    assert p["current_weight"] == 130.0
-    assert ex["plateau_days"] == 0
-    # Phase 2 fires on the genuine year-long improvement (start 100 -> current
-    # ability 130 = +30%), NOT on a plateau (is_plateau stays False above). The
-    # end-anchor fix means weight_change_pct now reflects current ability, not
-    # the 120 back-off last session (which gave a sub-threshold 20%).
-    assert p["weight_change_pct"] == 30.0
-    assert ex["phase2_triggered"] is True
-
-
-# ── G-NO-REGRESSION · today's 120 back-off day is not a regression ────────────
-
-def test_G_NO_REGRESSION_lat_pulldown_backoff():
-    data = collect(**_LAT_KW)
-    p = _ex(data, "Lat Pulldown")["progression"]
-    assert p["regression_from_peak"] is None             # was a false 7.7% drop
-    # End now tracks current ability (130), not the back-off last session;
-    # the literal 120 lives in latest_session_weight (labeled as a back-off).
-    assert p["max_weight_end"] == 130.0
-    assert p["current_weight"] == 130.0
-    assert p["latest_session_weight"] == 120.0
-    assert p["latest_session_is_backoff"] is True
 
 
 # ── G-REP-PROGRESS · same-weight rep gain IS a new best ───────────────────────
@@ -1026,26 +1139,6 @@ def test_G_COMMENT_MARCH16_lat_pulldown():
 # (process.py _compute_progression — end = current ability, not the last session)
 # ══════════════════════════════════════════════════════════════════════════════
 
-_DL_90 = dict(query_period_days=90, exercise_names=["Deadlift"],
-              aggregation_level="session", include_phase2=True)
-
-
-def test_G_PROG_END_CURRENT_deadlift_90d():
-    # End must be current ability (85, the PR), not the back-off last session (70).
-    data = collect(**_DL_90)
-    ex = _ex(data, "Deadlift")
-    p = ex["progression"]
-    assert p["max_weight_end"] == 85.0
-    assert p["current_weight"] == 85.0
-    assert p["latest_session_weight"] == 70.0            # the back-off last session
-    assert p["latest_session_is_backoff"] is True
-    # no contradiction with the PR: end == PR weight
-    assert ex["pr"]["weight"] == 85.0
-    # start unchanged (60), so the % is start->current, not start->back-off
-    assert p["max_weight_start"] == 60.0
-    assert p["weight_change_pct"] == 41.7
-
-
 def test_G_PROG_CROSSFRAME_deadlift_alltime():
     # All-time spans the 2025-12-26 lbs->kg switch — the % must NOT be the old
     # boundary-spanning 185.4; it is within the kg era (start re-anchored).
@@ -1059,19 +1152,6 @@ def test_G_PROG_CROSSFRAME_deadlift_alltime():
     assert p["max_weight_start"] == 32.0                 # first post-switch session (settled history)
     # max_weight_end (the all-time max) was a one-PR-away record pin — removed.
     # The cross-frame % LOGIC above (pct != 185.4) is the regression-relevant check.
-
-
-def test_G_BACKOFF_LABEL_lat_pulldown():
-    # 90-day window: first session is 130×5, so start==current==130 and the
-    # working weight is HELD (0), not the old -10/-7.7% back-off decline.
-    p = _ex(collect(query_period_days=90, exercise_names=["Lat Pulldown"],
-                    aggregation_level="session", include_phase2=True),
-            "Lat Pulldown")["progression"]
-    assert p["latest_session_is_backoff"] is True
-    assert p["latest_session_weight"] == 120.0
-    assert p["latest_session_reps"] == 6
-    assert p["current_weight"] == 130.0
-    assert p["weight_change"] == 0.0                     # working weight HELD, not -10
 
 
 def test_G_NO_BACKOFF_last_session_is_new_best():
@@ -1090,6 +1170,49 @@ def test_G_NO_BACKOFF_last_session_is_new_best():
     assert p["current_weight"] == 115.0
     assert p["latest_session_weight"] == 115.0
     assert p["max_weight_end"] == 115.0                  # end == latest == current
+
+
+# ── G-BACKOFF-TRUE · rising run ending on a deliberate back-off (synthetic) ───
+# Complement to test_G_NO_BACKOFF: the most recent session is LOWER load than the
+# established working max, so latest_session_is_backoff is True BY CONSTRUCTION
+# (no today-relative window). Asserts the full back-off-branch union the four
+# deleted live goldens used to cover: end-anchor on current ability, the back-off
+# label fields, % that tracks current ability (not the back-off day), and no
+# false regression / plateau.
+
+def test_G_BACKOFF_TRUE_synthetic():
+    from src.data_agent.process import _compute_progression, _evaluate_phase2
+    from datetime import datetime
+    sessions = [
+        _synth_session("2026-01-05", 100, 5),   # start
+        _synth_session("2026-01-12", 110, 5),
+        _synth_session("2026-01-19", 120, 5),
+        _synth_session("2026-01-26", 130, 5),    # the PR / last new best
+        _synth_session("2026-02-02", 120, 6),    # deliberate back-off (last session)
+    ]
+    p = _compute_progression(sessions)
+    # Latest session is the back-off, labeled distinct from current ability.
+    assert p["latest_session_is_backoff"] is True
+    assert p["latest_session_weight"] == 120.0
+    assert p["latest_session_reps"] == 6
+    # Current ability holds the established 130, NOT the 120 back-off day.
+    assert p["current_weight"] == 130.0
+    # End anchor = current ability (130), never the back-off last session (120).
+    assert p["max_weight_end"] == 130.0
+    # % is start->current ability (100->130 = +30%), NOT start->back-off (->120 = +20%).
+    assert p["max_weight_start"] == 100.0
+    assert p["weight_change"] == 30.0
+    assert p["weight_change_pct"] == 30.0
+    # A single lighter day is neither a regression nor a plateau.
+    assert p["regression_from_peak"] is None
+    assert p["is_plateau"] is False
+    assert p["plateau_since"] is None
+    assert p["last_new_best_date"] == "2026-01-26"       # the PR, not the back-off
+    assert p["sessions_since_best"] == 1                 # < PLATEAU_MIN_SESSIONS_SINCE_BEST (5)
+    # Phase 2 fires on the genuine +30% improvement, not on a plateau.
+    trig, days = _evaluate_phase2(p, datetime.strptime("2026-02-02", "%Y-%m-%d").date())
+    assert trig is True
+    assert days == 0                                     # not a plateau -> no span
 
 
 # ══════════════════════════════════════════════════════════════════════════════
