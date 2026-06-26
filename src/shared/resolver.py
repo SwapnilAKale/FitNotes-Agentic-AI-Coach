@@ -11,18 +11,113 @@ import re
 import sqlite3
 
 
-def resolve_exercise_name(query: str, db_path: str) -> dict:
+# Permissive rank-and-pick thresholds (READ path only). These now serve ONLY the
+# 0-data NAME-ONLY FALLBACK below (when no candidate has real logged data): a LIKE
+# tier with multiple all-unlogged candidates auto-resolves to the difflib winner
+# only when it clears both:
+#   MARGIN    — top ratio must beat the runner-up by this much (a CLEAR winner)
+#   MIN_FLOOR — top ratio must itself be at least this (not a weak best-of-bad-lot)
+_PERMISSIVE_MARGIN    = 0.10
+_PERMISSIVE_MIN_FLOOR = 0.5
+
+# Real-data threshold (READ path only). A candidate with at least this many logged
+# sets is a "real target" the user actually trains; below it an exercise has no
+# analyzable history. The multi-candidate decision keys on HOW MANY candidates clear
+# this floor — a corpus-independent signal, unlike a tuned name-similarity margin:
+#   >= 2 real-data candidates -> genuine ambiguity -> ASK (return None, no auto-pick)
+#   == 1 real-data candidate  -> the sole real target -> auto-pick it
+#   == 0 real-data candidates -> fall back to the name-only margin pick above
+# WRITE path (permissive=False) NEVER applies this filter: a first-time-logged
+# exercise legitimately has 0 sets, so writes keep strict disambiguation.
+_LOGGED_FLOOR = 5
+
+
+def resolve_exercise_name(query: str, db_path: str, permissive: bool = False) -> dict:
     """
     Resolve a colloquial exercise name to its exact database name.
     Returns {"candidates": [...], "match": "..." or None}
     Same 5-tier logic as the MCP tool.
     Uses db_path to query the exercise table directly.
+
+    permissive: READ-PATH ONLY. When True, a LIKE tier that yields multiple
+    candidates auto-resolves to a clear-margin difflib winner instead of
+    disambiguating. MUST stay False for writes — a silent wrong write is
+    unrecoverable (the locked auto-pick-removal rule).
     """
     conn = _connect(db_path)
     try:
-        return _resolve(query, conn)
+        return _resolve(query, conn, permissive=permissive)
     finally:
         conn.close()
+
+
+def _ratio(query: str, name: str) -> float:
+    """Space-stripped, lowercased difflib ratio — the shared name-similarity score."""
+    return difflib.SequenceMatcher(
+        None, query.lower().replace(" ", ""), name.lower().replace(" ", "")
+    ).ratio()
+
+
+def _logged_counts(conn: sqlite3.Connection, names: list) -> dict:
+    """Logged-set count per candidate name (READ path only). One LEFT-JOIN query so
+    a never-logged exercise returns 0 rather than being dropped. Read-only."""
+    if not names:
+        return {}
+    placeholders = ",".join("?" * len(names))
+    rows = conn.execute(
+        f"""SELECT e.name AS name, COUNT(tl._id) AS sets
+            FROM exercise e
+            LEFT JOIN training_log tl ON tl.exercise_id = e._id
+            WHERE e.name IN ({placeholders})
+            GROUP BY e.name""",
+        tuple(names),
+    ).fetchall()
+    return {r["name"]: r["sets"] for r in rows}
+
+
+def _order_by_data(query: str, candidates: list, counts: dict) -> list:
+    """Order the ask-list data-first: (logged_count desc, name-ratio desc) so the
+    exercise the user actually trains leads the disambiguation prompt."""
+    return sorted(
+        candidates,
+        key=lambda n: (-counts.get(n, 0), -_ratio(query, n)),
+    )
+
+
+def _permissive_pick(query: str, candidates: list, counts: dict) -> "str | None":
+    """
+    READ-path multi-candidate decision (bug 2.4(ii)). The signal is HOW MANY
+    candidates have real logged data (>= _LOGGED_FLOOR), NOT a name-similarity margin:
+
+      >= 2 real-data candidates -> None (genuine ambiguity -> caller ASKS)
+      == 1 real-data candidate  -> that candidate (the sole real target)
+      == 0 real-data candidates -> name-only fallback (clear-margin difflib winner,
+                                    else None) — every pick here is data-sparse and
+                                    degrades downstream to "not found -> broad" anyway.
+
+    A single candidate can't be ambiguous, so it is returned directly.
+    """
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+
+    with_data = [c for c in candidates if counts.get(c, 0) >= _LOGGED_FLOOR]
+    if len(with_data) >= 2:
+        return None                      # genuine ambiguity → ASK
+    if len(with_data) == 1:
+        return with_data[0]              # sole real target → auto-pick
+
+    # 0 candidates with real data → name-only margin pick (unchanged behavior).
+    scored = sorted(
+        ((_ratio(query, n), n) for n in candidates),
+        key=lambda x: -x[0],
+    )
+    top_ratio, top_name = scored[0]
+    second_ratio = scored[1][0]
+    if top_ratio >= _PERMISSIVE_MIN_FLOOR and (top_ratio - second_ratio) >= _PERMISSIVE_MARGIN:
+        return top_name
+    return None
 
 
 def _connect(db_path: str) -> sqlite3.Connection:
@@ -43,7 +138,7 @@ def _like_escape(term: str) -> str:
     return term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
-def _resolve(query: str, conn: sqlite3.Connection) -> dict:
+def _resolve(query: str, conn: sqlite3.Connection, permissive: bool = False) -> dict:
     # Input guard: empty / whitespace-only / too-short (after strip) is NOT a
     # disambiguation case — it's "no exercise specified". Return a clean no-match
     # BEFORE any broad LIKE match. Without this, "" survived to Tier 2 as
@@ -100,6 +195,12 @@ def _resolve(query: str, conn: sqlite3.Connection) -> dict:
     )
     candidates = _filter_by_token([r["name"] for r in cursor.fetchall()])
     if candidates:
+        if permissive:
+            counts = _logged_counts(conn, candidates)
+            picked = _permissive_pick(query, candidates, counts)
+            if picked:
+                return {"match": picked, "candidates": []}
+            candidates = _order_by_data(query, candidates, counts)
         return {"match": None, "candidates": candidates}
 
     # Tier 3: plural/singular expansion + word-by-word matching.
@@ -139,6 +240,12 @@ def _resolve(query: str, conn: sqlite3.Connection) -> dict:
             )
     candidates = _filter_by_token(_dedup(raw))[:8]
     if candidates:
+        if permissive:
+            counts = _logged_counts(conn, candidates)
+            picked = _permissive_pick(query, candidates, counts)
+            if picked:
+                return {"match": picked, "candidates": []}
+            candidates = _order_by_data(query, candidates, counts)
         return {"match": None, "candidates": candidates}
 
     # Tier 4: fuzzy character-level match using difflib.SequenceMatcher.

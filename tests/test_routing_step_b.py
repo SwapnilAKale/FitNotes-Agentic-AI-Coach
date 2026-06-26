@@ -91,7 +91,7 @@ def _spy_resolver(monkeypatch, *, match=None, candidates=None):
     import src.shared.resolver as resolver_mod
     calls: list = []
 
-    def fake(name, db_path):
+    def fake(name, db_path, permissive=False):
         calls.append(name)
         return {"match": match, "candidates": candidates or []}
 
