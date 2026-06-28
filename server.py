@@ -326,7 +326,20 @@ async def _confirmation_handler(tool_name: str, arguments: dict) -> bool:
         )
         return False
     # Staging tool — capture its args so the confirmation card can show them.
-    _state["staging_preview"] = json.dumps(arguments, indent=2)
+    # Fix 3: log_workout now stages a multi-exercise day as a batch (N calls before
+    # one execute), so ACCUMULATE its previews instead of overwriting — otherwise the
+    # confirm card shows only the last exercise. Sibling single-item ops (set_goal,
+    # update/delete) keep overwrite. The accumulation is reset per /chat turn
+    # (the turn handler sets staging_preview="" before routing), and the confirmation
+    # gate ends the turn at execute, so a batch is scoped to one turn — no stale bleed.
+    blob = json.dumps(arguments, indent=2)
+    if tool_name == "log_workout":
+        _state["staging_preview"] = (
+            f"{_state['staging_preview']}\n\n{blob}"
+            if _state["staging_preview"] else blob
+        )
+    else:
+        _state["staging_preview"] = blob
     return True
 
 

@@ -163,7 +163,7 @@ def test_unit_param_never_leaks_into_metric_code(db):
             "exercise_name": "Test Press", "date": "2026-06-06",
             "sets": [{"weight": 100.0, "unit": u, "reps": 5}],
         })
-        staged = cs._staged_writes["workout"]["sets"][0]
+        staged = cs._staged_writes["workout"][0]["sets"][0]   # slot is a list of workouts (Fix 3)
         assert staged["unit"] in (0, 2, 3)     # metric code only
         assert staged["unit"] == 0             # strength → 0, never the string
     # cardio staged unit is also a metric code
@@ -173,7 +173,7 @@ def test_unit_param_never_leaks_into_metric_code(db):
         "sets": [{"distance": 1.0, "duration_seconds": 600},
                  {"duration_seconds": 300}],
     })
-    units = [s["unit"] for s in cs._staged_writes["workout"]["sets"]]
+    units = [s["unit"] for s in cs._staged_writes["workout"][0]["sets"]]   # list of workouts (Fix 3)
     assert units == [3, 2]
 
 
@@ -227,3 +227,171 @@ def test_wal_dedup_identical_cardio_collapsed(db):
     with pytest.raises(wal._ReplayConflict):
         _replay(db, params)                    # second time: all sets already present
     assert len(_rows(db)) == 1                  # still one row
+
+
+# ── Fix 3: batch staging (slot is a LIST of workouts) ─────────────────────────
+
+def _add_exercise(db_path, _id, name, cat):
+    conn = sqlite3.connect(db_path)
+    conn.execute("INSERT INTO exercise (_id, name, category_id) VALUES (?,?,?)",
+                 (_id, name, cat))
+    conn.commit()
+    conn.close()
+
+
+def test_batch_three_exercises_all_written(db):
+    # 3 log_workout calls before ONE execute → all 3 exercises' sets land (not just
+    # the last). Pre-Fix-3 the slot overwrote and only the last survived.
+    _add_exercise(db, 3, "Squat", 6)
+    _add_exercise(db, 4, "Curl", 3)
+    for name, lbs in [("Test Press", 100.0), ("Squat", 200.0), ("Curl", 50.0)]:
+        staged = json.loads(cs._log_workout_sync({
+            "exercise_name": name, "date": "2026-06-10",
+            "sets": [{"weight": lbs, "unit": "lbs", "reps": 5},
+                     {"weight": lbs, "unit": "lbs", "reps": 5}]}))
+        assert "error" not in staged, staged
+    done = json.loads(cs._execute_staged_workout_sync())
+    assert done["success"] and done["sets_written"] == 6 and done["exercises_written"] == 3
+    by_ex = {}
+    for r in _rows(db):
+        by_ex[r["exercise_id"]] = by_ex.get(r["exercise_id"], 0) + 1
+    assert by_ex == {1: 2, 3: 2, 4: 2}          # every exercise's 2 sets present
+    assert cs._staged_writes.get("workout") is None   # slot cleared once
+
+
+def test_batch_mixed_strength_cardio_comments(db):
+    # One batch: strength+comment, distance cardio, duration-only cardio → all land.
+    _add_exercise(db, 3, "Cycling", 8)
+    for args in [
+        {"exercise_name": "Test Press", "date": "2026-06-11",
+         "sets": [{"weight": 100.0, "unit": "lbs", "reps": 5, "comment": "solid"}]},
+        {"exercise_name": "Treadmill", "date": "2026-06-11",
+         "sets": [{"distance": 3.0, "duration_seconds": 1200, "comment": "tempo"}]},
+        {"exercise_name": "Cycling", "date": "2026-06-11",
+         "sets": [{"duration_seconds": 1800}]},
+    ]:
+        assert "error" not in json.loads(cs._log_workout_sync(args))
+    done = json.loads(cs._execute_staged_workout_sync())
+    assert done["success"] and done["exercises_written"] == 3
+    tl = _rows(db)
+    strength = next(r for r in tl if r["exercise_id"] == 1)
+    dist     = next(r for r in tl if r["exercise_id"] == 2)
+    dur_only = next(r for r in tl if r["exercise_id"] == 3)
+    assert strength["reps"] == 5 and strength["unit"] == 0
+    assert dist["unit"] == 3 and dist["distance"] == 3.0 and dist["duration_seconds"] == 1200
+    assert dur_only["unit"] == 2 and dur_only["distance"] == 0 and dur_only["duration_seconds"] == 1800
+    comments = {c["owner_id"]: c["comment"] for c in _rows(db, "Comment")}
+    assert comments[strength["_id"]] == "solid" and comments[dist["_id"]] == "tempo"
+    assert dur_only["_id"] not in comments       # no comment on the duration-only set
+
+
+def test_batch_wal_one_record_per_workout(db, monkeypatch, tmp_path):
+    # THE TRAP guard: a 3-exercise batch must journal 3 per-workout WAL records,
+    # each params a single workout dict — NOT one record holding the list.
+    monkeypatch.setattr(wal, "WAL_PATH", str(tmp_path / "wal.json"))
+    _add_exercise(db, 3, "Squat", 6)
+    for name in ("Test Press", "Treadmill", "Squat"):
+        args = ({"exercise_name": name, "date": "2026-06-12",
+                 "sets": [{"distance": 2.0, "duration_seconds": 900}]}
+                if name == "Treadmill" else
+                {"exercise_name": name, "date": "2026-06-12",
+                 "sets": [{"weight": 80.0, "unit": "lbs", "reps": 5}]})
+        cs._log_workout_sync(args)
+    assert json.loads(cs._execute_staged_workout_sync())["success"]
+
+    records = wal.get_records()
+    assert len(records) == 3                      # one PER workout, not one list record
+    for rec in records:
+        assert rec["tool"] == "execute_staged_workout"
+        p = rec["params"]
+        assert isinstance(p, dict) and not isinstance(p, list)   # single workout, never a list
+        assert "exercise_id" in p and isinstance(p["sets"], list)
+
+
+def test_batch_single_exercise_still_works(db):
+    # Regression: a list-of-one behaves exactly like the old single-workout case.
+    assert "error" not in json.loads(cs._log_workout_sync({
+        "exercise_name": "Test Press", "date": "2026-06-13",
+        "sets": [{"weight": 120.0, "unit": "lbs", "reps": 3}]}))
+    done = json.loads(cs._execute_staged_workout_sync())
+    assert done["success"] and done["sets_written"] == 1 and done["exercises_written"] == 1
+    assert len(_rows(db)) == 1
+
+
+def _make_db_with_check(path):
+    """Same schema as _make_db but training_log carries CHECK(reps >= 0) — a
+    constraint SQLite genuinely ENFORCES (raises IntegrityError), unlike a bad-typed
+    value that type affinity would silently accept."""
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE exercise (_id INTEGER PRIMARY KEY, name TEXT, category_id INTEGER);
+        CREATE TABLE training_log (
+            _id INTEGER PRIMARY KEY, exercise_id INTEGER, date DATE,
+            metric_weight REAL, reps INTEGER CHECK (reps >= 0),
+            unit INTEGER NOT NULL DEFAULT 0, is_personal_record INTEGER,
+            is_complete INTEGER NOT NULL DEFAULT 0,
+            distance REAL NOT NULL DEFAULT 0, duration_seconds INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE Comment (_id INTEGER PRIMARY KEY, date DATE, owner_type_id INTEGER,
+                              owner_id INTEGER, comment TEXT);
+        INSERT INTO exercise (_id, name, category_id) VALUES (1,'Test Press',5), (2,'Squat',6);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_batch_cross_exercise_rollback(tmp_path, monkeypatch):
+    # WHOLE batch is one transaction: exercise 1 valid, a LATER exercise fails →
+    # exercise 1's sets roll back too (0 rows). Failure mode = CHECK(reps>=0), which
+    # SQLite truly raises on (reps=-1), not a silently-accepted bad value.
+    p = str(tmp_path / "chk.fitnotes")
+    _make_db_with_check(p)
+    monkeypatch.setattr(cs, "DB_PATH", p)
+
+    # Non-vacuity guard: a control all-valid batch DOES write on this schema.
+    cs._staged_writes.clear()
+    cs._log_workout_sync({"exercise_name": "Test Press", "date": "2026-06-14",
+                          "sets": [{"weight": 100.0, "unit": "lbs", "reps": 5}]})
+    cs._log_workout_sync({"exercise_name": "Squat", "date": "2026-06-14",
+                          "sets": [{"weight": 200.0, "unit": "lbs", "reps": 3}]})
+    assert json.loads(cs._execute_staged_workout_sync())["success"]
+    assert len(_rows(p)) == 2                     # inserts genuinely happen absent a failure
+
+    # Now exercise 1 valid + a LATER exercise with reps=-1 (violates CHECK).
+    cs._staged_writes.clear()
+    cs._log_workout_sync({"exercise_name": "Test Press", "date": "2026-06-15",
+                          "sets": [{"weight": 100.0, "unit": "lbs", "reps": 5}]})
+    cs._log_workout_sync({"exercise_name": "Squat", "date": "2026-06-15",
+                          "sets": [{"weight": 200.0, "unit": "lbs", "reps": -1}]})
+    out = json.loads(cs._execute_staged_workout_sync())
+    assert "error" in out                         # the CHECK violation surfaced
+    assert [r for r in _rows(p) if r["date"] == "2026-06-15"] == []   # whole batch rolled back
+
+
+def test_batch_preview_accumulates_and_resets(monkeypatch):
+    # Preview shows the WHOLE batch (not just the last exercise); sibling ops do not
+    # accumulate; the per-turn reset (server.py:526 sets staging_preview="") starts clean.
+    import asyncio
+    import server as srv
+
+    srv._state["staging_preview"] = ""           # mimic the start-of-turn reset (:526)
+    for name in ("Test Press", "Squat", "Curl"):
+        asyncio.run(srv._confirmation_handler(
+            "log_workout", {"exercise_name": name, "date": "2026-06-16", "sets": []}))
+    preview = srv._state["staging_preview"]
+    assert all(n in preview for n in ("Test Press", "Squat", "Curl"))   # all 3 present
+
+    # A sibling single-item op overwrites (does NOT accumulate onto the batch).
+    asyncio.run(srv._confirmation_handler(
+        "set_goal", {"exercise_name": "Bench", "target_weight": 225}))
+    assert "Test Press" not in srv._state["staging_preview"]
+    assert "Bench" in srv._state["staging_preview"]
+
+    # Per-turn reset → a fresh stage starts clean (no stale bleed from the prior batch).
+    srv._state["staging_preview"] = ""           # what server.py:526 does each /chat turn
+    asyncio.run(srv._confirmation_handler(
+        "log_workout", {"exercise_name": "Deadlift", "date": "2026-06-17", "sets": []}))
+    assert "Squat" not in srv._state["staging_preview"]
+    assert "Deadlift" in srv._state["staging_preview"]

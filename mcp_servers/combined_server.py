@@ -1422,11 +1422,14 @@ def _log_workout_sync(arguments: dict) -> str:
                 "comment": comment,
             })
 
-    _staged_writes["workout"] = {
+    # Fix 3: the slot is a LIST of workouts so a multi-exercise day stages as a
+    # batch — each log_workout APPENDS one workout instead of overwriting the slot
+    # (which previously dropped all but the last exercise). One execute writes all.
+    _staged_writes.setdefault("workout", []).append({
         "exercise_id": exercise_id,
         "date": date_str,
         "sets": staged_sets,
-    }
+    })
 
     # Summary reflects what is actually being written (cardio metrics + comments),
     # not a weight×reps-only framing.
@@ -1461,31 +1464,45 @@ async def _log_workout(arguments: dict) -> str:
 def _execute_staged_workout_sync() -> str:
     from src.db import get_write_connection, insert_training_log_set, insert_set_comment
 
-    staged = _staged_writes.get("workout")
-    if not staged:
+    # Fix 3: the slot holds a LIST of workouts (a multi-exercise day). Write the
+    # whole batch in ONE transaction — outer loop over workouts, inner loop over
+    # each workout's sets — so a partial failure rolls back the entire day rather
+    # than half-writing it.
+    staged_list = _staged_writes.get("workout")
+    if not staged_list:
         return json.dumps({"error": "No staged workout found. Call log_workout first."})
 
     conn = get_write_connection(DB_PATH)
     sets_written = 0
     try:
-        for s in staged["sets"]:
-            # Shared writer (also used by WAL replay) → identical rows on replay.
-            new_id = insert_training_log_set(
-                conn, staged["exercise_id"], staged["date"], s)
-            if s.get("comment"):
-                # Bind the comment to THIS set's new _id (no off-by-one).
-                insert_set_comment(conn, new_id, staged["date"], s["comment"])
-            sets_written += 1
-        conn.commit()
+        for w in staged_list:
+            for s in w["sets"]:
+                # Shared writer (also used by WAL replay) → identical rows on replay.
+                new_id = insert_training_log_set(conn, w["exercise_id"], w["date"], s)
+                if s.get("comment"):
+                    # Bind the comment to THIS set's new _id (no off-by-one).
+                    insert_set_comment(conn, new_id, w["date"], s["comment"])
+                sets_written += 1
+        conn.commit()                       # ONE commit for the whole batch
     except Exception as exc:
-        conn.rollback()
+        conn.rollback()                     # whole batch rolls back — no half-written day
         return json.dumps({"error": f"Failed to write workout: {exc}"})
     finally:
         conn.close()
 
     _staged_writes.pop("workout", None)
-    _wal_append("execute_staged_workout", staged)
-    return json.dumps({"success": True, "sets_written": sets_written, "message": "Workout logged successfully."})
+    # WAL: one record PER workout (NOT the list). append_write does no shape
+    # validation and _wal_append swallows errors, so journaling the whole list
+    # would silently write an un-replayable record (replay reads one workout per
+    # record). Per-workout records keep replay working unchanged.
+    for w in staged_list:
+        _wal_append("execute_staged_workout", w)
+    return json.dumps({
+        "success": True,
+        "sets_written": sets_written,
+        "exercises_written": len(staged_list),
+        "message": "Workout logged successfully.",
+    })
 
 
 async def _execute_staged_workout() -> str:
