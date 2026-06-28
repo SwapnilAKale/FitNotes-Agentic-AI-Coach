@@ -207,30 +207,39 @@ def _replay_workout(conn: sqlite3.Connection, params: dict) -> str:
     if not date_str or not sets:
         raise _ReplayConflict("workout record missing date or sets")
 
+    from src.db import insert_training_log_set, insert_set_comment
+
     inserted = skipped = 0
     for s in sets:
         metric_weight = _set_metric_weight(s)
-        reps = int(s["reps"])
+        reps = int(s.get("reps") or 0)          # cardio sets carry reps=0
+        distance = float(s.get("distance") or 0)
+        duration = int(s.get("duration_seconds") or 0)
         # training_log has no unique constraint, so a duplicate INSERT would
         # succeed and double the set. An identical existing row means the
-        # data is already in the database — skip it.
+        # data is already in the database — skip it. The predicate is
+        # cardio-aware: distinct cardio sessions (weight=reps=0) differ only by
+        # distance/duration, so those are part of the identity check.
         dup = conn.execute(
             """SELECT 1 FROM training_log
                WHERE exercise_id = ? AND date = ? AND reps = ?
                  AND ABS(metric_weight - ?) < ?
+                 AND ABS(distance - ?) < ?
+                 AND duration_seconds = ?
                LIMIT 1""",
-            (exercise_id, date_str, reps, metric_weight, _WEIGHT_EPSILON),
+            (exercise_id, date_str, reps, metric_weight, _WEIGHT_EPSILON,
+             distance, _WEIGHT_EPSILON, duration),
         ).fetchone()
         if dup:
             skipped += 1
             continue
-        conn.execute(
-            """INSERT INTO training_log
-               (exercise_id, date, metric_weight, reps, unit, is_personal_record, is_complete)
-               VALUES (?, ?, ?, ?, 0, ?, 1)""",
-            (exercise_id, date_str, metric_weight, reps,
-             int(s.get("is_personal_record", 0))),
-        )
+        # Shared writer (also used by the live execute handler) → a replay
+        # reproduces an identical row. metric_weight is recovered above for the
+        # dedup check, so thread it onto the dict the helper writes.
+        new_id = insert_training_log_set(
+            conn, exercise_id, date_str, {**s, "metric_weight": metric_weight})
+        if s.get("comment"):
+            insert_set_comment(conn, new_id, date_str, s["comment"])
         inserted += 1
 
     if inserted == 0:

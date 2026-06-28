@@ -125,15 +125,35 @@ async def list_tools() -> list[types.Tool]:
                     },
                     "sets": {
                         "type": "array",
-                        "description": "list of sets to log",
+                        "description": (
+                            "list of sets to log. STRENGTH sets use weight+reps; "
+                            "CARDIO sets use distance and/or duration_seconds "
+                            "(omit weight/reps). Add comment for any set's notes."
+                        ),
                         "items": {
                             "type": "object",
                             "properties": {
-                                "weight": {"type": "number"},
-                                "unit": {"type": "string", "enum": ["lbs", "kg"]},
-                                "reps": {"type": "integer"},
+                                "weight": {"type": "number", "description": "strength: weight lifted"},
+                                "unit": {
+                                    "type": "string",
+                                    "enum": ["lbs", "kg"],
+                                    "description": "display unit of weight (lbs/kg). Strength only.",
+                                },
+                                "reps": {"type": "integer", "description": "strength: reps performed"},
+                                "comment": {
+                                    "type": "string",
+                                    "description": "optional per-set note (form, how it felt, etc.)",
+                                },
+                                "distance": {
+                                    "type": "number",
+                                    "description": "cardio: distance in km",
+                                },
+                                "duration_seconds": {
+                                    "type": "integer",
+                                    "description": "cardio: duration in seconds",
+                                },
                             },
-                            "required": ["weight", "unit", "reps"],
+                            "required": [],
                         },
                     },
                 },
@@ -1342,12 +1362,14 @@ def _log_workout_sync(arguments: dict) -> str:
         })
 
     conn = get_connection(DB_PATH)
-    cursor = conn.execute("SELECT _id FROM exercise WHERE name = ?", (exercise_name,))
+    cursor = conn.execute(
+        "SELECT _id, category_id FROM exercise WHERE name = ?", (exercise_name,))
     row = cursor.fetchone()
     if not row:
         return json.dumps({"error": f"Exercise '{exercise_name}' not found. Use resolve_exercise_name first."})
 
     exercise_id = row["_id"]
+    is_cardio = row["category_id"] == 8   # category_id 8 == Cardio
 
     cursor = conn.execute(
         "SELECT MAX(metric_weight) AS max_w FROM training_log WHERE exercise_id = ?",
@@ -1356,23 +1378,49 @@ def _log_workout_sync(arguments: dict) -> str:
     pr_row = cursor.fetchone()
     current_pr_metric = pr_row["max_w"] if pr_row and pr_row["max_w"] is not None else 0.0
 
+    # Each staged set is the CANONICAL row (final column values for its metric
+    # type), so the execute handler and WAL replay are blind, identical writers.
+    # `unit` is the METRIC-TYPE code (0/2/3), never the lbs/kg display unit — the
+    # lbs/kg param is intentionally NOT stored (read path derives it elsewhere).
     staged_sets = []
     new_prs = 0
+    cardio_count = 0
 
     for s in sets:
-        weight = float(s["weight"])
-        unit = s["unit"]
-        reps = int(s["reps"])
-        metric_weight = weight / 2.2046
-        is_pr = metric_weight > current_pr_metric
-        if is_pr:
-            current_pr_metric = metric_weight
-            new_prs += 1
-        staged_sets.append({
-            "metric_weight": metric_weight,
-            "reps": reps,
-            "is_personal_record": 1 if is_pr else 0,
-        })
+        comment = (s.get("comment") or "").strip() or None
+        if is_cardio:
+            # Cardio: distance/duration, weight=reps=0, no PR-on-weight.
+            distance = float(s["distance"]) if s.get("distance") is not None else 0.0
+            duration = int(s["duration_seconds"]) if s.get("duration_seconds") is not None else 0
+            unit_code = 3 if distance > 0 else 2   # 3=distance/km, 2=duration/time
+            staged_sets.append({
+                "metric_weight": 0,
+                "reps": 0,
+                "unit": unit_code,
+                "distance": distance,
+                "duration_seconds": duration,
+                "is_personal_record": 0,
+                "comment": comment,
+            })
+            cardio_count += 1
+        else:
+            # Strength: weight×reps; unit column is the vestigial constant 0.
+            weight = float(s["weight"])
+            reps = int(s["reps"])
+            metric_weight = weight / 2.2046
+            is_pr = metric_weight > current_pr_metric
+            if is_pr:
+                current_pr_metric = metric_weight
+                new_prs += 1
+            staged_sets.append({
+                "metric_weight": metric_weight,
+                "reps": reps,
+                "unit": 0,
+                "distance": 0,
+                "duration_seconds": 0,
+                "is_personal_record": 1 if is_pr else 0,
+                "comment": comment,
+            })
 
     _staged_writes["workout"] = {
         "exercise_id": exercise_id,
@@ -1380,12 +1428,28 @@ def _log_workout_sync(arguments: dict) -> str:
         "sets": staged_sets,
     }
 
-    pr_note = f" ({new_prs} new PR{'s' if new_prs != 1 else ''})" if new_prs else ""
+    # Summary reflects what is actually being written (cardio metrics + comments),
+    # not a weight×reps-only framing.
+    if is_cardio and cardio_count:
+        parts = []
+        for s in staged_sets:
+            if s["distance"] > 0:
+                parts.append(f"{s['distance']} km in {s['duration_seconds']}s")
+            else:
+                parts.append(f"{s['duration_seconds']}s")
+        summary = f"{cardio_count} cardio entr{'y' if cardio_count == 1 else 'ies'} of {exercise_name} on {date_str} ({'; '.join(parts)})"
+    else:
+        pr_note = f" ({new_prs} new PR{'s' if new_prs != 1 else ''})" if new_prs else ""
+        summary = f"{len(sets)} sets of {exercise_name} on {date_str}{pr_note}"
+    comment_count = sum(1 for s in staged_sets if s["comment"])
+    if comment_count:
+        summary += f", {comment_count} with notes"
+
     return json.dumps({
         "staged": True,
         "requires_confirmation": True,
         "staged_key": "workout",
-        "summary": f"{len(sets)} sets of {exercise_name} on {date_str}{pr_note}",
+        "summary": summary,
         "next_step": "Call execute_staged_workout to complete the write.",
     })
 
@@ -1395,7 +1459,7 @@ async def _log_workout(arguments: dict) -> str:
 
 
 def _execute_staged_workout_sync() -> str:
-    from src.db import get_write_connection
+    from src.db import get_write_connection, insert_training_log_set, insert_set_comment
 
     staged = _staged_writes.get("workout")
     if not staged:
@@ -1405,12 +1469,12 @@ def _execute_staged_workout_sync() -> str:
     sets_written = 0
     try:
         for s in staged["sets"]:
-            conn.execute(
-                """INSERT INTO training_log
-                   (exercise_id, date, metric_weight, reps, unit, is_personal_record, is_complete)
-                   VALUES (?, ?, ?, ?, 0, ?, 1)""",
-                (staged["exercise_id"], staged["date"], s["metric_weight"], s["reps"], s["is_personal_record"]),
-            )
+            # Shared writer (also used by WAL replay) → identical rows on replay.
+            new_id = insert_training_log_set(
+                conn, staged["exercise_id"], staged["date"], s)
+            if s.get("comment"):
+                # Bind the comment to THIS set's new _id (no off-by-one).
+                insert_set_comment(conn, new_id, staged["date"], s["comment"])
             sets_written += 1
         conn.commit()
     except Exception as exc:
