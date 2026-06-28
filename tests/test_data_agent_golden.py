@@ -782,9 +782,10 @@ def test_G_SCOPE_BROAD_size_and_fields():
       • no dropped deep-stat keys on any non-cardio exercise
       • exactly monthly_aggregations present (365d >= 180d)
       • serialized size < 500 KB
-      • Lat Pulldown pr.weight 130.0 × 9 with comment (carried on pr object,
-        not via full_comments — must survive the drop)
-    Pinned to 2026-05-28 snapshot.
+    Structure-only and snapshot-INDEPENDENT (no live-DB value pins). PR value/comment
+    logic — incl. that pr.comment lives on the pr object and never depends on
+    full_comments — is covered by the synthetic PR LOGIC section above
+    (test_PR_LOGIC_picks_highest_weight / _weight_tie_more_reps_wins / _pr_carries_comment).
     """
     import json as _json
     pkg = prepare_analysis_package(query_period_days=365)
@@ -813,17 +814,11 @@ def test_G_SCOPE_BROAD_size_and_fields():
         f"G-SCOPE-BROAD: package is {size_kb:.1f} KB, expected < 500 KB"
     )
 
-    # PR comment must survive on the pr object (not via full_comments)
-    lat_ex = next(e for e in pkg["exercises"] if e["name"] == "Lat Pulldown")
-    pr = lat_ex.get("pr")
-    assert pr is not None
-    assert pr["weight"] == pytest.approx(130.0)
-    assert pr["reps"] == 9
-    assert "comment" in pr and pr["comment"] is not None, (
-        "G-SCOPE-BROAD: Lat Pulldown pr.comment missing — PR comment must live on pr "
-        "object, not depend on full_comments"
-    )
-    assert "First 3 below the neck" in pr["comment"]
+    # NOTE: the former Lat Pulldown pr.weight==130×9 (+comment) assertions were
+    # DELETED — they were a live-DB pin that drifted (true all-time PR is now
+    # 145×5 2026-06-10 as heavier sets were logged after the 2026-05-28 snapshot;
+    # code correct, golden stale). PR value + the pr.comment-not-via-full_comments
+    # invariant are covered by the synthetic PR LOGIC section above.
 
 
 # ══════════════════════════════════════════════════════════════════════════════
