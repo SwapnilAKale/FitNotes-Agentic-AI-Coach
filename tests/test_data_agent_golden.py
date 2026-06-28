@@ -1139,19 +1139,9 @@ def test_G_COMMENT_MARCH16_lat_pulldown():
 # (process.py _compute_progression — end = current ability, not the last session)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def test_G_PROG_CROSSFRAME_deadlift_alltime():
-    # All-time spans the 2025-12-26 lbs->kg switch — the % must NOT be the old
-    # boundary-spanning 185.4; it is within the kg era (start re-anchored).
-    data = collect(query_period_days=None, exercise_names=["Deadlift"],
-                   aggregation_level="session", include_phase2=True)
-    p = _ex(data, "Deadlift")["progression"]
-    assert p["unit_switch_in_period"] is True
-    assert p["weight_change_pct"] != 185.4
-    assert p["weight_change_pct"] is None or p["weight_change_pct"] < 185.4
-    assert p["progression_note"] and "unit switch" in p["progression_note"]
-    assert p["max_weight_start"] == 32.0                 # first post-switch session (settled history)
-    # max_weight_end (the all-time max) was a one-PR-away record pin — removed.
-    # The cross-frame % LOGIC above (pct != 185.4) is the regression-relevant check.
+# test_G_PROG_CROSSFRAME_deadlift_alltime — DELETED (unsound live-DB golden:
+# weight_change_pct drifted to 337.5% as 2026-06-27 kg Deadlift rows grew the
+# live data). Replaced by the synthetic by-construction test_G_PROG_CROSSFRAME_synthetic.
 
 
 def test_G_NO_BACKOFF_last_session_is_new_best():
@@ -1215,25 +1205,48 @@ def test_G_BACKOFF_TRUE_synthetic():
     assert days == 0                                     # not a plateau -> no span
 
 
+# ── G-PROG-CROSSFRAME (synthetic) · unit-switch window re-anchors the % ────────
+# Synthetic by-construction replacement for the deleted live-DB
+# test_G_PROG_CROSSFRAME_deadlift_alltime (it drifted to 337.5% as 2026-06-27 kg
+# rows grew the live Deadlift). A window spanning a lbs->kg switch must re-anchor
+# "start" into the END (kg) frame so the % is same-frame, never boundary-spanning.
+# Validity: kg-era start=90, current best=100 -> +11.1% is computed BY HAND from
+# the placed values, sharing no logic with _compute_progression's re-anchoring.
+
+def test_G_PROG_CROSSFRAME_synthetic():
+    from src.data_agent.process import _compute_progression
+
+    def S(date, w, reps, unit):
+        e = round(w * (1 + reps / 30), 1) if reps > 1 else float(w)
+        return {"date": date, "unit": unit, "max_working_weight": float(w),
+                "reps_at_max": reps, "estimated_1rm": e}
+
+    sessions = [
+        S("2026-01-05", 200, 5, "lbs"),   # pre-switch (lbs era)
+        S("2026-01-12", 210, 5, "lbs"),
+        S("2026-01-19",  90, 5, "kg"),    # post-switch start (kg era)
+        S("2026-01-26", 100, 5, "kg"),    # kg-era best == current ability
+    ]
+    p = _compute_progression(sessions)
+    assert p["unit_switch_in_period"] is True
+    assert p["progression_note"] and "unit switch" in p["progression_note"]
+    # start re-anchored to the first kg-era session (90), NOT the lbs 200/210.
+    assert p["max_weight_start"] == 90.0
+    # % is kg-era 90 -> 100 = +11.1%, never a frame-spanning value (185.4 / 337.5).
+    assert p["weight_change_pct"] == 11.1
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Warmup 0-opener gate — bar-inclusive frame (process.py _detect_warmup_flags)
 # The empty-bar opener's heaviness check now compares headline-vs-headline, so a
 # genuine empty-bar warmup before heavy working sets is no longer missed.
 # ══════════════════════════════════════════════════════════════════════════════
 
-def test_G_WARMUP_EMPTYBAR_deadlift_2026_01_17():
-    # 0-plate (empty 20kg bar) x12 opener, then working sets up to 60kg headline
-    # (40 plates + 20 bar). 60 >= 0.5 * all-time 85 -> the opener IS a warmup.
-    ex = next(e for e in collect(query_period_days=None, exercise_names=["Deadlift"],
-                                 aggregation_level="session", include_phase2=False)["exercises"]
-              if e["name"] == "Deadlift")
-    s = _sess(ex, "2026-01-17")
-    opener = s["sets"][0]
-    assert opener["weight"] == 0.0                 # empty bar (0 plates)
-    assert opener["headline_weight"] == 20.0       # bar-inclusive headline
-    assert opener["is_warmup"] is True
-    # the comparison is headline-frame: a working set reaches 60 headline
-    assert max(st["headline_weight"] for st in s["sets"][1:]) == 60.0
+# test_G_WARMUP_EMPTYBAR_deadlift_2026_01_17 — DELETED (unsound live-DB golden:
+# 2026-06-27 Deadlift rows raised the all-time max so the 2026-01-17 opener is no
+# longer flagged). The 0-plate-opener-flag branch is covered by construction in
+# test_G_WARMUP_NO_FALSE_light_session_and_preconditions (heavy case) and the
+# bar-inclusive headline math by the bar tests / session_display port-equality.
 
 
 def test_G_WARMUP_NO_FALSE_light_session_and_preconditions():
@@ -1277,18 +1290,99 @@ def test_G_WARMUP_NO_FALSE_light_session_and_preconditions():
     assert two[0]["is_warmup"] is False
 
 
-def test_G_WARMUP_COUNT_UNCHANGED_FIELDS_deadlift_2026_01_17():
-    # Flagging the 0-plate opener as a warmup shifts ONLY working_sets_count and
-    # rep_ranges; weight/volume/e1RM/max are unchanged (0-plate set carries no
-    # plate load, and volume sums all sets regardless of the warmup flag).
-    ex = next(e for e in collect(query_period_days=None, exercise_names=["Deadlift"],
-                                 aggregation_level="session", include_phase2=False)["exercises"]
-              if e["name"] == "Deadlift")
-    s = _sess(ex, "2026-01-17")
-    assert s["max_working_weight"] == 60.0         # from a heavy working set, not the opener
-    assert s["total_volume"] == 1200.0             # includes the warmup (20*12 + 40*12 + 60*8)
-    assert s["estimated_1rm"] == 76.0
-    # the flag's effect: opener excluded from working sets / rep ranges
-    assert s["working_sets_count"] == 2            # 3 sets - 1 warmup
-    assert s["rep_ranges"]["hypertrophy_sets"] == 2
-    assert s["rep_ranges"]["endurance_sets"] == 0  # the 0-plate x12 opener no longer counted
+# ── G-WARMUP-AGGREGATE (synthetic) · flag excludes from count, not from volume ─
+# Synthetic by-construction replacement for the deleted live-DB
+# test_G_WARMUP_COUNT_UNCHANGED_FIELDS_deadlift_2026_01_17 (it drifted to
+# working_sets_count==3 as 2026-06-27 Deadlift rows raised the all-time max).
+# Builds raw rows through _build_sessions_from_rows (the seam that both flags the
+# warmup AND computes the session aggregates). Validity: 3 sets, opener flagged ->
+# 2 working; the two 8-rep working sets are hypertrophy; the opener's 15 reps
+# (endurance) is excluded -> endurance_sets==0; volume sums ALL sets. Every
+# expected value is counted/summed BY HAND, not by re-running the aggregator.
+
+def test_G_WARMUP_AGGREGATE_synthetic():
+    from src.data_agent.process import _build_sessions_from_rows
+
+    mw60 = 60.0 / 2.2046   # no bar/offset -> headline == round(mw*2.2046,1) == 60.0
+    rows = [
+        {"set_id": 1, "date": "2026-01-10", "metric_weight": 0.0,  "reps": 15,
+         "comment": None, "distance": 0, "duration_seconds": 0},   # 0-plate opener
+        {"set_id": 2, "date": "2026-01-10", "metric_weight": mw60, "reps": 8,
+         "comment": None, "distance": 0, "duration_seconds": 0},
+        {"set_id": 3, "date": "2026-01-10", "metric_weight": mw60, "reps": 8,
+         "comment": None, "distance": 0, "duration_seconds": 0},
+    ]
+    # The 0-opener gate compares a kg-NORMALIZED working_max against a kg
+    # exercise_alltime_max. SynLift is lbs, so working 60 lbs -> ~27.2 kg; pass a
+    # kg all-time max of 40.0 so 27.2 >= 0.5*40 = 20 -> the opener flags by construction.
+    sessions = _build_sessions_from_rows(
+        rows, ctx={}, exercise_name="SynLift",
+        warmup_eligible=frozenset({("SynLift", "2026-01-10")}),
+        exercise_alltime_max=40.0)
+    s = sessions[0]
+    assert s["sets"][0]["is_warmup"] is True
+    assert s["working_sets_count"] == 2                  # opener excluded from working
+    assert s["rep_ranges"]["hypertrophy_sets"] == 2      # the two 8-rep working sets
+    assert s["rep_ranges"]["endurance_sets"] == 0        # opener's 15 reps excluded
+    assert s["rep_ranges"]["strength_sets"] == 0
+    assert s["max_working_weight"] == 60.0               # from a working set, not the opener
+    assert s["total_volume"] == 960.0                    # 0*15 + 60*8 + 60*8 (all sets, flag-agnostic)
+
+
+# test_G_WARMUP_COUNT_UNCHANGED_FIELDS_deadlift_2026_01_17 — DELETED (unsound
+# live-DB golden: working_sets_count drifted 2->3 as 2026-06-27 rows raised the
+# all-time max). The warmup-flag -> session-aggregate effect (working_sets_count /
+# rep_ranges exclusion; max/volume flag-agnostic) is covered by construction in
+# test_G_WARMUP_AGGREGATE_synthetic.
+
+
+# ── G-WARMUP-ALLTIME-MAX-CROSSFRAME (synthetic) · normalize-then-max pre-pass ──
+# Closes the gap the deleted (masked) test_masked_deadlift_unchanged left open: the
+# pre-pass (process.py:2556-2569, inline in process_data) computes an exercise's
+# all-time max by kg-NORMALIZING each mixed-frame row BEFORE maxing. The masked test
+# couldn't catch a bug here because its user's max was kg-era (normalize == no-op).
+#
+# This fixture makes the kg-normalized max DIFFER from the raw-numeric max: an lbs-era
+# set typed 200 (raw 200, but only ~90.7 kg) vs a kg-era set typed 100 (raw 100, and
+# 100 kg). Correct normalize-then-max = 100 kg; a bypass would take raw max 200.
+# "Deadlift" is used because _is_kg_native date-gates ONLY Deadlift (the real signal).
+#
+# Assertion is by GATE EFFECT (the normalized max is a local, not emitted): a target
+# kg session's 0-plate opener flags as warmup iff working_max(70 kg) >= 0.5*max. With
+# the correct max 100 -> 70>=50 -> flagged (working_sets_count==2). Under a bypass
+# (max 200) -> 70<100 -> NOT flagged (count==3). 70 sits in [50,100) BY CONSTRUCTION,
+# so a broken/absent normalization changes the result -> the test is sound (verified
+# by a temporary bypass-and-revert demonstration during development).
+
+def test_G_WARMUP_ALLTIME_MAX_CROSSFRAME_synthetic():
+    from datetime import date as _date
+    from src.data_agent.process import process_data
+
+    ctx = {"unit_overrides": {"exercises_in_kg": ["Deadlift"]}}   # no bar -> bar 0
+
+    def R(set_id, d, typed, reps):   # metric_weight is stored as typed/2.2046
+        return {"set_id": set_id, "date": d, "metric_weight": typed / 2.2046,
+                "reps": reps, "distance": 0, "duration_seconds": 0,
+                "exercise_name": "Deadlift", "category_id": 5, "comment": None}
+
+    alltime_rows = [
+        R(1, "2025-12-01", 200, 5),   # lbs era (< 2025-12-26): raw 200, ~90.7 kg
+        R(2, "2026-01-05", 100, 5),   # kg era (>= cutoff): raw 100, 100 kg  -> the true max
+        # target kg session: 0-plate opener (12 reps) + two 70 kg working sets
+        R(3, "2026-01-12",   0, 12),
+        R(4, "2026-01-12",  70, 8),
+        R(5, "2026-01-12",  70, 8),
+    ]
+    bundle = {
+        "alltime_rows": alltime_rows, "bodyweight": [], "goals": [], "lifecycle": [],
+        "training_dates": ["2025-12-01", "2026-01-05", "2026-01-12"],
+        "total_training_day_count": 3,
+    }
+    data = process_data(bundle, ctx, "2000-01-01", "2026-01-31",
+                        _date(2026, 1, 31), None, None, ["Deadlift"], "session", False)
+
+    s = _sess(_ex(data, "Deadlift"), "2026-01-12")
+    # By construction the gate threshold differs by which max the pre-pass produced:
+    assert 0.5 * 100 <= 70 < 0.5 * 200            # 50 <= 70 < 100 (the gate gap)
+    assert s["sets"][0]["is_warmup"] is True       # flagged -> pre-pass used kg max 100, not raw 200
+    assert s["working_sets_count"] == 2            # opener excluded; would be 3 under a raw-max bypass

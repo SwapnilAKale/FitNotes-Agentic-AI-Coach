@@ -51,55 +51,13 @@ def _raw_rows(name, date=None):
         conn.close()
 
 
-# ── T1: single-exercise mode, faithful port shape ────────────────────────────
-
-def test_single_lat_pulldown_recent():
-    """Lat Pulldown most recent session: 2026-06-13, three sets, no bar (plates ==
-    bar-inclusive), 100/110/120 lbs, reps 10/8/6, no warmup (not warmup-shaped)."""
-    out = get_exercise_sessions("Lat Pulldown", mode="recent")
-    assert out["exercise"] == "Lat Pulldown"
-    sess = out["sessions"][0]
-    assert sess["date"] == "2026-06-13"
-    assert sess["total_sets"] == 3
-    assert sess["unit"] == "lbs"
-    assert sess["max_weight"] == 120.0
-    assert sess["display_sets"] == [
-        "Set 1: 100.0 lbs × 10 reps",
-        "Set 2: 110.0 lbs × 8 reps",
-        "Set 3: 120.0 lbs × 6 reps",
-    ]
-    # No bar exercise → no bar_weight_note key.
-    assert "bar_weight_note" not in out
-
-
-# ── T2: category mode (NEW) ──────────────────────────────────────────────────
-
-def test_category_back_most_recent():
-    """'last back session' = the single most recent date ANY Back exercise was
-    trained: 2026-06-14, exactly one exercise (Barbell Row), three sets, reps
-    10/8/6, bar-inclusive lbs.
-
-    NOTE (flagged): the spec stated 104.09/114.09/124.09 (un-rounded plate+bar).
-    The faithful port rounds the headline to 1 decimal (round(plates+bar,1)), so
-    the byte-identical-to-operational output is 104.1/114.1/124.1. We assert the
-    faithful-port values and do NOT change rounding (that would break parity with
-    the operational display)."""
-    out = get_category_session("Back", "recent")
-    assert out["category"] == "Back"
-    assert out["date"] == "2026-06-14"
-    assert out["count"] == 1
-
-    ex = out["exercises"][0]
-    assert ex["exercise"] == "Barbell Row"
-    assert ex["total_sets"] == 3
-    assert ex["unit"] == "lbs"
-    assert ex["display_sets"] == [
-        "Set 1: 104.1 lbs × 10 reps",
-        "Set 2: 114.1 lbs × 8 reps",
-        "Set 3: 124.1 lbs × 6 reps",
-    ]
-    # Barbell Row is a bar exercise → carries the bar-inclusive note.
-    assert "bar_weight_note" in ex
+# T1 (test_single_lat_pulldown_recent) and T2 (test_category_back_most_recent) —
+# DELETED (unsound live-DB goldens: most-recent date drifted 2026-06-13/14 ->
+# 2026-06-27 when stress-test rows landed). Most-recent date resolution
+# (single-exercise latest; category MAX-across-group) + flat header format are
+# covered by construction in tests/test_session_display_synthetic.py; display-string
+# formatting parity is covered by test_port_equality_vs_operational below (T3) and
+# the bar conversion by test_category_mode_shares_bar_conversion (T4).
 
 
 def test_category_time_place_neck_excluded():

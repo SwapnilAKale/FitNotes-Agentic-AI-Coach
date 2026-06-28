@@ -9,8 +9,8 @@ working_max via the session's frame).
   • Load-bearing: same physical situation flips the flag between the raw (buggy) and kg-normalized
     (fixed) compare — the normalization is the cause.
   • Single-frame: normalization is a no-op (both sides divided by the same constant → same ratio).
-  • Masked real-DB Deadlift no-regression (kg-era holds the max) is also covered by
-    test_data_agent_golden.py::test_G_WARMUP_COUNT_UNCHANGED_FIELDS_deadlift_2026_01_17.
+  • The warmup flag's effect on session aggregates (working_sets_count / rep_ranges) is covered
+    by construction in test_data_agent_golden.py::test_G_WARMUP_AGGREGATE_synthetic.
 """
 
 import os
@@ -25,7 +25,6 @@ if _PROJECT_ROOT not in sys.path:
 os.environ.setdefault("FITNOTES_DB_PATH",  "data/FitNotes_Backup.fitnotes")
 os.environ.setdefault("USER_CONTEXT_PATH", "data/user_context.json")
 
-from src.data_agent import collect  # noqa: E402
 from src.data_agent.process import _detect_warmup_flags, HEAVY_FRACTION  # noqa: E402
 
 _KG = "Deadlift"  # date-gated kg-native (kg from 2025-12-26); the only mid-switch exercise
@@ -105,16 +104,13 @@ def test_single_frame_normalization_is_noop(kg_native, working_headline, expecte
     assert normalized[0]["is_warmup"] is expected          # identical to the raw compare
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 3 — MASKED real-DB Deadlift: kg-era holds the max → fix is a no-op (no regression)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def test_masked_deadlift_unchanged():
-    """This user's heaviest Deadlift is kg-era, so the kg-normalized all-time max equals the old
-    raw max and the live result is unchanged: the 2026-01-17 (kg-era) 0-opener is still flagged."""
-    ex = next(e for e in collect(query_period_days=None, exercise_names=["Deadlift"],
-                                 aggregation_level="session", include_phase2=False)["exercises"]
-              if e["name"] == "Deadlift")
-    assert ex["unit"] == "kg"
-    s = next(ss for ss in ex["sessions"] if ss["date"] == "2026-01-17")
-    assert s["working_sets_count"] == 2        # opener still excluded as warmup (unchanged)
+# test_masked_deadlift_unchanged — DELETED (unsound live-DB golden: working_sets_count
+# drifted 2->3 as 2026-06-27 Deadlift rows raised the all-time max). It was a MASKED
+# no-op anyway — this user is kg-era, so cross-frame normalization changes nothing for
+# him and it could never catch the cross-frame bug it nominally guarded. The genuine
+# cross-frame GATE is covered by construction in test 1 above
+# (test_unit_switch_0opener_flag_flips_with_normalization); the single-effective-frame
+# no-op by test 2 (test_single_frame_normalization_is_noop). NOTE (residual gap, not
+# introduced by this deletion): the pre-pass that COMPUTES the kg-normalized all-time
+# max from mixed-frame rows (process.py inline in process_data) has no sound test — a
+# synthetic-DB collect() test on hand-built mixed-frame rows is a recommended follow-up.
