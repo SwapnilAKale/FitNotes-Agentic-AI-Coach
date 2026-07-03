@@ -160,9 +160,16 @@ async def list_tools() -> list[types.Tool]:
                 "required": ["exercise_name", "sets"],
             },
         ),
+        # Fix 5: execute_staged_workout is NOT declared here — unexposed from the
+        # agent's schema. The caller (server /confirm, CLI confirm) invokes it
+        # deterministically via session.call_tool, which dispatches without
+        # consulting list_tools. Handler kept below (unexpose, not delete).
         types.Tool(
-            name="execute_staged_workout",
-            description="execute_staged_workout() -> {success} — write staged workout to DB",
+            name="discard_staged_writes",
+            description="discard_staged_writes() -> {discarded} — drop ALL pending staged writes "
+                        "(the workout batch and any staged goal/set edit). Called deterministically "
+                        "by the server on a new chat turn and on cancel so a staged write reaches "
+                        "the DB only via an explicit confirm; clears any stale, abandoned batch.",
             inputSchema={"type": "object", "properties": {}, "required": []},
         ),
         types.Tool(
@@ -214,28 +221,11 @@ async def list_tools() -> list[types.Tool]:
                 "required": ["body_weight", "unit"],
             },
         ),
-        types.Tool(
-            name="verify_workout_logged",
-            description="verify_workout_logged(exercise_name, date, expected_sets) -> {verified, sets} — confirm workout write",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "exercise_name": {
-                        "type": "string",
-                        "description": "exact exercise name",
-                    },
-                    "date": {
-                        "type": "string",
-                        "description": "date in YYYY-MM-DD format",
-                    },
-                    "expected_sets": {
-                        "type": "integer",
-                        "description": "number of sets that should have been written",
-                    },
-                },
-                "required": ["exercise_name", "date", "expected_sets"],
-            },
-        ),
+        # Fix 5: verify_workout_logged is NOT declared here — unexposed. It reads
+        # training_log, so mid-stage it structurally returns sets_found: 0, which
+        # the agent misread as a failed write and re-staged (doubled exercises).
+        # Workout verification now happens inside the execute transaction itself.
+        # Handler kept below (unexpose, not delete).
         types.Tool(
             name="verify_goal_set",
             description="verify_goal_set(exercise_name, target_date) -> {verified} — confirm goal write",
@@ -519,6 +509,13 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             result = await _log_workout(arguments)
         elif name == "execute_staged_workout":
             result = await _execute_staged_workout()
+        elif name == "discard_staged_writes":
+            result = await _discard_staged_writes()
+        # Server-internal like execute_staged_workout: not declared in list_tools
+        # (the agent never sees it); the server calls it to build the confirm-panel
+        # preview from the staged slot.
+        elif name == "format_staged_workout_for_confirmation":
+            result = await _format_staged_workout_for_confirmation()
         elif name == "set_goal":
             result = await _set_goal(arguments)
         elif name == "execute_staged_goal":
@@ -677,6 +674,7 @@ from src.units import (
     KG_NATIVE_EXERCISES as KG_NATIVE,
     DEADLIFT_KG_SWITCH,
     kg_native_volume_case as _kg_native_volume_case,
+    is_kg_native as _is_kg_native_rule,
 )
 
 
@@ -1453,12 +1451,27 @@ def _log_workout_sync(arguments: dict) -> str:
         "requires_confirmation": True,
         "staged_key": "workout",
         "summary": summary,
-        "next_step": "Call execute_staged_workout to complete the write.",
+        "next_step": "Staged. Continue staging remaining exercises with log_workout. "
+                     "Do not call execute — the server commits the full batch when "
+                     "the user confirms.",
     })
 
 
 async def _log_workout(arguments: dict) -> str:
     return await asyncio.to_thread(_log_workout_sync, arguments)
+
+
+def _readback_count(conn, ids: list) -> int:
+    """Read-back verify inside the execute transaction: how many of the
+    just-inserted training_log rowids are visible on this connection. Matched by
+    id-set, NEVER by date — a date match would sweep pre-existing rows and could
+    mask a partial write."""
+    placeholders = ",".join("?" * len(ids))
+    row = conn.execute(
+        f"SELECT COUNT(*) FROM training_log WHERE _id IN ({placeholders})",
+        list(ids),
+    ).fetchone()
+    return row[0]
 
 
 def _execute_staged_workout_sync() -> str:
@@ -1472,8 +1485,13 @@ def _execute_staged_workout_sync() -> str:
     if not staged_list:
         return json.dumps({"error": "No staged workout found. Call log_workout first."})
 
+    # Fix 5: verify lives INSIDE the transaction — insert the batch, read the new
+    # rows back by their ids, and commit ONLY if every staged set is visible. On
+    # mismatch the transaction rolls back, so the dirty state never persists and
+    # no delete/cleanup is needed. The slot pops ONLY on the commit path; on any
+    # failure it is retained so the batch stays inspectable and confirm can retry.
     conn = get_write_connection(DB_PATH)
-    sets_written = 0
+    inserted_ids: list = []
     try:
         for w in staged_list:
             for s in w["sets"]:
@@ -1482,8 +1500,24 @@ def _execute_staged_workout_sync() -> str:
                 if s.get("comment"):
                     # Bind the comment to THIS set's new _id (no off-by-one).
                     insert_set_comment(conn, new_id, w["date"], s["comment"])
-                sets_written += 1
-        conn.commit()                       # ONE commit for the whole batch
+                inserted_ids.append(new_id)
+
+        staged_count = len(inserted_ids)
+        written_count = _readback_count(conn, inserted_ids)
+        if written_count != staged_count:
+            conn.rollback()                 # DB untouched; slot retained for retry
+            return json.dumps({
+                "success": False,
+                "verified": False,
+                "sets_expected": staged_count,
+                "sets_found": written_count,
+                "message": (
+                    "Write verification failed — batch rolled back, no changes made. "
+                    f"Expected {staged_count} sets, found {written_count}. The staged "
+                    "workout is still pending; confirm again to retry."
+                ),
+            })
+        conn.commit()                       # ONE commit for the whole verified batch
     except Exception as exc:
         conn.rollback()                     # whole batch rolls back — no half-written day
         return json.dumps({"error": f"Failed to write workout: {exc}"})
@@ -1499,14 +1533,111 @@ def _execute_staged_workout_sync() -> str:
         _wal_append("execute_staged_workout", w)
     return json.dumps({
         "success": True,
-        "sets_written": sets_written,
+        "verified": True,
+        "sets_written": staged_count,
         "exercises_written": len(staged_list),
-        "message": "Workout logged successfully.",
+        "message": (
+            f"Workout logged and verified: {staged_count} sets across "
+            f"{len(staged_list)} exercise(s)."
+        ),
     })
 
 
 async def _execute_staged_workout() -> str:
     return await asyncio.to_thread(_execute_staged_workout_sync)
+
+
+def _discard_staged_writes_sync() -> str:
+    # Drop EVERY pending staged write (the workout batch + any sibling goal/set-edit
+    # slot). The server calls this deterministically at /chat turn-start and on cancel
+    # so an abandoned/cancelled batch can never carry into a later execute — a staged
+    # write reaches the DB only via an explicit confirm.
+    _staged_writes.clear()
+    return json.dumps({"discarded": True})
+
+
+async def _discard_staged_writes() -> str:
+    return _discard_staged_writes_sync()
+
+
+def _fmt_duration(seconds) -> str:
+    """Human-readable duration for the confirm panel — never raw seconds integers."""
+    seconds = int(seconds or 0)
+    if seconds < 60:
+        return f"{seconds} sec"
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        parts = [f"{h} h"]
+        if m:
+            parts.append(f"{m} min")
+        if s:
+            parts.append(f"{s} sec")
+        return " ".join(parts)
+    if s:
+        return f"{m} min {s} sec"
+    return f"{m} minute{'s' if m != 1 else ''}"
+
+
+def _fmt_typed_weight(metric_weight: float) -> str:
+    """Recover the number the user typed from the stored metric column.
+
+    The write path stores metric_weight = typed / 2.2046 with NO offset
+    (see _log_workout_sync), so the exact inverse is * 2.2046. Deliberately
+    NOT process._recover_typed_weight (adds numeric_offset — a read-path
+    quirk adjustment the slot never carries) and NO bar weight: this is a
+    WRITE confirmation, it must show what the write round-trips to; the
+    bar-inclusive headline is read-path presentation only.
+    """
+    typed = round(metric_weight * 2.2046, 1)
+    return f"{typed:g}"                       # 100.0 -> "100", 45.4 -> "45.4"
+
+
+def _format_staged_workout_for_confirmation_sync() -> str:
+    """Deterministic confirm-panel content, read from _staged_writes["workout"]
+    itself — the exact payload execute will write — never the log_workout args
+    and never the LLM's phrasing, which can diverge from the write payload.
+    One block per exercise, every set listed (weight×reps / cardio distance+
+    duration), comments inline on their set."""
+    from src.db import get_connection
+
+    staged_list = _staged_writes.get("workout")
+    if not staged_list:
+        return json.dumps({"error": "No staged workout found."})
+
+    conn = get_connection(DB_PATH)
+    names: dict = {}
+    for w in staged_list:
+        eid = w["exercise_id"]
+        if eid not in names:
+            row = conn.execute(
+                "SELECT name FROM exercise WHERE _id = ?", (eid,)).fetchone()
+            names[eid] = row["name"] if row else f"Exercise #{eid}"
+    conn.close()
+
+    dates = {w["date"] for w in staged_list}
+    shared_date = next(iter(dates)) if len(dates) == 1 else None
+    lines = [f"Staged workout — {shared_date}" if shared_date else "Staged workout"]
+    for w in staged_list:
+        name = names[w["exercise_id"]]
+        lines.append("")
+        lines.append(name if shared_date else f"{name} — {w['date']}")
+        for i, s in enumerate(w["sets"], 1):
+            if s["unit"] == 3:                # cardio: distance (+ duration)
+                body = f"{s['distance']:g} km in {_fmt_duration(s['duration_seconds'])}"
+            elif s["unit"] == 2:              # cardio: duration-only
+                body = _fmt_duration(s["duration_seconds"])
+            else:                             # strength: typed weight × reps
+                unit = "kg" if _is_kg_native_rule(name, w["date"]) else "lbs"
+                body = f"{_fmt_typed_weight(s['metric_weight'])} {unit} × {s['reps']} reps"
+            if s.get("comment"):
+                body += f" ({s['comment']})"
+            lines.append(f"  Set {i}: {body}")
+    return json.dumps({"preview": "\n".join(lines)})
+
+
+async def _format_staged_workout_for_confirmation() -> str:
+    return await asyncio.to_thread(_format_staged_workout_for_confirmation_sync)
 
 
 def _set_goal_sync(arguments: dict) -> str:

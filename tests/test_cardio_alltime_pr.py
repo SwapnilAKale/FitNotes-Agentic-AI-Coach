@@ -59,15 +59,10 @@ def test_alltime_locked_pr_walking_ten_min_target():
     assert locked["date"] == "2025-02-28"
     assert locked["distance_km"] == 1.0
 
-
-def test_duration_only_alltime_pr_falls_back_to_max_duration():
-    """Cycling is duration-only (all distance == 0): all-time pr falls back to MAX
-    duration (720s / 2025-01-14), carries its comment, and has no distance/weight."""
-    pkg = prepare_analysis_package(query_period_days=None, exercise_names=["Cycling"])
-    ex = _cardio_ex(pkg, "Cycling")
-    pr = ex["pr"]
-    assert pr["duration_seconds"] == 720
-    assert pr["date"] == "2025-01-14"
-    assert pr.get("comment") and "easy" in pr["comment"]
-    assert "weight" not in pr
-    assert not pr.get("distance_km")                # duration-only → no distance
+# NOTE: the former test_duration_only_alltime_pr_falls_back_to_max_duration was
+# live-DB-pinned (Cycling max duration drifted 720s→1800s as sessions were logged)
+# and could not be soundly recompute-and-related: Cycling is duration-only, and the
+# no-lock cardio-PR rule is max DISTANCE (0 for every Cycling row), so a "correct"
+# recompute pins to nothing. Deleted; the duration-only fallback branch is owned by
+# the synthetic-by-construction test_CARDIO_PR_duration_only_fallback_and_none
+# (tests/test_data_agent_golden.py).

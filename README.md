@@ -135,8 +135,7 @@ You: Log today's workout: flat dumbbell bench press, 3 sets — 50 lbs x 10, 55 
 
 You: yesterday
 → [Confirmation gate fires — you type yes]
-→ [Execute gate fires — you type yes]
-→ ✅ 3 sets of Flat Dumbbell Bench Press logged for 2026-05-19.
+→ ✅ Workout logged and verified: 3 sets across 1 exercise(s).
 
 You: I have a new exercise called Dumbbell Hold. Reps stores seconds, weight is lbs.
 → Understood — I'll interpret Dumbbell Hold sets as hold duration, not rep count.
@@ -145,10 +144,10 @@ Tools — Single-Agent (31 total)
 Organized into 8 groups:
 Read — Workout Data: query_workout_data, get_personal_record, get_exercise_history, get_weekly_volume, run_read_only_sql, get_exercise_sessions, read_exercise_comments, resolve_exercise_name
 Read — Knowledge: search_fitness_knowledge
-Write — Logging: log_workout, execute_staged_workout, log_bodyweight
+Write — Logging: log_workout, log_bodyweight (execute_staged_workout is server-driven — not exposed to the agent)
 Write — Goals: set_goal, execute_staged_goal, update_goal, execute_staged_goal_update, delete_goal, execute_staged_goal_delete
 Write — Corrections: update_workout_set, execute_staged_set_update, delete_workout_set, execute_staged_set_delete
-Verify: verify_workout_logged, verify_goal_set, verify_set_updated, verify_set_deleted
+Verify: verify_goal_set, verify_set_updated, verify_set_deleted (workout verification runs inside the server-side execute transaction)
 Memory: remember_fact, recall_memories, forget_fact
 Exercise Quirks: add_exercise_quirk, update_exercise_quirk, delete_exercise_quirk, list_exercise_quirks
 
@@ -161,7 +160,7 @@ Three-stage retrieval: query rewriting (casual English → academic terms) → B
 Exercise Session Display
 get_exercise_sessions returns pre-formatted display_sets strings rather than raw weight values. Each string has set number, weights in correct units, inline comments, drop sets merged with →, and warmup labeled. The agent copies these strings verbatim — no arithmetic, no formatting decisions. Unit conversion, **bar weight**, and quirk offsets are applied at the tool level before returning — bar-inclusive (plates + bar + offset), in each session's own unit frame, matching get_exercise_history and the analytical package (see the bar-inclusive display-reads fix below).
 Write Operations
-Two-phase pattern: stage (validate + preview) → CLI confirmation gate → execute (DB write) → verify (read-back). The agent cannot bypass the gate. Write connections are separate from read connections at the SQLite level. log_workout persists per-set comments (written to the Comment table, keyed to each set's row) and cardio entries (distance/duration), not just weight×reps — the live write and the write-ahead-log replay share one writer so a replay reproduces identical rows. A full multi-exercise day stages as a batch and writes in one confirmation (one transaction — all-or-nothing). The confirmation panel scrolls for a long multi-exercise batch, keeping the Confirm/Cancel buttons pinned and reachable.
+Two-phase pattern: stage (validate + preview) → confirmation gate → execute (DB write) → verify (read-back). For workouts the agent only stages: it has no execute or verify tool, and the write is committed server-side on explicit confirmation with atomic write-and-verify — the inserted rows are read back by id inside the same transaction and the batch commits only if every staged set is present, rolling back on any mismatch. The agent stages, the server commits; the agent cannot bypass the gate. Write connections are separate from read connections at the SQLite level. log_workout persists per-set comments (written to the Comment table, keyed to each set's row) and cardio entries (distance/duration), not just weight×reps — the live write and the write-ahead-log replay share one writer so a replay reproduces identical rows. A full multi-exercise day stages as a batch and writes in one confirmation (one transaction — all-or-nothing). The confirmation panel's preview is rendered server-side from the staged slot itself — the exact payload execute will write (typed weights with kg/lbs per the kg-native rule, cardio as distance+duration, comments inline per set), not a re-generated summary — scrollable, with the Confirm/Cancel buttons pinned and reachable. Staged writes are committed only on explicit confirmation — abandoning a pending log (reload, a new message) or cancelling it discards the staged batch, so it can never be carried into a later confirm.
 Long-Term Memory (Option B)
 Facts in memory.json (source of truth, 30-fact cap). ChromaDB user_memory collection is the search index. Per question: embed question → retrieve top 5 semantically relevant facts (cosine distance < 0.8) → inject only those into system_instruction. Token cost stays constant at ~100 tokens regardless of total memory size.
 User Article Upload

@@ -278,9 +278,13 @@ _UNEXPOSED_DISPLAY = {"get_exercise_sessions", "read_exercise_comments",
                       "get_exercise_history"}
 # resolve_exercise_name STAYS exposed — writes need a pre-resolved exact name.
 _KEPT_READS = {"resolve_exercise_name"}
-_KEPT_OTHER = {"log_workout", "execute_staged_workout", "update_workout_set",
+_KEPT_OTHER = {"log_workout", "update_workout_set",
                "delete_workout_set", "set_goal", "search_fitness_knowledge",
                "remember_fact", "recall_memories"}
+# Fix 5: workout execute+verify moved off the agent — the server/CLI drives
+# execute_staged_workout via session.call_tool on explicit confirm, and verify
+# happens inside the execute transaction. Unexposed, handlers kept.
+_UNEXPOSED_EXECUTE = {"execute_staged_workout", "verify_workout_logged"}
 
 
 def _exposed_tool_names():
@@ -316,6 +320,14 @@ def test_kept_tools_still_exposed():
     names = _exposed_tool_names()
     missing = (_KEPT_READS | _KEPT_OTHER) - names
     assert not missing, f"unexpectedly removed: {missing}"
+
+
+def test_workout_execute_verify_unexposed_fix5():
+    names = _exposed_tool_names()
+    assert _UNEXPOSED_EXECUTE.isdisjoint(names), (
+        f"still exposed to operational: {_UNEXPOSED_EXECUTE & names}")
+    # Sibling staged flows keep their agent-driven execute tools.
+    assert "execute_staged_goal" in names
 
 
 def test_unused_reuse_functions_removed():

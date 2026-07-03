@@ -50,6 +50,12 @@ Type your question or 'exit' to quit.
 async def main() -> None:
     session = AgentSession(DB_PATH, memory_only=memory_only)
 
+    # Fix 5: the agent only STAGES workouts — it has no execute tool. When the
+    # gate below approves a log_workout staging, this flag arms the post-turn
+    # code to drive execute_staged_workout via session.call_tool (caller-driven,
+    # same pattern as the web server's /confirm — never the agent).
+    turn_state = {"staged_workout": False}
+
     async def confirmation_handler(tool_name: str, arguments: dict) -> bool:
         """Called before any write tool executes. Returns True to proceed, False to cancel."""
         print(f"\n{'='*60}")
@@ -76,9 +82,16 @@ async def main() -> None:
             response = input("Confirm? (yes/no): ").strip().lower()
             if response in {"yes", "y"}:
                 print("✅ Confirmed. Proceeding with write.")
+                if tool_name == "log_workout":
+                    turn_state["staged_workout"] = True
                 return True
             elif response in {"no", "n", "cancel"}:
                 print("❌ Cancelled. No changes made.")
+                if tool_name == "log_workout" and turn_state["staged_workout"]:
+                    # A partial batch may already be staged this turn — drop it so
+                    # it can't linger into a later execute.
+                    await session.call_tool("discard_staged_writes", {})
+                    turn_state["staged_workout"] = False
                 return False
             else:
                 print("Please type 'yes' or 'no'.")
@@ -119,8 +132,28 @@ async def main() -> None:
                     if result.get("route"):
                         print(f"\x1b[2m[route: {result['route']}]\x1b[0m")
                     print(f"\n{result['answer']}\n")
+                    # Fix 5: caller-driven commit. Every staged exercise was
+                    # already approved through the gate above, so the CLI (never
+                    # the agent) runs the atomic execute+verify for the batch.
+                    if turn_state["staged_workout"]:
+                        turn_state["staged_workout"] = False
+                        outcome = json.loads(
+                            await session.call_tool("execute_staged_workout", {}))
+                        if outcome.get("success"):
+                            session._staged_active = False
+                            print(f"✅ {outcome.get('message', 'Workout saved and verified.')}\n")
+                        else:
+                            print(f"❌ {outcome.get('message') or outcome.get('error') or 'Workout write failed — nothing was saved.'}\n")
             except Exception as e:
                 error_str = str(e)
+                if turn_state["staged_workout"]:
+                    # The turn died between staging and execute — drop the batch
+                    # so it can't be committed by a later, unrelated confirm.
+                    turn_state["staged_workout"] = False
+                    try:
+                        await session.call_tool("discard_staged_writes", {})
+                    except Exception:
+                        pass
                 if _is_rate_limit(e):
                     wait_msg = ""
                     if "Please try again in" in error_str:

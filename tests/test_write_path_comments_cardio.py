@@ -395,3 +395,206 @@ def test_batch_preview_accumulates_and_resets(monkeypatch):
         "log_workout", {"exercise_name": "Deadlift", "date": "2026-06-17", "sets": []}))
     assert "Squat" not in srv._state["staging_preview"]
     assert "Deadlift" in srv._state["staging_preview"]
+
+
+# ── Staging-slot lifecycle: discard_staged_writes (clear-on-entry / clear-on-cancel) ──
+
+def test_discard_staged_writes_clears_all_keys():
+    # The discard tool drops EVERY staged key (workout batch + sibling goal/set slots),
+    # so a new turn or a cancel can wipe any stale staged action in one call.
+    cs._staged_writes.clear()
+    cs._staged_writes["workout"] = [{"exercise_id": 1, "date": "2026-06-29", "sets": []}]
+    cs._staged_writes["goal"] = {"exercise_id": 2, "metric_weight": 100.0}
+    out = json.loads(cs._discard_staged_writes_sync())
+    assert out == {"discarded": True}
+    assert cs._staged_writes == {}               # all keys gone
+
+
+def test_discard_prevents_stale_batch_reaching_db(db):
+    # Stage a workout, discard it, then execute → execute finds nothing staged and
+    # writes 0 rows. Proves a discarded/abandoned batch can never reach the DB.
+    assert "error" not in json.loads(cs._log_workout_sync({
+        "exercise_name": "Test Press", "date": "2026-06-29",
+        "sets": [{"weight": 100.0, "unit": "lbs", "reps": 5}]}))
+    assert cs._staged_writes.get("workout")      # staged
+
+    cs._discard_staged_writes_sync()
+    assert not cs._staged_writes.get("workout")  # cleared
+
+    out = json.loads(cs._execute_staged_workout_sync())
+    assert "error" in out                        # "No staged workout found"
+    assert _rows(db) == []                        # nothing written — no DB bypass
+
+
+def test_normal_stage_execute_unaffected_by_discard_tool(db):
+    # Regression: with NO discard between stage and execute, the write still happens
+    # (the execute clear/pop path is untouched).
+    _stage_execute({
+        "exercise_name": "Test Press", "date": "2026-06-29",
+        "sets": [{"weight": 120.0, "unit": "lbs", "reps": 3}]})
+    assert len(_rows(db)) == 1
+    assert cs._staged_writes.get("workout") is None   # execute's own pop still fires
+
+
+# ── Fix 5: atomic execute+verify — read-back by id-set INSIDE the transaction ──
+
+def test_execute_verify_commit_path(db):
+    # Valid 2-exercise batch → verified commit: result reports verified, every
+    # staged set is a row in the DB, and the slot pops (commit path only).
+    for name, sets in [
+        ("Test Press", [{"weight": 100.0, "unit": "lbs", "reps": 5},
+                        {"weight": 105.0, "unit": "lbs", "reps": 3}]),
+        ("Treadmill",  [{"distance": 2.5, "duration_seconds": 900}]),
+    ]:
+        assert "error" not in json.loads(cs._log_workout_sync(
+            {"exercise_name": name, "date": "2026-07-01", "sets": sets}))
+    done = json.loads(cs._execute_staged_workout_sync())
+    assert done["success"] and done["verified"]
+    assert done["sets_written"] == 3 and done["exercises_written"] == 2
+    assert len(_rows(db)) == 3
+    assert cs._staged_writes.get("workout") is None   # slot popped ONLY on commit
+
+
+def test_execute_verify_rollback_on_mismatch(db, monkeypatch, tmp_path):
+    # Read-back sees fewer rows than staged → rollback: ZERO rows reach the DB,
+    # slot RETAINED (confirm can retry), no WAL record. Then the SAME retained
+    # slot commits clean once the fault is removed — non-vacuity: the rollback,
+    # not a broken writer, is what suppressed the write.
+    monkeypatch.setattr(wal, "WAL_PATH", str(tmp_path / "wal.json"))
+    assert "error" not in json.loads(cs._log_workout_sync({
+        "exercise_name": "Test Press", "date": "2026-07-01",
+        "sets": [{"weight": 100.0, "unit": "lbs", "reps": 5}]}))
+    assert "error" not in json.loads(cs._log_workout_sync({
+        "exercise_name": "Treadmill", "date": "2026-07-01",
+        "sets": [{"distance": 2.0, "duration_seconds": 600}]}))
+
+    real_readback = cs._readback_count
+    monkeypatch.setattr(cs, "_readback_count",
+                        lambda conn, ids: real_readback(conn, ids) - 1)
+    out = json.loads(cs._execute_staged_workout_sync())
+    assert out["success"] is False and out["verified"] is False
+    assert out["sets_expected"] == 2 and out["sets_found"] == 1
+    assert "rolled back" in out["message"]
+    assert _rows(db) == []                       # negative: nothing reached the DB
+    assert len(cs._staged_writes["workout"]) == 2   # slot retained, batch intact
+    assert wal.get_records() == []               # no WAL journal on rollback
+
+    # Control: remove the fault, retry the retained slot → commits and verifies.
+    monkeypatch.setattr(cs, "_readback_count", real_readback)
+    done = json.loads(cs._execute_staged_workout_sync())
+    assert done["success"] and done["verified"]
+    assert len(_rows(db)) == 2
+    assert cs._staged_writes.get("workout") is None
+    assert len(wal.get_records()) == 2           # WAL appended only on commit
+
+
+def test_no_committed_but_unverified_state(db, monkeypatch, tmp_path):
+    # Atomicity: verify runs BEFORE commit in the same transaction, so a failed
+    # verification leaves the DB byte-identical — pre-existing rows survive and
+    # none of the failed batch's rows are observable at any point after execute.
+    monkeypatch.setattr(wal, "WAL_PATH", str(tmp_path / "wal.json"))
+    _stage_execute({
+        "exercise_name": "Test Press", "date": "2026-06-30",
+        "sets": [{"weight": 90.0, "unit": "lbs", "reps": 8}]})
+    before = _rows(db)
+    assert len(before) == 1                      # committed pre-existing row
+
+    assert "error" not in json.loads(cs._log_workout_sync({
+        "exercise_name": "Test Press", "date": "2026-07-01",
+        "sets": [{"weight": 100.0, "unit": "lbs", "reps": 5},
+                 {"weight": 105.0, "unit": "lbs", "reps": 3}]}))
+    monkeypatch.setattr(cs, "_readback_count", lambda conn, ids: 0)
+    out = json.loads(cs._execute_staged_workout_sync())
+    assert out["success"] is False
+    assert _rows(db) == before                   # DB unchanged — no dirty state persists
+
+
+def test_next_step_no_longer_instructs_execute(db):
+    # The staged result must not steer the agent toward calling execute (the tool
+    # is unexposed; the server commits on user confirm).
+    staged = json.loads(cs._log_workout_sync({
+        "exercise_name": "Test Press", "date": "2026-07-01",
+        "sets": [{"weight": 100.0, "unit": "lbs", "reps": 5}]}))
+    assert "Call execute_staged_workout" not in staged["next_step"]
+    assert "Do not call execute" in staged["next_step"]
+
+
+def test_execute_verify_unexposed_handlers_kept():
+    # Unexpose, don't delete: the agent's schema (list_tools-derived) lacks both
+    # tools, but the handlers remain for the caller-driven session.call_tool path
+    # (server /confirm and CLI confirm).
+    import asyncio
+    from mcp_servers.combined_server import list_tools
+    names = {t.name for t in asyncio.run(list_tools())}
+    assert "execute_staged_workout" not in names
+    assert "verify_workout_logged" not in names
+    assert "log_workout" in names                # staging stays exposed
+    assert "discard_staged_writes" in names      # lifecycle tool untouched
+    for fn in ("_execute_staged_workout_sync", "_verify_workout_logged_sync"):
+        assert hasattr(cs, fn), f"{fn} must remain (unexpose, not delete)"
+
+
+# ── Confirm-panel formatter: deterministic display of the staged SLOT ──────────
+# The panel gates the write, so it renders _staged_writes["workout"] itself
+# (typed weights recovered from metric, kg/lbs per the kg-native rule, cardio as
+# distance+duration strings, comments inline) — never the log_workout args.
+
+def _stage_mixed_confirmation_batch(db):
+    _add_exercise(db, 3, "Hand Gripper", 3)      # kg-native for ALL history
+    _add_exercise(db, 4, "Cycling", 8)           # cardio, duration-only
+    for args in [
+        {"exercise_name": "Hand Gripper", "date": "2026-07-01",
+         "sets": [{"weight": 100.0, "unit": "kg", "reps": 5,
+                   "comment": "grip felt strong"}]},
+        {"exercise_name": "Test Press", "date": "2026-07-01",
+         "sets": [{"weight": 135.0, "unit": "lbs", "reps": 10}]},
+        {"exercise_name": "Treadmill", "date": "2026-07-01",
+         "sets": [{"distance": 3.0, "duration_seconds": 1200}]},
+        {"exercise_name": "Cycling", "date": "2026-07-01",
+         "sets": [{"duration_seconds": 1800}]},
+    ]:
+        assert "error" not in json.loads(cs._log_workout_sync(args))
+
+
+def test_confirmation_preview_typed_units_cardio_comments(db):
+    _stage_mixed_confirmation_batch(db)
+    out = json.loads(cs._format_staged_workout_for_confirmation_sync())
+    preview = out["preview"]
+    lines = preview.splitlines()
+
+    # kg-native typed round-trip: 100 kg in, metric 45.36 stored, 100 kg shown.
+    assert "100 kg × 5 reps" in preview
+    assert "45.4" not in preview                 # the metric value never leaks
+    assert "135 lbs × 10 reps" in preview        # non-kg-native stays typed lbs
+
+    # Cardio as formatted distance/duration strings, never raw integers.
+    assert "3 km in 20 minutes" in preview
+    assert "30 minutes" in preview
+    assert "1200" not in preview and "1800" not in preview
+
+    # Comment inline on ITS set: the kg-native line carries it, no other does.
+    gripper_line = next(l for l in lines if "100 kg × 5 reps" in l)
+    assert "grip felt strong" in gripper_line
+    press_line = next(l for l in lines if "135 lbs" in l)
+    assert "grip felt strong" not in press_line and "(" not in press_line
+
+    # One block per exercise, shared date shown once in the header.
+    assert lines[0] == "Staged workout — 2026-07-01"
+    for name in ("Hand Gripper", "Test Press", "Treadmill", "Cycling"):
+        assert name in lines                     # each exercise gets its own block line
+
+    # Formatting the slot must not consume it — staging is untouched.
+    assert len(cs._staged_writes["workout"]) == 4
+
+
+def test_confirmation_formatter_empty_slot_and_unexposed():
+    # Empty slot → error JSON (the server falls back to the args preview).
+    cs._staged_writes.clear()
+    out = json.loads(cs._format_staged_workout_for_confirmation_sync())
+    assert "error" in out and "preview" not in out
+
+    # Server-internal like execute: dispatchable but never in the agent schema.
+    import asyncio
+    from mcp_servers.combined_server import list_tools
+    names = {t.name for t in asyncio.run(list_tools())}
+    assert "format_staged_workout_for_confirmation" not in names

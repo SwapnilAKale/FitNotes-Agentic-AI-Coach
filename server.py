@@ -306,6 +306,10 @@ _state: dict = {
     "confirmation_preview": "",
     "allow_execute": False,   # set True by /confirm so execute_ tools are unblocked
     "staging_preview": "",    # args from the last staging tool call, shown as preview
+    # Fix 5: which staged flow is awaiting /confirm. "workout" → the server
+    # executes deterministically via session.call_tool; anything else keeps the
+    # sibling allow_execute + agent re-prompt path.
+    "pending_execute_kind": None,
     "pending_upload_path": None,
     "pending_upload_contents": None,
 }
@@ -338,6 +342,12 @@ async def _confirmation_handler(tool_name: str, arguments: dict) -> bool:
             f"{_state['staging_preview']}\n\n{blob}"
             if _state["staging_preview"] else blob
         )
+        # Fix 5: the agent stages and STOPS — it no longer calls execute, so the
+        # blocked-execute path below can't raise the confirm panel for workouts.
+        # Staging itself is now what arms confirmation_required for this turn.
+        _state["pending_confirmation"] = True
+        _state["confirmation_preview"] = _state["staging_preview"]
+        _state["pending_execute_kind"] = "workout"
     else:
         _state["staging_preview"] = blob
     return True
@@ -537,6 +547,17 @@ async def _process_turn(message: str) -> JSONResponse:
         _state["pending_confirmation"] = False
         _state["allow_execute"] = False
         _state["staging_preview"] = ""
+        _state["pending_execute_kind"] = None
+        # Clear-on-entry: wipe any staged batch left by a prior turn (reload, abandoned,
+        # or cancelled) BEFORE this turn stages anything. _staged_writes lives in the MCP
+        # subprocess, so the server clears it deterministically via call_tool. This MUST
+        # complete before coordinator.route runs (it fires once, before any log_workout of
+        # this turn, so the turn's own batch is never wiped). Defensive: a transient MCP
+        # failure must not 500 the turn.
+        try:
+            await session.call_tool("discard_staged_writes", {})
+        except Exception as exc:
+            print(f"[server] discard_staged_writes (turn-start) failed: {exc}", file=sys.stderr)
         try:
             result = await coordinator.route(message)
             if DEBUG:
@@ -555,9 +576,37 @@ async def _process_turn(message: str) -> JSONResponse:
             session.chat_history.append({"role": "assistant", "text": result.get("answer", ""),   "timestamp": _now})
         if _state["pending_confirmation"]:
             _state["pending_confirmation"] = False
+            preview = _state["confirmation_preview"]
+            # Observability: the args fallback renders workout-shaped text too,
+            # so without a source tag a live run can't tell a working slot-read
+            # from a silent fallback — a false-pass. Surfaced in the response.
+            preview_source = "args_fallback"
+            # Workout path: the panel gates the write, so it must render the
+            # staged SLOT — the exact payload execute will write — formatted
+            # deterministically in the MCP subprocess, not the tool args and
+            # not the LLM's phrasing (either can diverge from the payload).
+            # Defensive: any failure falls back to the args-based preview so
+            # the panel never blanks.
+            if _state["pending_execute_kind"] == "workout":
+                try:
+                    slot = json.loads(await session.call_tool(
+                        "format_staged_workout_for_confirmation", {}))
+                    if slot.get("preview"):
+                        preview = slot["preview"]
+                        preview_source = "slot"
+                    else:
+                        # Formatter answered but carried no preview (e.g. an
+                        # {"error": ...} for an empty slot) — log it, or this
+                        # fallback is indistinguishable from a fired slot-read.
+                        print(f"[server] staged-workout preview empty/error: {slot!r}",
+                              file=sys.stderr)
+                except Exception as exc:
+                    print(f"[server] staged-workout preview failed: {exc}",
+                          file=sys.stderr)
             return JSONResponse(content={
                 "type": "confirmation_required",
-                "preview": _state["confirmation_preview"],
+                "preview": preview,
+                "preview_source": preview_source,
             })
         # #2: the Coordinator already builds a graceful, user-facing answer for
         # BOTH the operational fallback (pipeline failure) AND the
@@ -611,8 +660,41 @@ async def confirm(body: ConfirmRequest):
             content={"error": "Agent is busy, please wait"},
         )
     async with agent_lock:
-        _state["allow_execute"] = body.confirmed
+        pending_kind = _state["pending_execute_kind"]
         _state["pending_confirmation"] = False
+        _state["pending_execute_kind"] = None
+        # Clear-on-cancel: a cancelled batch must be discarded immediately so it can't be
+        # carried into a later execute (closes the window before the next /chat turn clears
+        # it). The confirm path leaves the staged batch intact for execute. Deterministic
+        # via call_tool; defensive so a clear failure doesn't break the cancel response.
+        if not body.confirmed:
+            try:
+                await session.call_tool("discard_staged_writes", {})
+            except Exception as exc:
+                print(f"[server] discard_staged_writes (cancel) failed: {exc}", file=sys.stderr)
+        # Fix 5: a confirmed WORKOUT batch is executed by the SERVER, not the agent
+        # — call_tool mirrors the deterministic discard calls above. The tool runs
+        # atomic write-and-verify (rollback on mismatch), so its result IS the
+        # outcome; the agent is never re-prompted and cannot misfire mid-flow.
+        if body.confirmed and pending_kind == "workout":
+            try:
+                raw = await session.call_tool("execute_staged_workout", {})
+                outcome = json.loads(raw)
+            except Exception as exc:
+                return _error_response(exc)
+            if outcome.get("success"):
+                session._staged_active = False   # slot committed+popped; keep resume coherent
+                return JSONResponse(content={
+                    "type": "answer",
+                    "text": f"✅ {outcome.get('message', 'Workout saved and verified.')}",
+                })
+            return JSONResponse(content={
+                "type": "error",
+                "text": f"❌ {outcome.get('message') or outcome.get('error') or 'Workout write failed — nothing was saved.'}",
+            })
+        # Sibling staged flows (goal / set edits) keep the agent-driven execute:
+        # allow_execute unblocks their execute_* tools and the agent is re-prompted.
+        _state["allow_execute"] = body.confirmed
         message = "Yes, confirmed, please execute" if body.confirmed else "Cancel that"
         try:
             # Route directly to session — /confirm is the continuation of an

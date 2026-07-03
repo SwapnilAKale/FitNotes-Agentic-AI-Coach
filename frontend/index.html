@@ -134,12 +134,16 @@
   </div>
 
   <!-- Confirmation card (hidden by default) -->
-  <div id="confirm-bar" class="hidden flex-shrink-0 border-t border-yellow-800 bg-yellow-950/50 px-4 py-3">
-    <div class="max-w-2xl mx-auto">
-      <p class="text-sm text-yellow-200 mb-3 font-medium">Confirm this action?</p>
-      <p id="confirm-preview" class="text-xs text-yellow-300/70 mb-3 font-mono whitespace-pre-wrap"
-         style="max-height: 40vh; overflow-y: auto; scrollbar-width: thin;"></p>
-      <div class="flex gap-2">
+  <!-- Bounded flex column: heading + scrollable card region + PINNED footer, so a long
+       multi-exercise batch scrolls inside the card region while Confirm/Cancel stay visible. -->
+  <div id="confirm-bar" class="hidden flex-shrink-0 flex flex-col max-h-[70vh] border-t border-yellow-800 bg-yellow-950/50 px-4 py-3">
+    <div class="max-w-2xl mx-auto w-full flex flex-col min-h-0">
+      <p class="text-sm text-yellow-200 mb-3 font-medium flex-shrink-0">Confirm this action?</p>
+      <!-- Scroll region (min-h-0 is required for a flex child to actually scroll). Populated
+           by renderConfirmPreview() — formatted cards, or raw text on parse failure. -->
+      <div id="confirm-preview" class="text-xs flex-1 min-h-0 overflow-y-auto pr-1"
+           style="scrollbar-width: thin;"></div>
+      <div class="flex gap-2 flex-shrink-0 pt-3">
         <button id="confirm-yes" class="px-4 py-1.5 bg-green-700 hover:bg-green-600 text-white text-sm rounded-lg">Confirm</button>
         <button id="confirm-no" class="px-4 py-1.5 bg-slate-600 hover:bg-slate-500 text-white text-sm rounded-lg">Cancel</button>
       </div>
@@ -159,6 +163,60 @@ function nowTime() {
 
 function esc(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+// esc() requires a string; coerce any value (numbers, null) before escaping.
+function escv(v) { return esc(String(v == null ? '' : v)); }
+
+// Display-only seconds → M:SS (or H:MM:SS when >= 1h). No weight/other arithmetic.
+function mmss(s) {
+  s = Math.max(0, Math.round(Number(s) || 0));
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  const pad = n => String(n).padStart(2, '0');
+  return h > 0 ? `${h}:${pad(m)}:${pad(sec)}` : `${m}:${pad(sec)}`;
+}
+
+// Render the staged batch (server sends N pretty-printed log_workout arg objects joined
+// by "\n\n") as formatted exercise cards. On ANY parse problem, fall back to the raw
+// preview text so the panel never blanks (also covers sibling goal/set-edit previews).
+function renderConfirmPreview(preview) {
+  const el = document.getElementById('confirm-preview');
+  preview = preview || '';
+  try {
+    const blocks = preview.split('\n\n').map(b => b.trim()).filter(Boolean);
+    const workouts = blocks.map(b => JSON.parse(b));
+    if (!workouts.length ||
+        !workouts.every(w => w && typeof w === 'object' &&
+                             w.exercise_name && Array.isArray(w.sets))) {
+      throw new Error('not a workout batch');
+    }
+    let html = '';
+    const date = workouts[0].date;
+    if (date) html += `<div class="text-yellow-200/80 mb-2">${escv(date)}</div>`;
+    for (const w of workouts) {
+      html += `<div class="mb-2 rounded-lg border border-yellow-500/20 bg-black/20 px-3 py-2">`;
+      html += `<div class="text-sm font-semibold text-white mb-1">${escv(w.exercise_name)}</div>`;
+      for (const s of w.sets) {
+        let line;
+        if (Number(s.distance) > 0) {
+          line = `${escv(s.distance)} km in ${escv(mmss(s.duration_seconds))}`;
+        } else if (Number(s.duration_seconds) > 0) {
+          line = escv(mmss(s.duration_seconds));
+        } else {
+          const parts = [];
+          if (s.weight != null) parts.push(`${escv(s.weight)}${s.unit ? ' ' + escv(s.unit) : ''}`);
+          if (s.reps != null) parts.push(`${escv(s.reps)} reps`);
+          line = parts.join(' × ') || '—';
+        }
+        html += `<div class="text-yellow-100/90">${line}</div>`;
+        if (s.comment) html += `<div class="italic text-yellow-300/50 ml-2 mb-1">${escv(s.comment)}</div>`;
+      }
+      html += `</div>`;
+    }
+    el.innerHTML = html;
+  } catch (e) {
+    // Never blank — raw fallback (monospaced, wrapped), matching the old rendering.
+    el.innerHTML = `<pre class="whitespace-pre-wrap font-mono text-yellow-300/70 m-0">${escv(preview)}</pre>`;
+  }
 }
 
 function chatInner() {
@@ -476,7 +534,7 @@ async function sendMessage(forcedText) {
     } else if (data.error === 'overload') {
       handleOverloadError();
     } else if (data.type === 'confirmation_required') {
-      document.getElementById('confirm-preview').textContent = data.preview || '';
+      renderConfirmPreview(data.preview);
       document.getElementById('confirm-bar').classList.remove('hidden');
       setBusy(false);
     } else if (data.type === 'not_ready') {

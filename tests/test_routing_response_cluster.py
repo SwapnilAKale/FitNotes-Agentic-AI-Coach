@@ -291,6 +291,47 @@ def test_chat_normal_answer_unaffected(srv, monkeypatch):
     assert body["type"] == "answer" and body["text"] == "Your bench is up 10 lbs."
 
 
+# ── preview_source observability: slot-read vs args fallback must be tellable ──
+# The args fallback renders workout-shaped text too, so without a source tag a
+# live check cannot prove the slot-read fired — a false-pass is possible.
+
+def _confirm_turn(srv, monkeypatch, formatter_result):
+    # Fake route arms the confirmation exactly as the log_workout staging branch
+    # of _confirmation_handler would (route runs AFTER the turn-start reset).
+    async def route(msg):
+        srv._state["pending_confirmation"] = True
+        srv._state["confirmation_preview"] = "ARGS-BLOB"
+        srv._state["pending_execute_kind"] = "workout"
+        return {"answer": "", "route": "operational", "flagged_claims": [], "error": None}
+
+    async def call_tool(name, args):
+        if name == "format_staged_workout_for_confirmation":
+            return json.dumps(formatter_result)
+        return json.dumps({"discarded": True})   # turn-start discard_staged_writes
+
+    monkeypatch.setattr(srv, "coordinator", SimpleNamespace(route=route))
+    monkeypatch.setattr(srv, "session", SimpleNamespace(call_tool=call_tool))
+    return _body(asyncio.run(srv._process_turn("log my workout")))
+
+
+def test_confirmation_preview_source_slot(srv, monkeypatch):
+    body = _confirm_turn(srv, monkeypatch,
+                         {"preview": "Staged workout — 2026-07-01\n\nBench"})
+    assert body["type"] == "confirmation_required"
+    assert body["preview"].startswith("Staged workout")
+    assert body["preview_source"] == "slot"
+
+
+def test_confirmation_preview_source_args_fallback_logs(srv, monkeypatch, capsys):
+    # Formatter answers with an error payload (no preview key) → args fallback,
+    # tagged as such, AND the previously-silent path now logs to stderr.
+    body = _confirm_turn(srv, monkeypatch, {"error": "No staged workout found."})
+    assert body["type"] == "confirmation_required"
+    assert body["preview"] == "ARGS-BLOB"
+    assert body["preview_source"] == "args_fallback"
+    assert "staged-workout preview empty/error" in capsys.readouterr().err
+
+
 def test_reinitialize_session_logs_close_failure(srv, monkeypatch, capsys):
     # A close() that raises must be LOGGED (not silently swallowed), and the
     # reload must still proceed.
