@@ -215,7 +215,7 @@ def _count_processing(coord, monkeypatch, op_route="operational"):
     """Patch both pipelines with counters; return the dict."""
     seen = {"op": 0, "an": 0, "last": None}
 
-    async def fake_op(q):
+    async def fake_op(q, **kw):          # **kw: /log boundary flags (ignored here)
         seen["op"] += 1; seen["last"] = q
         return "OP:" + q
     monkeypatch.setattr(coord, "_run_operational", fake_op)
@@ -558,7 +558,7 @@ def test_resume_with_no_slot_returns_notice(slot, coord, monkeypatch):
         return "X", []
     monkeypatch.setattr(coord, "_run_analytical", spy_an)
 
-    async def spy_op(q):
+    async def spy_op(q, **kw):           # **kw: /log boundary flags (ignored here)
         spy["operational"] += 1
         return "Y"
     monkeypatch.setattr(coord, "_run_operational", spy_op)

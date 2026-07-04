@@ -28,7 +28,8 @@ DEBUG = args.debug
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from src.agent import AgentSession
-from src.coordinator import Coordinator
+from src.coordinator import Coordinator, MSG_VERIFY_RESTATE, format_verify_fail_message
+from src import checkpoint as _ckpt
 from src import wal
 
 DB_PATH = os.environ.get("FITNOTES_DB_PATH", "./data/FitNotes_Backup.fitnotes")
@@ -574,6 +575,16 @@ async def _process_turn(message: str) -> JSONResponse:
             _now = datetime.datetime.now().isoformat()
             session.chat_history.append({"role": "user",      "text": message,                    "timestamp": _now})
             session.chat_history.append({"role": "assistant", "text": result.get("answer", ""),   "timestamp": _now})
+        # Write-path restore (resume of a quota-interrupted /log turn): the
+        # coordinator restored the checkpointed staged batch into the MCP slot
+        # and signals it here — the server arms the confirm panel DIRECTLY (the
+        # only non-agent writer of these flags; normally _confirmation_handler
+        # sets them during agent tool calls). No agent ran this turn.
+        if result.get("restore_staged"):
+            _state["pending_confirmation"] = True
+            _state["pending_execute_kind"] = "workout"
+            if not _state["confirmation_preview"]:
+                _state["confirmation_preview"] = "Confirm staged workout"
         if _state["pending_confirmation"]:
             _state["pending_confirmation"] = False
             preview = _state["confirmation_preview"]
@@ -603,6 +614,91 @@ async def _process_turn(message: str) -> JSONResponse:
                 except Exception as exc:
                     print(f"[server] staged-workout preview failed: {exc}",
                           file=sys.stderr)
+                # ── Stage-2 verify-at-staging: ONE LLM diff of the assembled
+                # /log-flow turns ⇄ the staged slot (+ its deterministic
+                # rendering), BEFORE the panel is shown. FAIL suppresses the
+                # panel and discards the slot IMMEDIATELY — a stray /confirm
+                # must find pending_kind=None and an empty slot, so nothing can
+                # reach execute. ERROR (verify machinery failed, incl. no
+                # slot-rendered preview) fails OPEN: the panel is itself a
+                # human check of the slot rendering. Defensive throughout — a
+                # verify-layer crash must not 500 the turn.
+                verdict = {"verdict": "ERROR", "reason": "verify unavailable"}
+                slot_raw = ""
+                try:
+                    slot_raw = await session.call_tool(
+                        "read_staged_workout_slot", {})
+                    restored = result.get("restored_verify")
+                    if (isinstance(restored, dict)
+                            and restored.get("verdict") == "PASS"):
+                        # Restored case 1: the batch was verified before the
+                        # interruption and the verdict rode the checkpoint —
+                        # never re-pay a completed LLM call on resume.
+                        verdict = restored
+                    elif preview_source == "slot":
+                        verdict = await coordinator.verify_log_staging(
+                            result.get("log_flow_turns") or [message],
+                            slot_raw, preview)
+                    else:
+                        verdict = {"verdict": "ERROR",
+                                   "reason": "preview unavailable — verify skipped"}
+                except Exception as exc:
+                    print(f"[server] staging verify errored: {exc}",
+                          file=sys.stderr)
+                    verdict = {"verdict": "ERROR", "reason": str(exc)}
+                if verdict.get("verdict") == "FAIL":
+                    # Close the execute leak BEFORE replying: kind cleared so
+                    # /confirm's workout branch can't fire, slot discarded so
+                    # even a direct execute is an empty-slot no-op. Discard
+                    # FIRST, then record — discard clears the whole
+                    # _staged_writes dict, so the FAIL verdict must be written
+                    # after it to survive as the sibling key. The guarded
+                    # checkpoint clear closes the resume loop (a restored slot
+                    # that FAILs must not be restorable again); it never
+                    # touches a non-staged (analytical) checkpoint.
+                    _state["pending_execute_kind"] = None
+                    try:
+                        await session.call_tool("discard_staged_writes", {})
+                        await session.call_tool("record_workout_verify", verdict)
+                    except Exception as exc:
+                        print(f"[server] staging verify FAIL cleanup failed: {exc}",
+                              file=sys.stderr)
+                    _ckpt.clear_staged_checkpoint()
+                    print(f"[server] staging verify FAIL: {verdict.get('reason')}",
+                          file=sys.stderr)
+                    return JSONResponse(content={
+                        "type": "answer",
+                        "text": format_verify_fail_message(preview) if preview else MSG_VERIFY_RESTATE,
+                    })
+                # PASS / ERROR: record the verdict (stage 3's trusted-or-not
+                # signal) and proceed to the panel.
+                try:
+                    await session.call_tool("record_workout_verify", verdict)
+                except Exception as exc:
+                    print(f"[server] record_workout_verify failed: {exc}",
+                          file=sys.stderr)
+                # Checkpoint-2 (boundary 2 of the write-path arc): a PASSed
+                # batch is checkpointed BEFORE the panel wait, so an abandoned
+                # panel / restart / stray 429 resumes by restoring this exact
+                # verified slot (keep-until-confirm: /confirm outcomes clear
+                # it). On a resume turn `message` is "continue", but the flow
+                # turns and original question ride the result dict from the
+                # checkpoint — the re-save never stores ["continue"].
+                if verdict.get("verdict") == "PASS":
+                    try:
+                        slot_list = json.loads(slot_raw).get("staged_workouts")
+                        if slot_list:
+                            _ckpt.save_checkpoint(
+                                route="operational",
+                                question=result.get("restored_question") or message,
+                                staged_slot=slot_list,
+                                log_flow_turns=(result.get("log_flow_turns")
+                                                or [message]),
+                                verify_verdict=verdict,
+                            )
+                    except Exception as exc:
+                        print(f"[server] staged checkpoint save failed: {exc}",
+                              file=sys.stderr)
             return JSONResponse(content={
                 "type": "confirmation_required",
                 "preview": preview,
@@ -672,6 +768,11 @@ async def confirm(body: ConfirmRequest):
                 await session.call_tool("discard_staged_writes", {})
             except Exception as exc:
                 print(f"[server] discard_staged_writes (cancel) failed: {exc}", file=sys.stderr)
+            # A cancelled batch's checkpoint must die with it, or a later
+            # "continue" would restore what the user just rejected. Guarded:
+            # only a staged_slot checkpoint is cleared, never an unrelated
+            # interrupted-question slot.
+            _ckpt.clear_staged_checkpoint()
         # Fix 5: a confirmed WORKOUT batch is executed by the SERVER, not the agent
         # — call_tool mirrors the deterministic discard calls above. The tool runs
         # atomic write-and-verify (rollback on mismatch), so its result IS the
@@ -684,6 +785,11 @@ async def confirm(body: ConfirmRequest):
                 return _error_response(exc)
             if outcome.get("success"):
                 session._staged_active = False   # slot committed+popped; keep resume coherent
+                # The committed batch's checkpoint must die NOW (guarded) — a
+                # later "continue" restoring an already-written batch would be
+                # a double write. This is the keep-until-confirm lifecycle's
+                # closing clear.
+                _ckpt.clear_staged_checkpoint()
                 return JSONResponse(content={
                     "type": "answer",
                     "text": f"✅ {outcome.get('message', 'Workout saved and verified.')}",

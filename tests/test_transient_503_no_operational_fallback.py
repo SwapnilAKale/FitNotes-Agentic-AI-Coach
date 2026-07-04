@@ -97,7 +97,7 @@ def _count_operational(coord):
     """Replace _run_operational with a counter; return the counter dict."""
     calls = {"n": 0}
 
-    async def fake_op(question):
+    async def fake_op(question, **kw):   # **kw: /log boundary flags (ignored here)
         calls["n"] += 1
         return "OPERATIONAL-ANSWER (should never appear on analytical failure)"
 

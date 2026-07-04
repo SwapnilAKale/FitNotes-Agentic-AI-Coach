@@ -516,6 +516,22 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         # preview from the staged slot.
         elif name == "format_staged_workout_for_confirmation":
             result = await _format_staged_workout_for_confirmation()
+        # Server-internal like execute_staged_workout: not declared in list_tools
+        # (the agent never sees it); later verification stages call it to read
+        # the RAW staged slot — the exact payload execute will write — as JSON,
+        # not the formatted preview.
+        elif name == "read_staged_workout_slot":
+            result = await _read_staged_workout_slot()
+        # Server-internal like the two above: not declared in list_tools. The
+        # caller stores the stage-2 staging-verify verdict as a sibling key in
+        # _staged_writes (cleared for free by discard_staged_writes).
+        elif name == "record_workout_verify":
+            result = await _record_workout_verify(arguments)
+        # Server-internal, unexposed like its siblings: restores a checkpointed
+        # staged batch (id-validated against the CURRENT DB) so a resumed /log
+        # turn confirms the exact pre-interruption slot, never a re-stage.
+        elif name == "restore_staged_workout_slot":
+            result = await _restore_staged_workout_slot(arguments)
         elif name == "set_goal":
             result = await _set_goal(arguments)
         elif name == "execute_staged_goal":
@@ -1638,6 +1654,76 @@ def _format_staged_workout_for_confirmation_sync() -> str:
 
 async def _format_staged_workout_for_confirmation() -> str:
     return await asyncio.to_thread(_format_staged_workout_for_confirmation_sync)
+
+
+def _read_staged_workout_slot_sync() -> str:
+    """Raw _staged_writes["workout"] slot as JSON — NOT the formatted preview.
+    Deterministic shape for the later verification stages (an LLM verifier and
+    a post-execute compare read the exact payload execute will write): always
+    {"staged_workouts": [...]}, empty list when nothing is staged."""
+    return json.dumps({"staged_workouts": _staged_writes.get("workout", [])})
+
+
+async def _read_staged_workout_slot() -> str:
+    return await asyncio.to_thread(_read_staged_workout_slot_sync)
+
+
+def _record_workout_verify_sync(arguments: dict) -> str:
+    """Store the stage-2 staging-verify verdict as an MCP-sibling key in
+    _staged_writes, NOT server _state: discard_staged_writes clears the whole
+    dict, so the verdict is wiped alongside the batch for free (no dual reset
+    sites, nothing to leak). Stage 3 reads it as the trusted-or-not signal.
+    On a FAIL the caller discards FIRST, then records — so the FAIL verdict
+    survives the dict-clear as the only remaining key."""
+    _staged_writes["workout_verify"] = {
+        "verdict": arguments.get("verdict", "ERROR"),
+        "reason":  arguments.get("reason", ""),
+    }
+    return json.dumps({"recorded": True})
+
+
+async def _record_workout_verify(arguments: dict) -> str:
+    return _record_workout_verify_sync(arguments)
+
+
+def _restore_staged_workout_slot_sync(arguments: dict) -> str:
+    """Restore a checkpointed staged batch into _staged_writes["workout"]
+    (+ its stage-2 verdict when one was checkpointed) so a quota-interrupted
+    /log turn resumes with the EXACT batch — never an agent re-stage.
+
+    Backup-upload invalidation: the slot stores exercise_ids valid for the DB
+    at checkpoint time; an upload inside the checkpoint's 48h window may have
+    replaced the DB. Every id is validated against the CURRENT exercise table
+    (same SELECT pattern as the confirm-panel formatter); any miss refuses the
+    whole restore and writes NOTHING — the caller falls back to a re-log
+    prompt rather than confirming a batch with dangling ids."""
+    from src.db import get_connection
+
+    staged = arguments.get("staged_workouts")
+    if not staged or not isinstance(staged, list):
+        return json.dumps({"error": "nothing to restore"})
+    ids = {w.get("exercise_id") for w in staged if isinstance(w, dict)}
+    if not ids or None in ids:
+        return json.dumps({"error": "malformed staged slot"})
+    conn = get_connection(DB_PATH)
+    placeholders = ",".join("?" * len(ids))
+    rows = conn.execute(
+        f"SELECT _id FROM exercise WHERE _id IN ({placeholders})",
+        sorted(ids),
+    ).fetchall()
+    conn.close()
+    found = {r["_id"] for r in rows}
+    missing = sorted(ids - found)
+    if missing:
+        return json.dumps({"error": "invalid_exercise_ids", "missing": missing})
+    _staged_writes["workout"] = staged
+    if arguments.get("verify"):
+        _staged_writes["workout_verify"] = arguments["verify"]
+    return json.dumps({"restored": True, "workouts": len(staged)})
+
+
+async def _restore_staged_workout_slot(arguments: dict) -> str:
+    return await asyncio.to_thread(_restore_staged_workout_slot_sync, arguments)
 
 
 def _set_goal_sync(arguments: dict) -> str:

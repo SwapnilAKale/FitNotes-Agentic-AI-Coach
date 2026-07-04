@@ -226,10 +226,19 @@ def save_checkpoint(route:           str,
                     params:          dict | None = None,
                     completed_stage: str | None = None,
                     draft:           str | None = None,
-                    messages:        list | None = None) -> dict:
+                    messages:        list | None = None,
+                    staged_slot:     list | None = None,
+                    log_flow_turns:  list | None = None,
+                    verify_verdict:  dict | None = None) -> dict:
     """
     Write the single slot, overwriting any previous checkpoint.
     The draft is stored VERBATIM. Operational messages are mechanically pruned.
+
+    Write-path fields (all None on non-write turns): staged_slot is the raw
+    _staged_writes["workout"] list at checkpoint time, log_flow_turns the
+    assembled /log-flow user turns (verify Input A), verify_verdict the
+    stage-2 verdict when verify already PASSed. Resume restores the slot
+    instead of re-entering the agent loop (a fresh probabilistic re-stage).
     """
     cp = {
         "created":         datetime.now().isoformat(),
@@ -239,13 +248,19 @@ def save_checkpoint(route:           str,
         "completed_stage": completed_stage,
         "draft":           draft,
         "messages":        prune_tool_messages(messages) if messages else None,
+        "staged_slot":     staged_slot,
+        "log_flow_turns":  log_flow_turns,
+        "verify_verdict":  verify_verdict,
     }
     _write(cp)
     logger.info(
-        "[checkpoint] saved: route=%s completed_stage=%s draft=%s messages=%s",
+        "[checkpoint] saved: route=%s completed_stage=%s draft=%s messages=%s "
+        "staged_slot=%s verify=%s",
         route, completed_stage,
         f"{len(draft)} chars" if draft else "none",
         len(messages) if messages else 0,
+        f"{len(staged_slot)} workout(s)" if staged_slot else "none",
+        (verify_verdict or {}).get("verdict", "none"),
     )
     return cp
 
@@ -293,6 +308,43 @@ def load_checkpoint() -> dict | None:
         logger.warning("[checkpoint] corrupt slot discarded: %s", e)
         clear_checkpoint()
         return None
+
+
+def enrich_checkpoint(fields: dict) -> dict | None:
+    """
+    Merge fields into the live slot and rewrite it. RAW read — own file read,
+    deliberately NOT load_checkpoint: its MAX_AGE staleness gate clears and
+    returns None, and a gate on a cp written milliseconds ago (the boundary-1
+    caller enriches the checkpoint the agent just saved) must be structurally
+    impossible, not just unlikely. Returns the enriched cp, or None only when
+    the slot file is missing/corrupt (enrichment skipped; resume then takes
+    the no-slot path — safe).
+    """
+    path = _path()
+    try:
+        with open(path, encoding="utf-8") as f:
+            cp = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError) as e:
+        logger.warning("[checkpoint] enrich skipped — no readable slot: %s", e)
+        return None
+    cp.update(fields)
+    _write(cp)
+    logger.info("[checkpoint] enriched slot with: %s", ", ".join(fields))
+    return cp
+
+
+def clear_staged_checkpoint() -> bool:
+    """
+    Clear the slot ONLY if it carries a staged workout (staged_slot). The
+    guard exists because /confirm outcomes (execute success / cancel) and the
+    verify-FAIL path must never destroy an unrelated interrupted-question
+    checkpoint. Returns whether a slot was cleared.
+    """
+    cp = load_checkpoint()
+    if cp and cp.get("staged_slot"):
+        clear_checkpoint()
+        return True
+    return False
 
 
 def clear_checkpoint() -> None:

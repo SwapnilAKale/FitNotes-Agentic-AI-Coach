@@ -40,6 +40,34 @@
     }
     #attach-menu button:hover { background: #334155; color: white; }
     #attach-menu button:not(:last-child) { border-bottom: 1px solid #334155; }
+    #slash-menu {
+      display: none;
+      position: absolute;
+      bottom: calc(100% + 8px);
+      left: 0;
+      right: 0;
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 12px;
+      overflow: hidden;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+      z-index: 50;
+    }
+    #slash-menu.open { display: block; }
+    #slash-menu button {
+      display: block;
+      width: 100%;
+      padding: 10px 16px;
+      text-align: left;
+      font-size: 13px;
+      color: #cbd5e1;
+      background: transparent;
+      border: none;
+      cursor: pointer;
+    }
+    #slash-menu button:hover, #slash-menu button.active { background: #334155; color: white; }
+    #slash-menu .slash-cmd { color: #60a5fa; font-weight: 600; }
+    #slash-menu .slash-desc { color: #94a3b8; margin-left: 8px; }
     .thinking-dot {
       display: inline-block;
       width: 6px; height: 6px;
@@ -93,6 +121,11 @@
   <div class="flex-shrink-0 border-t border-slate-700/50 bg-slate-900/30 px-4 py-4">
     <div class="max-w-2xl mx-auto">
       <div class="relative flex items-end gap-2 bg-slate-800 rounded-2xl px-3 py-2 border border-slate-700 focus-within:border-blue-500 transition-colors">
+
+        <!-- Slash-command autocomplete (shown while typing "/" … "/log") -->
+        <div id="slash-menu">
+          <button id="slash-log-btn"><span class="slash-cmd">/log</span><span class="slash-desc">Log a workout — using /log gives a more reliable log</span></button>
+        </div>
 
         <!-- Attach button + menu -->
         <div class="relative flex-shrink-0" id="attach-wrapper">
@@ -703,12 +736,41 @@ document.addEventListener('click', (e) => {
   }
 });
 
+// ── Slash-command autocomplete ────────────────────────────────────────────────
+// Shown only while the input is exactly a prefix of "/log" typed from position
+// 0 ("/", "/l", "/lo", "/log"). Selecting inserts "/log ". When the menu is
+// closed every existing input behavior (incl. Enter-to-send) is untouched.
+function slashMenuOpen() {
+  return document.getElementById('slash-menu').classList.contains('open');
+}
+function updateSlashMenu(value) {
+  const show = /^\/(l(o(g)?)?)?$/i.test(value);
+  document.getElementById('slash-menu').classList.toggle('open', show);
+}
+function pickSlashLog() {
+  const input = document.getElementById('input');
+  input.value = '/log ';
+  document.getElementById('slash-menu').classList.remove('open');
+  input.focus();
+}
+document.getElementById('slash-log-btn').addEventListener('click', pickSlashLog);
+document.addEventListener('click', (e) => {
+  if (!document.getElementById('slash-menu').contains(e.target)) {
+    document.getElementById('slash-menu').classList.remove('open');
+  }
+});
+
 // ── Input behaviour ───────────────────────────────────────────────────────────
 document.getElementById('input').addEventListener('input', function() {
   this.style.height = 'auto';
   this.style.height = Math.min(this.scrollHeight, 128) + 'px';
+  updateSlashMenu(this.value);
 });
 document.getElementById('input').addEventListener('keydown', (e) => {
+  if (slashMenuOpen()) {
+    if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); pickSlashLog(); return; }
+    if (e.key === 'Escape') { e.preventDefault(); document.getElementById('slash-menu').classList.remove('open'); return; }
+  }
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
 });
 document.getElementById('send-btn').addEventListener('click', () => sendMessage());

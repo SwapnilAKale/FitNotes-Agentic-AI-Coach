@@ -161,6 +161,66 @@ def _is_write_intent(message: str) -> bool:
     return bool(_WRITE_IMPERATIVE_RE.search(message))
 
 
+# ── /log deterministic write boundary ─────────────────────────────────────────
+# A user-typed "/log" prefix is a TRUSTED write boundary: no inference, no
+# regex guessing. The write-intent regex above stays as the graceful-degradation
+# fallback for un-prefixed logging messages (never silent failure) — in that
+# fallback case only, the answer carries a one-line /log suggestion.
+_LOG_PREFIX_RE = re.compile(r"(?i)^\s*/log\b[:,]?\s*")
+_LOG_FALLBACK_NUDGE = (
+    "Tip: starting your message with /log makes logging faster and more reliable."
+)
+_LOG_TRAILING_NOTE = (
+    "(Noted your other question — ask it again after confirming this log.)"
+)
+
+# Tail-question test for _split_log_tail. Dedicated regex (NOT a change to
+# _WRITE_QUESTION_RE): "Also, how is my back progressing" has no "?", "how is"
+# isn't in _WRITE_QUESTION_RE's alternations, and the leading "Also" breaks its
+# ^ anchor. Optional connector, then an interrogative lead — or a "?" anywhere.
+_LOG_TAIL_QUESTION_RE = re.compile(
+    r"(?i)^\s*(?:also,?\s+|and\s+also,?\s+|btw,?\s+|by\s+the\s+way,?\s+"
+    r"|oh\s+and\s+|plus,?\s+)?"
+    r"(?:how|what|why|when|where|which|who|is|are|am|do|does|did"
+    r"|can|could|should|would|will)\b"
+    r"|\?"
+)
+_LOG_QUANTITY_RE = re.compile(r"(?i)" + _WRITE_QUANTITY)
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def _split_log_tail(text: str) -> tuple[str, bool]:
+    """
+    Split a /log request into (workout head, has_analytical_tail). Peels
+    trailing sentences that read as questions (and carry no set/rep/weight
+    quantity — those are workout content, never a tail). Conservative: false
+    negatives are fine; the tail is never routed or decomposed — the only
+    acknowledgment is _LOG_TRAILING_NOTE appended to the answer. If every
+    sentence would peel (head would be empty), don't split at all.
+    """
+    parts = _SENTENCE_SPLIT_RE.split(text)
+    keep = len(parts)
+    while keep > 1:
+        seg = parts[keep - 1]
+        if _LOG_TAIL_QUESTION_RE.search(seg) and not _LOG_QUANTITY_RE.search(seg):
+            keep -= 1
+        else:
+            break
+    if keep == len(parts):
+        return text, False
+    return " ".join(parts[:keep]).strip(), True
+
+
+def _log_carry_unrelated(message: str) -> bool:
+    """
+    Clear-without-consume test for the single-turn /log carry: a question is
+    not a clarification answer, and a bare filler ("thanks") is abandonment.
+    Anything else ("yesterday", "3 sets of 12", "the dumbbell one") plausibly
+    answers the pending logging clarification and joins the /log flow.
+    """
+    return bool(_WRITE_QUESTION_RE.search(message)) or _filler_reply(message) is not None
+
+
 # ── Filler short-circuit (#5a) ────────────────────────────────────────────────
 # Bare greetings / acknowledgments / thanks must NOT spend a classify call, a
 # package build, or an analytical/operational turn. A small, conservative,
@@ -452,6 +512,60 @@ OUT_OF_SCOPE_REFUSAL = (
 )
 
 
+# ── Stage-2 staging-verify prompt (write-verification layer) ──────────────────
+# ONE LLM diff call per logging turn: the assembled /log-flow user turns ⇄ the
+# staged JSON slot (+ its deterministic rendering — the raw slot alone is
+# un-diffable: exercise_id is an opaque int and metric_weight is kg, typed/2.2046).
+# Verification, NOT re-extraction: the model checks whether B faithfully
+# represents A; it never re-derives B from A. No retries (quota: +1 call/turn).
+
+_VERIFY_SYSTEM = """
+You are a verification checker for a workout-logging system.
+
+You receive:
+  [LOGGING REQUEST]  — the user's own words asking to log a workout (possibly
+                       assembled from several turns, in order).
+  [STAGED JSON]      — the machine-parsed workout batch that will be written.
+  [STAGED RENDERING] — a deterministic human-readable rendering of that same
+                       JSON (exercise names and typed weights recovered from
+                       the database).
+
+Your task is a DIFF, not a re-parse: check whether the staged JSON faithfully
+represents the request. Do NOT re-derive the workout from the request yourself
+and do NOT judge whether the workout is sensible. Only compare.
+
+FAIL when:
+  - a set, exercise, or per-set comment in the request is missing from the JSON
+  - the JSON contains a set, exercise, or comment the request never asked for
+  - a value is misattributed (weight/reps/comment on the wrong set or exercise)
+  - the date contradicts the request
+
+Do NOT flag:
+  - resolved exercise names ("bench" resolved to "Flat Barbell Bench Press")
+  - unit conversion (metric_weight in the JSON is kilograms = typed pounds
+    divided by 2.2046; the RENDERING shows the typed value — trust the
+    rendering for weights)
+  - exercise_id integers (opaque database ids; the RENDERING carries the name)
+  - non-logging content in the request (questions, asides) — verify the
+    logging portion only
+
+Return ONLY valid JSON, no preamble, no markdown fences:
+  {"verdict": "PASS"}
+  {"verdict": "FAIL", "reason": "<one short sentence: what is missing / extra / misattributed>"}
+""".strip()
+
+# FAIL response — a re-state prompt in the existing message style, not a raw error.
+MSG_VERIFY_RESTATE = "I may have misread that — could you re-state the workout?"
+
+
+def format_verify_fail_message(preview: str) -> str:
+    return (
+        "Here's what I staged — but it didn't match your request:\n\n"
+        f"{preview}\n\n"
+        "Could you confirm this is right, or re-state the workout?"
+    )
+
+
 # ── Coverage check prompt ─────────────────────────────────────────────────────
 
 _COVERAGE_SYSTEM = """
@@ -492,6 +606,23 @@ class Coordinator:
         # In-memory, per session. Lives exactly the immediate next turn (+1 turn
         # only if the user attempts an answer that needs one clarification).
         self._pending_followup: dict | None = None
+        # /log follow-up carry: set when a /log-boundary turn ends WITHOUT a
+        # complete staged batch (the agent asked a logging clarification — date,
+        # name disambiguation, ambiguous sets/reps, any of them). The immediate
+        # next turn joins the /log flow without the prefix. Single-turn by
+        # construction: route() snapshot-and-clears it at every entry, and only
+        # _run_operational re-arms it (on a boundary turn that again ended
+        # pending clarification). Coordinator-level (not server _state) so the
+        # CLI and web interfaces share the same seam.
+        self._pending_log_carry: bool = False
+        # Stage-2 verify Input A: the assembled WORKOUT-PORTION user turns of the
+        # current /log flow (turn-1 stripped head + carry replies, in order).
+        # Same scope-by-construction discipline as _pending_log_carry: route()
+        # snapshot-and-clears it at every entry; only the three flow-shaped
+        # branches in _route_fresh rebuild it (prefix, carry-consume, fallback
+        # write). Any other turn shape leaves it cleared — a flow never leaks
+        # stale turns into the next one.
+        self._log_flow_turns: list[str] = []
 
     # ── Public entry point ────────────────────────────────────────────────────
 
@@ -518,7 +649,24 @@ class Coordinator:
                 return consumed
             self._pending_followup = None     # not an answer → drop, route normally
 
-        result = await self._route_with_checkpoint(question)
+        # ── /log carry: snapshot-and-clear at every entry. The flag can never
+        # outlive one turn — a followup-consumed turn, checkpoint prompt, or
+        # filler reply all count as abandonment (cleared, never consumed).
+        # _route_fresh decides consume vs. clear-without-consume; only
+        # _run_operational can re-arm it.
+        log_carry = self._pending_log_carry
+        self._pending_log_carry = False
+
+        # ── Flow turns: same snapshot-and-clear as the carry. The snapshot holds
+        # the boundary turn's workout portion for a carry turn to extend; every
+        # non-flow turn shape (followup, checkpoint prompt, filler, analytical)
+        # leaves the member cleared, so the list's scope is one flow by
+        # construction — never a branch-local reset obligation.
+        flow_turns = self._log_flow_turns
+        self._log_flow_turns = []
+
+        result = await self._route_with_checkpoint(
+            question, log_carry=log_carry, flow_turns=flow_turns)
 
         # ── POST: append at most one follow-up (only on a real answer).
         if (result.get("route") in ("analytical", "operational")
@@ -573,7 +721,9 @@ class Coordinator:
     def _followup_response(self, text: str, route: str) -> dict:
         return {"answer": text, "route": route, "flagged_claims": [], "error": None}
 
-    async def _route_with_checkpoint(self, question: str) -> dict:
+    async def _route_with_checkpoint(self, question: str,
+                                     log_carry: bool = False,
+                                     flow_turns: Optional[list] = None) -> dict:
         """
         The checkpoint + routing flow (resume / confirm-before-discard / classify
         + dispatch). Wrapped by route(), which adds the Stage-B follow-up layer.
@@ -621,27 +771,72 @@ class Coordinator:
                 _ckpt.mark_awaiting_discard(cp, question)
                 return self._confirm_response(_ckpt.discard_confirm_prompt(cp))
 
-        return await self._route_fresh(question)
+        return await self._route_fresh(question, log_carry=log_carry,
+                                       flow_turns=flow_turns)
 
-    async def _route_fresh(self, question: str) -> dict:
+    async def _route_fresh(self, question: str, log_carry: bool = False,
+                           flow_turns: Optional[list] = None) -> dict:
         """
         Classify and dispatch a NEW (or classify-resumed) question. Separated
         from route()'s checkpoint handling so a resume from
         completed_stage='classify' can re-enter here directly (re-running the
         cheap classify call) without re-triggering checkpoint logic.
         """
+        # ── 0a. /log deterministic write boundary ────────────────────────────
+        # Detected HERE (not route()) so a "/log ..." stashed as the checkpoint
+        # discard-confirm pending_question re-detects intact when re-processed.
+        # Prefix turn: strip the prefix, peel a trailing analytical tail (the
+        # note is its only acknowledgment — never routed, never decomposed).
+        # Carry turn: the previous /log turn ended pending a logging
+        # clarification, so this reply joins the flow — unless it reads as
+        # unrelated (question / filler), which clears without consuming.
+        log_boundary = False
+        trailing_note = False
+        m = _LOG_PREFIX_RE.match(question)
+        if m:
+            log_boundary = True
+            question = question[m.end():].strip()
+            question, trailing_note = _split_log_tail(question)
+            # Fresh flow: Input A restarts at this turn's workout portion (the
+            # stripped head — the peeled tail is never part of the verify).
+            self._log_flow_turns = [question]
+        elif log_carry and not _log_carry_unrelated(question):
+            log_boundary = True                       # consume the carry
+            # Carry turn extends the flow: the route() snapshot holds the
+            # boundary turn's workout portion; this reply joins it in order.
+            self._log_flow_turns = list(flow_turns or []) + [question]
+
         # ── 0b. Filler short-circuit (#5a) ───────────────────────────────────
         # Bare greeting / ack / thanks / empty-ish → cheap canned reply, NO
         # classify call, NO package, NO analytical/operational pipeline. Runs
         # BEFORE classification. Conservative: anything with real content (incl.
         # a question behind a polite prefix) falls through to normal routing.
-        filler = _filler_reply(question)
-        if filler is not None:
-            return self._filler_response(filler)
+        # Skipped on a /log-boundary turn: a trusted write boundary is never
+        # filler (a bare "/log" should reach the agent and get a clarification).
+        if not log_boundary:
+            filler = _filler_reply(question)
+            if filler is not None:
+                return self._filler_response(filler)
 
         # ── 1. Classify (or short-circuit for obvious write operations) ──────
         # Misrouting a write to analytical bypasses the confirmation gate.
-        if _is_write_intent(question):
+        # /log boundary = trusted user signal, no inference. The regex guard
+        # below it is UNTOUCHED and now the fallback: it fires only when no
+        # /log prefix (and no carry), and only then the answer gets the nudge.
+        fallback_write = False
+        if log_boundary:
+            params = {
+                "route":             "operational",
+                "exercise_names":    None,
+                "muscle_groups":     None,
+                "query_period_days": 90,
+                "needs_custom_sql":  False,
+                "custom_sql_intent": None,
+            }
+        elif _is_write_intent(question):
+            fallback_write = True
+            # Regex-inferred write: the flow is this single message.
+            self._log_flow_turns = [question]
             params = {
                 "route":             "operational",
                 "exercise_names":    None,
@@ -732,7 +927,12 @@ class Coordinator:
                 # route stays "analytical": the request WAS analytical and simply
                 # could not complete.
         else:
-            answer = await self._run_operational(question)
+            answer = await self._run_operational(
+                question,
+                log_boundary=log_boundary,
+                fallback_write=fallback_write,
+                trailing_note=trailing_note,
+            )
 
         # ── 3. Update conversation history ────────────────────────────────────
         self._history.append({"role": "user",      "content": question})
@@ -745,6 +945,12 @@ class Coordinator:
             "route":          route,
             "flagged_claims": flagged,
             "error":          error,
+            "log_boundary":   log_boundary,
+            # Stage-2 verify Input A: the assembled workout-portion turns of
+            # this flow, present only on write-shaped turns (callers fall back
+            # to the raw message when absent).
+            "log_flow_turns": (list(self._log_flow_turns)
+                               if (log_boundary or fallback_write) else None),
         }
 
     # ── Per-minute silent retry ───────────────────────────────────────────────
@@ -897,6 +1103,13 @@ class Coordinator:
                                "resumed."),
                     "route": "operational", "flagged_claims": [], "error": None,
                 }
+            # Three-way write-path resume: a checkpointed staged batch is
+            # RESTORED (cases 1 and 2 — with/without a PASS verdict), never
+            # re-staged by the agent (a fresh probabilistic extraction that
+            # can diverge from what stage-2 already verified). Only a slot-less
+            # checkpoint (case 3) re-enters the agent loop.
+            if cp.get("staged_slot"):
+                return await self._resume_staged_workout(cp)
             result = await self._agent.resume(cp)   # QuotaInterrupted propagates
             _ckpt.clear_checkpoint()
             answer = result.get("answer", "")
@@ -932,6 +1145,72 @@ class Coordinator:
             "flagged_claims": flagged,
             "error":          error,
         }
+
+    async def _resume_staged_workout(self, cp: dict) -> dict:
+        """
+        Restore a checkpointed staged workout batch (write-path resume, cases
+        1 and 2). The exact pre-interruption slot — id-validated against the
+        CURRENT DB by the restore tool (a backup upload inside the slot's 48h
+        window can invalidate exercise_ids) — is written back into the MCP
+        subprocess, and the caller (server/CLI) arms its confirm gate from the
+        returned restore signal WITHOUT any agent call.
+
+        Case 1 (verify_verdict PASS stored): the batch was already verified —
+        the caller skips the verify LLM call entirely. Case 2 (no verdict —
+        the 429 hit after staging, before verify): the caller's existing
+        stage-2 verify block runs NOW on the restored slot, with the restored
+        log_flow_turns as Input A (never ["continue"]).
+
+        Checkpoint lifecycle is keep-until-confirm: the slot is NOT cleared
+        here — /confirm execute-success, cancel, or a verify FAIL clears it
+        (guarded), so an abandoned panel or a restart stays resumable and a
+        committed batch can never be restored twice.
+        """
+        orig_q  = cp.get("question") or ""
+        verdict = cp.get("verify_verdict")
+        flow    = cp.get("log_flow_turns") or ([orig_q] if orig_q else [])
+        try:
+            restore = json.loads(await self._agent.call_tool(
+                "restore_staged_workout_slot",
+                {"staged_workouts": cp["staged_slot"], "verify": verdict},
+            ))
+        except Exception as e:
+            logger.warning("[coordinator] staged-slot restore failed: %s", e)
+            restore = {"error": str(e)}
+
+        if restore.get("error"):
+            # Invalid ids (DB replaced since checkpoint) or a restore failure:
+            # never confirm a batch with dangling references — drop the slot
+            # and ask for a re-log.
+            logger.warning(
+                "[coordinator] staged-slot restore refused: %s", restore)
+            _ckpt.clear_checkpoint()
+            answer = ("Your data changed since this workout was staged — "
+                      "please re-log it with /log.")
+            self._history.append({"role": "user",      "content": orig_q})
+            self._history.append({"role": "assistant", "content": answer})
+            return {
+                "answer": answer, "route": "operational",
+                "flagged_claims": [], "error": None,
+            }
+
+        self._agent._staged_active = True
+        answer = "Restored your staged workout — confirm below to save it."
+        self._history.append({"role": "user",      "content": orig_q})
+        self._history.append({"role": "assistant", "content": answer})
+        if len(self._history) > CONTEXT_WINDOW * 2:
+            self._history = self._history[-(CONTEXT_WINDOW * 2):]
+        return {
+            "answer":            answer,
+            "route":             "operational",
+            "flagged_claims":    [],
+            "error":             None,
+            "log_boundary":      True,
+            "log_flow_turns":    flow,
+            "restore_staged":    True,        # non-agent gate-arming signal
+            "restored_verify":   verdict,     # PASS dict (case 1) or None (case 2)
+            "restored_question": orig_q,      # checkpoint-2 re-save must never
+        }                                     # degrade question to "continue"
 
     # ── Classification ────────────────────────────────────────────────────────
 
@@ -1456,18 +1735,136 @@ class Coordinator:
 
     # ── Operational path ──────────────────────────────────────────────────────
 
-    async def _run_operational(self, question: str) -> str:
+    async def _run_operational(self, question: str, *,
+                               log_boundary: bool = False,
+                               fallback_write: bool = False,
+                               trailing_note: bool = False) -> str:
         """
         Pass question to the existing Single Agent (AgentSession).
         The Single Agent manages its own ReAct loop and conversation history.
+
+        This is the single append chokepoint for the /log surface text (serves
+        cli.py and server.py identically — both render this answer verbatim):
+          - trailing_note: the /log message carried an analytical tail — the
+            note is its only acknowledgment (never routed, never decomposed).
+          - fallback_write: the write was inferred by regex, not /log — append
+            the suggestive nudge (fallback turns only, never /log turns).
+        Carry set-site: a boundary turn whose staged batch never reached the
+        confirmation gate (agent.answer's staging_reached_confirm is False)
+        ended in a logging clarification — arm the single-turn carry so the
+        user's next reply joins the /log flow. Staging-complete ⇒ gate reached
+        ⇒ flag stays down; cancel only exists at the confirm panel, which only
+        exists when the batch was complete ⇒ flag already down.
         """
         if self._agent is None:
             return (
                 "Operational path is not available in this configuration. "
                 "Please initialise the Coordinator with an AgentSession."
             )
-        result = await self._agent.answer(question)
-        return result.get("answer", "")
+        try:
+            result = await self._agent.answer(question)
+        except _ckpt.QuotaInterrupted:
+            # Boundary 1 of the write-path checkpoint arc: the agent just
+            # checkpointed its transcript (agent.py's on-429 save). Enrich that
+            # slot with the write-path state only the Coordinator holds — the
+            # staged batch as it exists RIGHT NOW (read from the MCP slot; may
+            # be partial if the 429 hit mid-staging — resume restores it and
+            # the stage-2 verify FAILs a partial batch against the full
+            # request) and the assembled flow turns (verify Input A). Resume
+            # then RESTORES instead of re-entering the agent loop.
+            try:
+                slot = json.loads(await self._agent.call_tool(
+                    "read_staged_workout_slot", {}))
+                if slot.get("staged_workouts"):
+                    _ckpt.enrich_checkpoint({
+                        "staged_slot":    slot["staged_workouts"],
+                        "log_flow_turns": list(self._log_flow_turns),
+                    })
+            except Exception as e:
+                # Enrichment failure must never mask the 429 — the un-enriched
+                # checkpoint still resumes via the agent path.
+                logger.warning("[coordinator] checkpoint enrichment failed: %s", e)
+            raise
+        answer = result.get("answer", "")
+        if log_boundary:
+            self._pending_log_carry = not result.get("staging_reached_confirm", False)
+        if trailing_note:
+            answer = answer.rstrip() + "\n\n" + _LOG_TRAILING_NOTE
+        if fallback_write:
+            answer = answer.rstrip() + "\n\n" + _LOG_FALLBACK_NUDGE
+        return answer
+
+    # ── Stage-2 staging verify (write-verification layer) ─────────────────────
+
+    async def verify_log_staging(self, flow_turns: list, slot_json: str,
+                                 preview: Optional[str]) -> dict:
+        """
+        ONE LLM diff call: the assembled /log-flow user turns (Input A) against
+        the staged slot JSON + its deterministic rendering (Input B). Returns
+        {"verdict": "PASS"|"FAIL"|"ERROR", "reason": str}.
+
+        FAIL is the model's verdict (B misrepresents A) — the caller suppresses
+        the confirm panel and discards the slot. ERROR is the verify machinery
+        failing (no preview, LLM exception, unparseable output) — fail-OPEN: the
+        caller proceeds to the panel (itself a human check of the slot-rendered
+        preview) and stage 3 sees a not-verified signal. Deliberately NO
+        _call_with_per_minute_retry and no retry loop: +1 call per logging turn
+        is the quota budget; a 429/503 here is an ERROR, never a blocker.
+        """
+        if not preview:
+            # A name-blind diff (opaque exercise_ids, kg-converted weights, no
+            # rendering) could spuriously FAIL a good batch — skip instead.
+            return {"verdict": "ERROR",
+                    "reason": "preview unavailable — verify skipped"}
+        request_block = "\n".join(
+            f"{i}. {t}" for i, t in enumerate(flow_turns or [], 1))
+        content = (
+            "[LOGGING REQUEST]\n" + request_block
+            + "\n\n[STAGED JSON]\n" + (slot_json or "")
+            + "\n\n[STAGED RENDERING]\n" + preview
+        )
+        try:
+            config = types.GenerateContentConfig(
+                system_instruction=_VERIFY_SYSTEM,
+                temperature=0.0,
+                max_output_tokens=256,
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
+            )
+            response = await asyncio.to_thread(
+                self._client.models.generate_content,
+                model=COORDINATOR_MODEL,
+                contents=[types.Content(
+                    role="user",
+                    parts=[types.Part.from_text(text=content)],
+                )],
+                config=config,
+            )
+            raw = ""
+            _cand  = response.candidates[0] if getattr(response, "candidates", None) else None
+            _parts = (_cand.content.parts
+                      if _cand and _cand.content and _cand.content.parts else [])
+            for part in _parts:
+                if getattr(part, "text", None):
+                    raw += part.text
+
+            raw = raw.strip()
+            if raw.startswith("```"):
+                raw = "\n".join(
+                    l for l in raw.splitlines()
+                    if not l.strip().startswith("```")
+                ).strip()
+
+            parsed  = json.loads(raw)
+            verdict = str(parsed.get("verdict", "")).strip().upper()
+            if verdict not in ("PASS", "FAIL"):
+                return {"verdict": "ERROR",
+                        "reason": f"unrecognized verdict: {parsed.get('verdict')!r}"}
+            return {"verdict": verdict, "reason": parsed.get("reason", "") or ""}
+        except Exception as e:
+            # Fail-open (incl. 429/503): the panel is still a human check and
+            # stage 3 sees not-verified. No retries by design.
+            logger.warning("[coordinator] staging verify errored: %s", e)
+            return {"verdict": "ERROR", "reason": str(e)}
 
     # ── Coverage check ────────────────────────────────────────────────────────
 

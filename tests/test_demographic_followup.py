@@ -97,7 +97,7 @@ def coord(tmp_path, monkeypatch):
     monkeypatch.setattr(ckpt, "load_checkpoint", lambda: None)
     c = Coordinator(agent_session=_FakeAgent())
 
-    async def fake_inner(q):
+    async def fake_inner(q, **kw):       # **kw: /log carry flag (ignored here)
         return {"answer": MAIN, "route": "analytical", "flagged_claims": [], "error": None}
     monkeypatch.setattr(c, "_route_with_checkpoint", fake_inner)
     return c

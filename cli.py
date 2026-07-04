@@ -11,7 +11,7 @@ load_dotenv()
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from src.agent import AgentSession
-from src.coordinator import Coordinator
+from src.coordinator import Coordinator, MSG_VERIFY_RESTATE, format_verify_fail_message
 
 # Rate-limit errors re-raised by Coordinator — mirror _is_rate_limit from coordinator.py
 try:
@@ -45,6 +45,135 @@ BANNER = """
 ╚═══════════════════════════════════════╝
 Type your question or 'exit' to quit.
 """
+
+
+async def _finalize_staged_workout(session, coordinator, result, question) -> str:
+    """
+    Stage-2 verify + caller-driven commit for a gate-approved staged batch —
+    the CLI's single execute seam, mirroring server.py's panel-branch verify
+    and /confirm workout execute (same-seam rule: web and CLI verify
+    identically). Verify FIRST: ONE LLM diff of the assembled /log-flow turns
+    against the staged slot + its deterministic rendering. FAIL discards the
+    slot immediately and asks the user to re-state (execute skipped; discard
+    BEFORE record so the FAIL verdict survives the whole-dict clear). ERROR
+    fails OPEN — the interactive gate already showed the write, and stage 3
+    sees a not-verified signal. Returns the line to print.
+    """
+    verdict = {"verdict": "ERROR", "reason": "verify unavailable"}
+    try:
+        slot_raw = await session.call_tool("read_staged_workout_slot", {})
+        fmt = json.loads(await session.call_tool(
+            "format_staged_workout_for_confirmation", {}))
+        # verify_log_staging skips the LLM (verdict ERROR) when preview is
+        # missing — a name-blind diff could spuriously FAIL a good batch.
+        verdict = await coordinator.verify_log_staging(
+            result.get("log_flow_turns") or [question],
+            slot_raw, fmt.get("preview"))
+    except Exception as exc:
+        print(f"[cli] staging verify errored: {exc}", file=sys.stderr)
+        verdict = {"verdict": "ERROR", "reason": str(exc)}
+    if verdict.get("verdict") == "FAIL":
+        try:
+            await session.call_tool("discard_staged_writes", {})
+            await session.call_tool("record_workout_verify", verdict)
+        except Exception as exc:
+            print(f"[cli] staging verify FAIL cleanup failed: {exc}", file=sys.stderr)
+        print(f"[cli] staging verify FAIL: {verdict.get('reason')}", file=sys.stderr)
+        preview = fmt.get("preview")
+        return format_verify_fail_message(preview) if preview else MSG_VERIFY_RESTATE
+    try:
+        await session.call_tool("record_workout_verify", verdict)
+    except Exception as exc:
+        print(f"[cli] record_workout_verify failed: {exc}", file=sys.stderr)
+    outcome = json.loads(await session.call_tool("execute_staged_workout", {}))
+    if outcome.get("success"):
+        session._staged_active = False
+        return f"✅ {outcome.get('message', 'Workout saved and verified.')}"
+    return f"❌ {outcome.get('message') or outcome.get('error') or 'Workout write failed — nothing was saved.'}"
+
+
+async def _confirm_restored_workout(session, coordinator, result) -> str:
+    """
+    CLI arm of the write-path restore (same seam as the server's panel
+    arming): the coordinator restored a checkpointed staged batch and
+    signalled it via result["restore_staged"]. The CLI has no panel, so the
+    restored batch passes its interactive gate: print the slot-rendered
+    preview, ask Confirm? (yes/no), yes → execute, no → discard + clear the
+    checkpoint.
+
+    Three-way verify handling mirrors the server: a checkpointed PASS verdict
+    skips the LLM (already verified — case 1); no verdict (case 2) runs the
+    stage-2 verify NOW on the restored slot with the restored flow turns as
+    Input A — FAIL discards + clears + re-states WITHOUT prompting; ERROR
+    falls THROUGH to the yes/no gate exactly like PASS (fail-open means
+    "don't block", never "skip the gate" — execute can only fire from the
+    yes branch). Returns the line to print.
+    """
+    from src import checkpoint as _ckpt
+
+    slot_raw = ""
+    preview = None
+    try:
+        slot_raw = await session.call_tool("read_staged_workout_slot", {})
+        fmt = json.loads(await session.call_tool(
+            "format_staged_workout_for_confirmation", {}))
+        preview = fmt.get("preview")
+    except Exception as exc:
+        print(f"[cli] restored-slot preview failed: {exc}", file=sys.stderr)
+
+    restored = result.get("restored_verify")
+    if isinstance(restored, dict) and restored.get("verdict") == "PASS":
+        verdict = restored              # case 1: verified pre-interruption
+    else:
+        # Case 2: the 429 hit between staging and verify — verify NOW, on the
+        # restored slot, with the restored flow turns as Input A.
+        try:
+            verdict = await coordinator.verify_log_staging(
+                result.get("log_flow_turns") or [], slot_raw, preview)
+        except Exception as exc:
+            print(f"[cli] staging verify errored: {exc}", file=sys.stderr)
+            verdict = {"verdict": "ERROR", "reason": str(exc)}
+        if verdict.get("verdict") == "FAIL":
+            try:
+                await session.call_tool("discard_staged_writes", {})
+                await session.call_tool("record_workout_verify", verdict)
+            except Exception as exc:
+                print(f"[cli] restore verify FAIL cleanup failed: {exc}",
+                      file=sys.stderr)
+            _ckpt.clear_staged_checkpoint()
+            print(f"[cli] restore verify FAIL: {verdict.get('reason')}",
+                  file=sys.stderr)
+            return format_verify_fail_message(preview) if preview else MSG_VERIFY_RESTATE
+        try:
+            await session.call_tool("record_workout_verify", verdict)
+        except Exception as exc:
+            print(f"[cli] record_workout_verify failed: {exc}", file=sys.stderr)
+
+    # PASS or ERROR (fail-open): the human gate decides — never auto-execute.
+    print(f"\n{'='*60}")
+    print("⚠️  RESTORED STAGED WORKOUT — awaiting your confirmation")
+    print(f"{'='*60}")
+    print(preview or "(preview unavailable — the staged batch is shown above)")
+    print()
+    while True:
+        reply = input("Confirm? (yes/no): ").strip().lower()
+        if reply in {"yes", "y"}:
+            outcome = json.loads(
+                await session.call_tool("execute_staged_workout", {}))
+            if outcome.get("success"):
+                session._staged_active = False
+                _ckpt.clear_staged_checkpoint()
+                return f"✅ {outcome.get('message', 'Workout saved and verified.')}"
+            return f"❌ {outcome.get('message') or outcome.get('error') or 'Workout write failed — nothing was saved.'}"
+        if reply in {"no", "n", "cancel"}:
+            try:
+                await session.call_tool("discard_staged_writes", {})
+            except Exception as exc:
+                print(f"[cli] discard on cancel failed: {exc}", file=sys.stderr)
+            _ckpt.clear_staged_checkpoint()
+            session._staged_active = False
+            return "❌ Cancelled. Nothing was saved."
+        print("Please type 'yes' or 'no'.")
 
 
 async def main() -> None:
@@ -134,16 +263,20 @@ async def main() -> None:
                     print(f"\n{result['answer']}\n")
                     # Fix 5: caller-driven commit. Every staged exercise was
                     # already approved through the gate above, so the CLI (never
-                    # the agent) runs the atomic execute+verify for the batch.
+                    # the agent) runs the stage-2 verify then the atomic
+                    # execute+verify for the batch (see _finalize_staged_workout).
                     if turn_state["staged_workout"]:
                         turn_state["staged_workout"] = False
-                        outcome = json.loads(
-                            await session.call_tool("execute_staged_workout", {}))
-                        if outcome.get("success"):
-                            session._staged_active = False
-                            print(f"✅ {outcome.get('message', 'Workout saved and verified.')}\n")
-                        else:
-                            print(f"❌ {outcome.get('message') or outcome.get('error') or 'Workout write failed — nothing was saved.'}\n")
+                        line = await _finalize_staged_workout(
+                            session, coordinator, result, question)
+                        print(f"{line}\n")
+                    elif result.get("restore_staged"):
+                        # Resume of a quota-interrupted /log turn: the
+                        # coordinator restored the checkpointed batch — pass
+                        # it through the interactive gate (never the agent).
+                        line = await _confirm_restored_workout(
+                            session, coordinator, result)
+                        print(f"{line}\n")
             except Exception as e:
                 error_str = str(e)
                 if turn_state["staged_workout"]:

@@ -53,7 +53,7 @@ def _spy_downstream(coord, monkeypatch):
         return "AN", []
     monkeypatch.setattr(coord, "_run_analytical", an)
 
-    async def op(q):
+    async def op(q, **kw):               # **kw: /log boundary flags (ignored here)
         seen["operational"] += 1
         return "OP"
     monkeypatch.setattr(coord, "_run_operational", op)

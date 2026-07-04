@@ -160,8 +160,12 @@ WRITE ACTIONS:
 - To log a workout: ask for the date if not given (never assume today), then call
   log_workout once per exercise — all in the same turn — to stage the full day.
   Then STOP — do not call execute or verify. The server commits the batch
-  automatically when the user confirms. Your answer summarizes what was staged
-  and notes it awaits the user's confirmation — never claim it was saved.
+  automatically when the user confirms. Nothing is written yet: your answer
+  MUST open by stating the workout is STAGED and awaiting the user's
+  confirmation. It MUST NOT say "logged", "saved", "recorded", or use any
+  past-tense completion phrasing — the write only happens after the user
+  confirms. (The "✅ has been saved" rule below applies ONLY to goal and
+  correction writes, never to workout staging.)
 - For goal and correction writes: when a staging tool returns staged: true, call
   the matching execute tool immediately in the same response turn. The CLI has
   already handled confirmation. Do not add any text asking the user if they want
@@ -691,6 +695,11 @@ class AgentSession:
             messages.append({"role": "user", "content": question})
         max_iterations = 12
         tool_calls_made = 0
+        # True once any execute_staged_* call is ATTEMPTED (approved or blocked
+        # pending confirmation). A complete staged batch always reaches this
+        # gate; a clarification turn never does — so the coordinator reads it
+        # to tell "staging complete" from "pending a logging clarification".
+        execute_attempted = False
 
         # Build per-question system prompt with relevant memories injected
         try:
@@ -815,6 +824,7 @@ class AgentSession:
                     "answer": final_answer,
                     "tool_calls_made": tool_calls_made,
                     "error": None,
+                    "staging_reached_confirm": execute_attempted,
                 }
 
             # Execute tool calls
@@ -824,6 +834,9 @@ class AgentSession:
                 tool_name = fc_part.function_call.name
                 arguments = dict(fc_part.function_call.args)
                 tool_call_id = tc_dict["id"]
+
+                if tool_name in _execute_tool_names:
+                    execute_attempted = True
 
                 print("[thinking...]", flush=True)
 
@@ -915,6 +928,7 @@ class AgentSession:
                     "answer": _cancelled_answer,
                     "tool_calls_made": tool_calls_made,
                     "error": None,
+                    "staging_reached_confirm": execute_attempted,
                 }
 
         self._save_exchange(messages, new_exchange_start)
@@ -927,6 +941,7 @@ class AgentSession:
             "answer": _max_iter_answer,
             "tool_calls_made": tool_calls_made,
             "error": "max_iterations_reached",
+            "staging_reached_confirm": execute_attempted,
         }
 
     # ------------------------------------------------------------------ #
