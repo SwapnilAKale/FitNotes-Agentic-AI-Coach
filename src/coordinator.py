@@ -781,7 +781,44 @@ class Coordinator:
         from route()'s checkpoint handling so a resume from
         completed_stage='classify' can re-enter here directly (re-running the
         cheap classify call) without re-triggering checkpoint logic.
+
+        Facade over the parent coordinator graph
+        (src/graph/coordinator_graph.py): entry_boundary evaluates the
+        deterministic /log-boundary, carry, filler, and write-intent
+        pre-guards BEFORE any LLM; a conditional edge routes to the classify
+        router node or short-circuits straight to the operational dispatch.
+        There is no analytical→operational edge — the clean-fail handling
+        lives inside the dispatch_analytical node. Node bodies are the
+        _node_* methods below (verbatim code motion); return-dict contract
+        unchanged.
         """
+        from src.graph.coordinator_graph import get_coordinator_graph
+        from src.graph.persistence import cleanup_turn, new_turn_id, turn_config
+        from src.graph.state import GraphRunContext, RunCache
+
+        turn_id = new_turn_id()
+        state = await get_coordinator_graph().ainvoke(
+            {
+                "question": question,
+                "log_carry": log_carry,
+                "flow_turns": list(flow_turns or []),
+            },
+            turn_config(turn_id),
+            context=GraphRunContext(coordinator=self, cache=RunCache()),
+        )
+        cleanup_turn(turn_id)
+        return state["result"]
+
+    # ── Parent graph node bodies (verbatim code motion) ──────────────────────
+
+    def _node_entry_boundary(self, state: dict) -> dict:
+        """Node: the deterministic pre-LLM guards — /log boundary, carry
+        consume, filler short-circuit, write-intent regex — evaluated BEFORE
+        the classify router (the conditional edge reads this node's output)."""
+        question   = state["question"]
+        log_carry  = state.get("log_carry", False)
+        flow_turns = state.get("flow_turns")
+
         # ── 0a. /log deterministic write boundary ────────────────────────────
         # Detected HERE (not route()) so a "/log ..." stashed as the checkpoint
         # discard-confirm pending_question re-detects intact when re-processed.
@@ -816,14 +853,22 @@ class Coordinator:
         if not log_boundary:
             filler = _filler_reply(question)
             if filler is not None:
-                return self._filler_response(filler)
+                return {
+                    "question":      question,
+                    "log_boundary":  log_boundary,
+                    "trailing_note": trailing_note,
+                    "result":        self._filler_response(filler),
+                }
 
-        # ── 1. Classify (or short-circuit for obvious write operations) ──────
+        # ── 1. Deterministic write short-circuit (pre-guard, BEFORE classify) ─
         # Misrouting a write to analytical bypasses the confirmation gate.
         # /log boundary = trusted user signal, no inference. The regex guard
         # below it is UNTOUCHED and now the fallback: it fires only when no
         # /log prefix (and no carry), and only then the answer gets the nudge.
+        # A non-None params here makes the conditional edge skip the classify
+        # node entirely — the LLM router is never spent on a real write.
         fallback_write = False
+        params = None
         if log_boundary:
             params = {
                 "route":             "operational",
@@ -845,94 +890,115 @@ class Coordinator:
                 "needs_custom_sql":  False,
                 "custom_sql_intent": None,
             }
-        else:
-            # Per-minute 429s retry silently in-request; a DAILY 429 (or
-            # exhausted per-minute retries) closes the classify-stage gap by
-            # checkpointing at 'classify' (nothing paid → draft=null) and
-            # surfacing the resume status, instead of re-raising unprotected.
-            try:
-                params = await self._call_with_per_minute_retry(
-                    self._classify, question)
-            except Exception as e:
-                if _is_rate_limit(e):
-                    _ckpt.save_checkpoint(
-                        route="analytical", question=question,
-                        params=None, completed_stage="classify",
-                    )
-                    raise _ckpt.QuotaInterrupted(e, _ckpt.msg_draft_interrupted(e))
-                raise
 
-        # ── 1b. Parse-failure cheap default (#5b) ────────────────────────────
-        # If _classify could not PARSE the model output (vs. parsed-but-uncertain,
-        # which Step C correctly defaults analytical), the input is effectively
-        # garbage — do NOT build a ~358KB package and run analyze+ground on it
-        # (a bare "ok" would have the classifier invent muscle_groups=['Legs']).
-        # Return a cheap rephrase prompt instead. This ONLY changes the
-        # unparseable/errored case; parsed-but-uncertain still goes analytical.
-        if params.get("_parse_failed"):
-            return self._unparseable_response()
+        return {
+            "question":       question,
+            "log_boundary":   log_boundary,
+            "trailing_note":  trailing_note,
+            "fallback_write": fallback_write,
+            "params":         params,
+        }
 
-        route  = params.get("route", "analytical")
-
-        # ── Out-of-scope: refuse at classification time. No package build, no
-        # agent turn, no search, no analysis LLM call — the refusal IS the
-        # classifier's output, so a non-fitness question costs only the classify.
-        if route == "out_of_scope":
-            return self._out_of_scope_response()
-
-        # ── 2. Route ──────────────────────────────────────────────────────────
-        flagged = []
-        error   = None
-
-        if route == "analytical":
-            try:
-                answer, flagged = await self._run_analytical(question, params)
-            except DataAgentIntegrityError as e:
-                ids_str = ", ".join(v.invariant_id for v in e.violations)
-                logger.error(
-                    "[coordinator] data integrity check failed: %s\n  %s",
-                    ids_str,
-                    "\n  ".join(
-                        f"{v.invariant_id}: {v.message}" for v in e.violations
-                    ),
+    async def _node_classify(self, state: dict) -> dict:
+        """Node: the classify LLM router — reached only when no deterministic
+        pre-guard fired (the conditional edge enforces the old statement
+        order structurally)."""
+        question = state["question"]
+        # Per-minute 429s retry silently in-request; a DAILY 429 (or
+        # exhausted per-minute retries) closes the classify-stage gap by
+        # checkpointing at 'classify' (nothing paid → draft=null) and
+        # surfacing the resume status, instead of re-raising unprotected.
+        try:
+            params = await self._call_with_per_minute_retry(
+                self._classify, question)
+        except Exception as e:
+            if _is_rate_limit(e):
+                _ckpt.save_checkpoint(
+                    route="analytical", question=question,
+                    params=None, completed_stage="classify",
                 )
-                error  = str(e)
-                answer = (
-                    f"I cannot answer this question right now. "
-                    f"A data integrity check failed ({ids_str}). "
-                    f"The analytical pipeline was stopped to prevent "
-                    f"incorrect analysis from reaching you. "
-                    f"Please try again or contact support if this persists."
-                )
-            except Exception as e:
-                # An analytical-pipeline failure NEVER falls back to operational:
-                # post-strip, operational has no read tools and would fabricate an
-                # answer. Mirror the resume path's contract — retry/clean-fail only.
-                if _is_rate_limit(e):
-                    raise                              # 429 → server countdown (unchanged)
-                elif _is_transient_server_error(e):
-                    # The per-stage retry already tried; this 503 is persistent.
-                    # Clean-fail (no checkpoint, no reroute) — say try again.
-                    logger.warning(
-                        "[coordinator] analytical pipeline hit a transient 503: %s", e)
-                    error  = str(e)
-                    answer = _MSG_MODEL_BUSY
-                else:
-                    # Genuine pipeline bug — surface a clean failure, never operational.
-                    # logger.exception captures the traceback: the user only sees the
-                    # clean _MSG_PIPELINE_ERROR, so the log is the sole debug surface.
-                    logger.exception("[coordinator] analytical pipeline failed: %s", e)
-                    error  = str(e)
-                    answer = _MSG_PIPELINE_ERROR
-                # route stays "analytical": the request WAS analytical and simply
-                # could not complete.
-        else:
-            answer = await self._run_operational(
-                question,
-                log_boundary=log_boundary,
-                fallback_write=fallback_write,
-                trailing_note=trailing_note,
+                raise _ckpt.QuotaInterrupted(e, _ckpt.msg_draft_interrupted(e))
+            raise
+
+        # Parse-failure (#5b) and out_of_scope are routed by the conditional
+        # edge on this node's output: unparseable input never builds a
+        # ~358KB package, an out-of-scope question costs only the classify —
+        # the refusal IS the classifier's output.
+        return {"params": params}
+
+    async def _node_dispatch_analytical(self, state: dict) -> dict:
+        """Node: the analytical lane dispatch + clean-fail contract. There is
+        NO edge from here to the operational lane: an exception aborts or
+        degrades to a clean-fail message, it never switches lanes."""
+        question = state["question"]
+        params   = state["params"]
+        flagged  = []
+        error    = None
+
+        try:
+            answer, flagged = await self._run_analytical(question, params)
+        except DataAgentIntegrityError as e:
+            ids_str = ", ".join(v.invariant_id for v in e.violations)
+            logger.error(
+                "[coordinator] data integrity check failed: %s\n  %s",
+                ids_str,
+                "\n  ".join(
+                    f"{v.invariant_id}: {v.message}" for v in e.violations
+                ),
             )
+            error  = str(e)
+            answer = (
+                f"I cannot answer this question right now. "
+                f"A data integrity check failed ({ids_str}). "
+                f"The analytical pipeline was stopped to prevent "
+                f"incorrect analysis from reaching you. "
+                f"Please try again or contact support if this persists."
+            )
+        except Exception as e:
+            # An analytical-pipeline failure NEVER falls back to operational:
+            # post-strip, operational has no read tools and would fabricate an
+            # answer. Mirror the resume path's contract — retry/clean-fail only.
+            if _is_rate_limit(e):
+                raise                              # 429 → server countdown (unchanged)
+            elif _is_transient_server_error(e):
+                # The per-stage retry already tried; this 503 is persistent.
+                # Clean-fail (no checkpoint, no reroute) — say try again.
+                logger.warning(
+                    "[coordinator] analytical pipeline hit a transient 503: %s", e)
+                error  = str(e)
+                answer = _MSG_MODEL_BUSY
+            else:
+                # Genuine pipeline bug — surface a clean failure, never operational.
+                # logger.exception captures the traceback: the user only sees the
+                # clean _MSG_PIPELINE_ERROR, so the log is the sole debug surface.
+                logger.exception("[coordinator] analytical pipeline failed: %s", e)
+                error  = str(e)
+                answer = _MSG_PIPELINE_ERROR
+            # route stays "analytical": the request WAS analytical and simply
+            # could not complete.
+        return {"answer": answer, "flagged_claims": flagged, "error": error}
+
+    async def _node_dispatch_operational(self, state: dict) -> dict:
+        """Node: the operational lane dispatch. _run_operational resolves on
+        the instance at call time (byte-identical method — it arms the /log
+        carry and enriches the checkpoint on QuotaInterrupted exactly as
+        before)."""
+        answer = await self._run_operational(
+            state["question"],
+            log_boundary=state.get("log_boundary", False),
+            fallback_write=state.get("fallback_write", False),
+            trailing_note=state.get("trailing_note", False),
+        )
+        return {"answer": answer, "flagged_claims": [], "error": None}
+
+    def _node_finalize_turn(self, state: dict) -> dict:
+        """Node: conversation-history update + the contracted return dict.
+        Terminal short-circuits (filler / unparseable / out-of-scope) bypass
+        this node, so they never enter history — the hand-built behavior."""
+        question       = state["question"]
+        answer         = state["answer"]
+        log_boundary   = state.get("log_boundary", False)
+        fallback_write = state.get("fallback_write", False)
 
         # ── 3. Update conversation history ────────────────────────────────────
         self._history.append({"role": "user",      "content": question})
@@ -940,18 +1006,18 @@ class Coordinator:
         if len(self._history) > CONTEXT_WINDOW * 2:
             self._history = self._history[-(CONTEXT_WINDOW * 2):]
 
-        return {
+        return {"result": {
             "answer":         answer,
-            "route":          route,
-            "flagged_claims": flagged,
-            "error":          error,
+            "route":          (state.get("params") or {}).get("route", "analytical"),
+            "flagged_claims": state.get("flagged_claims") or [],
+            "error":          state.get("error"),
             "log_boundary":   log_boundary,
             # Stage-2 verify Input A: the assembled workout-portion turns of
             # this flow, present only on write-shaped turns (callers fall back
             # to the raw message when absent).
             "log_flow_turns": (list(self._log_flow_turns)
                                if (log_boundary or fallback_write) else None),
-        }
+        }}
 
     # ── Per-minute silent retry ───────────────────────────────────────────────
 
