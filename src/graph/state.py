@@ -97,14 +97,16 @@ class RunCache:
         self.gemini_contents: Optional[list] = None   # live types.Content
         self.effective_prompt: Optional[str] = None
 
-    async def ensure_package(self, coordinator, params: dict) -> dict:
-        """Rebuild-on-resume: return the package, building it from params via
-        the coordinator's package stage if the cache is empty (fresh process
-        resume). The build path goes through the same module seam
+    async def ensure_package(self, coordinator, state: dict) -> dict:
+        """Rebuild-on-resume: return the package, rebuilding it from the
+        persisted params + resolved scope if the cache is empty. On the
+        normal path build_package already populated the cache; the rebuild
+        fires only when a node runs in a process where it didn't (defensive
+        resume). The rebuild goes through the same module seam
         (coordinator-module ``prepare_analysis_package``) as a fresh run.
         """
         if self.pkg is None:
-            self.pkg = await coordinator._build_package_from_params(params)
+            self.pkg = await coordinator._rebuild_package_for_state(state)
         return self.pkg
 
 

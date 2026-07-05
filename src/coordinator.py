@@ -1337,22 +1337,54 @@ class Coordinator:
         resume:   Optional[dict] = None,
     ) -> tuple[str, list]:
         """
-        Full analytical pipeline:
-          1. prepare_analysis_package() with extracted params
-          2. analysis_agent.analyze() → draft
-          3. analysis_agent.ground_check() → verified answer + edits
-          4. coverage check → if incomplete, one retry with gap context
+        Full analytical pipeline — facade over the analytical subgraph
+        (src/graph/analytical.py), a linear node chain:
+          resolve_scope → build_package → draft → ground → coverage →
+          display_fidelity
+        Each node body is a _stage_* method below (verbatim code motion).
 
         resume: a checkpoint slot dict. The package always rebuilds (free,
-        re-validated — G6 etc. still apply); a stored draft skips the draft
-        LLM call and is verified VERBATIM.
+        re-validated — G6 etc. still apply) inside build_package; a stored
+        draft (state resume_draft) skips the draft LLM call and is verified
+        VERBATIM; completed_stage=="coverage" skips grounding too. The
+        package itself rides in the non-persisted RunCache — it never enters
+        graph state, so the SqliteSaver checkpoints hold only params + the
+        verbatim draft/answer.
 
         Stage-boundary 429 handling: each LLM stage saves a checkpoint of
         the last COMPLETED stage and raises QuotaInterrupted (status text
-        only — never draft content).
+        only — never draft content); the exception aborts the graph run and
+        propagates unchanged.
 
         Returns (final_answer, flagged_claims).
         """
+        from src.graph.analytical import get_analytical_graph
+        from src.graph.persistence import cleanup_turn, new_turn_id, turn_config
+        from src.graph.state import GraphRunContext, RunCache
+
+        turn_id = new_turn_id()
+        state = await get_analytical_graph().ainvoke(
+            {
+                "question": question,
+                "params": params,
+                "resume_completed_stage": (resume or {}).get("completed_stage"),
+                "resume_draft": (resume or {}).get("draft"),
+            },
+            turn_config(turn_id, "analytical"),
+            context=GraphRunContext(coordinator=self, cache=RunCache()),
+        )
+        cleanup_turn(turn_id)
+        if state.get("early_answer") is not None:
+            return state["early_answer"], []
+        return state["answer"], state.get("flagged", [])
+
+    # ── Analytical graph node bodies (verbatim code motion) ──────────────────
+
+    async def _stage_resolve_scope(self, state: dict) -> dict:
+        """Node: Category guard + exercise-name resolution + canonical
+        muscle groups (old pipeline head). Disambiguation produces
+        early_answer — the graph exits without building the package."""
+        params = state["params"]
         exercise_names    = params.get("exercise_names")
         if exercise_names:
             exercise_names = [n.strip() for n in exercise_names]
@@ -1405,19 +1437,31 @@ class Coordinator:
                     # Genuine ambiguity: surface candidates so the user can clarify
                     # rather than silently guessing the first one.
                     names_list = "\n".join(f"- {c}" for c in candidates[:5])
-                    return (
+                    return {"early_answer": (
                         f"I found multiple exercises matching **{name}**. "
                         f"Which one did you mean?\n\n{names_list}\n\n"
-                        f"Please let me know and I'll answer your question.",
-                        [],
-                    )
+                        f"Please let me know and I'll answer your question."
+                    )}
                 else:
                     # No match — keep original so the package reports it as unresolved
                     resolved.append(name)
             exercise_names = resolved
         # muscle_groups already computed above by the Category guard (canonical,
         # including any category terms moved out of exercise_names).
-        muscle_groups     = muscle_groups or None
+        return {
+            "exercise_names": exercise_names,
+            "muscle_groups": muscle_groups or None,
+        }
+
+    async def _stage_build_package(self, state: dict, cache) -> dict:
+        """Node: ONE pure call builds the analytical package (Data Agent
+        fetch/process/validate stay inside prepare_analysis_package — never
+        decomposed); scope notes + memories + conversation context follow.
+        The package lands in the non-persisted RunCache, NOT in state."""
+        question          = state["question"]
+        params            = state["params"]
+        exercise_names    = state.get("exercise_names")
+        muscle_groups     = state.get("muscle_groups")
         query_period_days = params.get("query_period_days", 90)
 
         # 6b: parameterized PR targets. rep_target threads straight through; the cardio
@@ -1507,11 +1551,31 @@ class Coordinator:
         except Exception:
             memories = None
 
-        # ── Stage: DRAFT (supplementary SQL + analyze) ─────────────────────────
-        # A stored draft (resume) is used VERBATIM — the draft LLM call is
-        # skipped entirely; only the remaining verification stages run.
+        cache.pkg                  = pkg
+        cache.research             = research
+        cache.memories             = memories
+        cache.conversation_context = conversation_context
+        return {
+            "scoped_question":  scoped_question,
+            "unresolved_names": unresolved_names,
+            "effective_names":  effective_names,
+        }
+
+    async def _stage_draft(self, state: dict, cache) -> dict:
+        """Node: supplementary SQL + analyze → stripped draft + grounding
+        context (in cache). A stored draft (resume) is used VERBATIM — the
+        draft LLM call is skipped entirely; only the remaining verification
+        stages run."""
+        question        = state["question"]
+        params          = state["params"]
+        scoped_question = state["scoped_question"]
+        pkg             = await cache.ensure_package(self, state)
+        research        = cache.research
+        memories        = cache.memories
+        conversation_context = cache.conversation_context
+
         custom_query = None
-        draft = (resume or {}).get("draft") if resume else None
+        draft = state.get("resume_draft")
         if draft is not None:
             logger.info(
                 "[coordinator] resume: stored draft (%d chars) used verbatim — "
@@ -1556,15 +1620,30 @@ class Coordinator:
             draft = _cite.strip_tags(draft_tagged)
             gctx  = _cite.build_grounding_context(cited, pkg)
 
-        # ── Stage: GROUNDING ───────────────────────────────────────────────────
-        # POLICY: the user never sees unverified draft text. On interruption
-        # the verbatim draft is checkpointed and only a status message ships.
+        cache.gctx         = gctx
+        cache.custom_query = custom_query
+        return {"draft": draft}
+
+    async def _stage_ground(self, state: dict, cache) -> dict:
+        """Node: grounding verification. POLICY: the user never sees
+        unverified draft text. On interruption the verbatim draft is
+        checkpointed and only a status message ships."""
+        question = state["question"]
+        params   = state["params"]
+        draft    = state["draft"]
         flagged: list = []
-        if resume and resume.get("completed_stage") == "coverage":
+        if state.get("resume_completed_stage") == "coverage":
             # Grounding completed before the interruption — the stored text
             # is already verified; only the coverage stage remains.
             answer = draft
         else:
+            gctx = cache.gctx
+            if gctx is None:
+                # Defensive resume path: grounding context is package-derived
+                # and never persisted — rebuild the whole-package fallback,
+                # exactly like the stored-draft branch.
+                gctx = _cite.build_grounding_context(
+                    [], await cache.ensure_package(self, state))
             logger.info("[coordinator] grounding path: %s", gctx.get("mode"))
             try:
                 answer, flagged = await self._call_with_per_minute_retry(
@@ -1577,8 +1656,22 @@ class Coordinator:
                     )
                     raise _ckpt.QuotaInterrupted(e, _ckpt.MSG_VERIFY_INTERRUPTED)
                 raise
+        return {"answer": answer, "flagged": flagged}
 
-        # ── Stage: COVERAGE (question + answer only, no data; 1 retry) ────────
+    async def _stage_coverage(self, state: dict, cache) -> dict:
+        """Node: coverage check (question + answer only, no data; 1 retry
+        re-running analyze+ground INSIDE this node — the chain stays
+        linear, exactly as the hand-built code did)."""
+        question        = state["question"]
+        params          = state["params"]
+        scoped_question = state["scoped_question"]
+        answer          = state["answer"]
+        flagged         = list(state.get("flagged") or [])
+        pkg             = await cache.ensure_package(self, state)
+        research        = cache.research
+        memories        = cache.memories
+        conversation_context = cache.conversation_context
+        custom_query    = cache.custom_query
         try:
             answer, complete = await self._call_with_per_minute_retry(
                 self._coverage_check, question, answer)
@@ -1620,6 +1713,22 @@ class Coordinator:
                 )
                 raise _ckpt.QuotaInterrupted(e, _ckpt.MSG_VERIFY_INTERRUPTED)
             raise
+        return {"answer": answer, "flagged": flagged}
+
+    async def _stage_display_fidelity(self, state: dict, cache) -> dict:
+        """Node: deterministic display-sets verbatim-integrity check +
+        unresolved-names prefix + memory-extraction recording (old pipeline
+        tail)."""
+        question         = state["question"]
+        scoped_question  = state["scoped_question"]
+        answer           = state["answer"]
+        unresolved_names = state.get("unresolved_names")
+        effective_names  = state.get("effective_names")
+        pkg              = await cache.ensure_package(self, state)
+        research         = cache.research
+        memories         = cache.memories
+        conversation_context = cache.conversation_context
+        custom_query     = cache.custom_query
 
         # ── Stage: DISPLAY SETS CHECK (deterministic verbatim-integrity) ───────
         # When the package carries pre-formatted display strings, grounding
@@ -1688,7 +1797,25 @@ class Coordinator:
         if self._agent is not None and answer:
             self._agent.record_external_exchange(question, answer)
 
-        return answer, flagged
+        return {"answer": answer}
+
+    async def _rebuild_package_for_state(self, state: dict) -> dict:
+        """Rebuild the analytical package from persisted params + resolved
+        scope (RunCache.ensure_package's rebuild-on-resume path). Pure
+        Python, re-validated — the same call expression as
+        _stage_build_package, through the same module-global seam."""
+        params = state.get("params") or {}
+        pkg = await asyncio.to_thread(
+            prepare_analysis_package,
+            query_period_days=params.get("query_period_days", 90),
+            exercise_names=state.get("exercise_names"),
+            muscle_groups=state.get("muscle_groups"),
+            include_phase2=True,
+            reps_floor=params.get("rep_target"),
+            cardio_lock=_normalize_cardio_lock(params.get("cardio_lock")),
+        )
+        pkg.pop("unresolved_exercise_names", None)
+        return pkg
 
     # ── Custom SQL ────────────────────────────────────────────────────────────
 
