@@ -68,6 +68,7 @@ class OperationalState(TypedDict, total=False):
     """
 
     question: str
+    resume_messages: Optional[list]   # quota-interrupted exchange from the slot
     messages: list
     new_exchange_start: int
     iteration: int

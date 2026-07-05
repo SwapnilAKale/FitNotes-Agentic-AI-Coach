@@ -19,6 +19,7 @@ because user-facing resume flows through the JSON slot with a new turn id.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import sqlite3
@@ -26,6 +27,44 @@ import uuid
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+def _make_async_compat_saver_class():
+    """Sync SqliteSaver + executor-based async methods.
+
+    langgraph-checkpoint-sqlite's sync saver deliberately raises
+    NotImplementedError from its a* methods; AsyncSqliteSaver needs an
+    aiosqlite connection whose lifetime is bound to one event loop — but the
+    CLI/tests run one asyncio.run() per turn, so the saver must be
+    loop-agnostic. asyncio.to_thread over the sync methods (with
+    check_same_thread=False) gives exactly the executor-wrapper behavior the
+    graphs need. (Flagged deviation: the design assumed built-in wrappers.)
+    """
+    from langgraph.checkpoint.sqlite import SqliteSaver
+
+    class AsyncCompatSqliteSaver(SqliteSaver):
+        async def aget_tuple(self, config):
+            return await asyncio.to_thread(self.get_tuple, config)
+
+        async def alist(self, config, *, filter=None, before=None, limit=None):
+            items = await asyncio.to_thread(
+                lambda: list(self.list(config, filter=filter, before=before, limit=limit))
+            )
+            for item in items:
+                yield item
+
+        async def aput(self, config, checkpoint, metadata, new_versions):
+            return await asyncio.to_thread(
+                self.put, config, checkpoint, metadata, new_versions)
+
+        async def aput_writes(self, config, writes, task_id, task_path=""):
+            return await asyncio.to_thread(
+                self.put_writes, config, writes, task_id, task_path)
+
+        async def adelete_thread(self, thread_id):
+            return await asyncio.to_thread(self.delete_thread, thread_id)
+
+    return AsyncCompatSqliteSaver
 
 # Worst case operational run: 12 iterations x (agent_step + exec_tools) plus
 # prepare/finalize supersteps ~ 28. LangGraph's default recursion_limit of 25
@@ -55,11 +94,20 @@ def get_saver():
     path = _default_path()
     if _saver is not None and path == _saver_path:
         return _saver
+    if _saver is not None:
+        # Release the previous sqlite handle so a test's tmp dir can be
+        # removed on Windows.
+        try:
+            conn = getattr(_saver, "conn", None)
+            if conn is not None:
+                conn.close()
+        except Exception:
+            pass
     try:
-        from langgraph.checkpoint.sqlite import SqliteSaver
+        saver_cls = _make_async_compat_saver_class()
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(path, check_same_thread=False)
-        _saver = SqliteSaver(conn)
+        _saver = saver_cls(conn)
     except Exception as e:
         logger.warning(
             "[graph] SqliteSaver unavailable at %s (%s) — falling back to "

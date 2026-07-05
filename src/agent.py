@@ -21,6 +21,20 @@ MODEL = "gemini-3.1-flash-lite"
 
 SERVERS_DIR = Path(__file__).parent.parent / "mcp_servers"
 
+# Hoisted from the old answer() loop locals (unchanged values): the write
+# tools guarded by the confirmation gate, and the execute-stage tools whose
+# ATTEMPT flips staging_reached_confirm.
+_EXECUTE_TOOL_NAMES = {"execute_staged_workout", "execute_staged_goal"}
+
+WRITE_TOOLS = {
+    "log_workout", "set_goal", "log_bodyweight",
+    "execute_staged_workout", "execute_staged_goal",
+    "update_goal", "execute_staged_goal_update",
+    "delete_goal", "execute_staged_goal_delete",
+    "update_workout_set", "execute_staged_set_update",
+    "delete_workout_set", "execute_staged_set_delete",
+}
+
 SYSTEM_PROMPT = f"""Today's date is {_date.today().strftime('%Y-%m-%d')}.
 
 DATE RESOLUTION RULE: When the user mentions a date without a year (e.g. 'May 17', 'December 25'):
@@ -663,10 +677,38 @@ class AgentSession:
              {"role": "assistant", "content": answer}], 0)
 
     # ------------------------------------------------------------------ #
-    #  Main answer loop                                                    #
+    #  Main answer loop (LangGraph operational subgraph)                   #
     # ------------------------------------------------------------------ #
 
     async def answer(self, question: str, resume_messages: list | None = None) -> dict:
+        """
+        Facade over the operational subgraph (src/graph/operational.py).
+        The hand-written ReAct loop became graph topology: prepare →
+        agent_step ⇄ exec_tools with conditional edges to the finalize
+        nodes. Every node body is an _op_* method below (verbatim code
+        motion); the live Gemini contents ride in the non-persisted
+        RunCache so thought_signature objects never touch the checkpointer.
+        Return dict contract unchanged.
+        """
+        from src.graph.operational import get_operational_graph
+        from src.graph.persistence import cleanup_turn, new_turn_id, turn_config
+        from src.graph.state import GraphRunContext, RunCache
+
+        turn_id = new_turn_id()
+        state = await get_operational_graph().ainvoke(
+            {"question": question, "resume_messages": resume_messages},
+            turn_config(turn_id, "operational"),
+            context=GraphRunContext(session=self, cache=RunCache()),
+        )
+        cleanup_turn(turn_id)
+        return state["result"]
+
+    # ── Graph node bodies (verbatim code motion from the old answer() loop) ──
+
+    def _op_prepare(self, state: dict, cache) -> dict:
+        """Node: message assembly + per-question system prompt (old loop head)."""
+        question = state["question"]
+        resume_messages = state.get("resume_messages")
         history_messages: list[dict] = [
             msg for exchange in self._conversation_history for msg in exchange
         ]
@@ -693,13 +735,6 @@ class AgentSession:
             })
         else:
             messages.append({"role": "user", "content": question})
-        max_iterations = 12
-        tool_calls_made = 0
-        # True once any execute_staged_* call is ATTEMPTED (approved or blocked
-        # pending confirmation). A complete staged batch always reaches this
-        # gate; a clarification turn never does — so the coordinator reads it
-        # to tell "staging complete" from "pending a logging clarification".
-        execute_attempted = False
 
         # Build per-question system prompt with relevant memories injected
         try:
@@ -711,238 +746,279 @@ class AgentSession:
             )
         except Exception:
             effective_prompt = self._base_system_prompt
-
-        _execute_tool_names = {"execute_staged_workout", "execute_staged_goal"}
-
-        WRITE_TOOLS = {
-            "log_workout", "set_goal", "log_bodyweight",
-            "execute_staged_workout", "execute_staged_goal",
-            "update_goal", "execute_staged_goal_update",
-            "delete_goal", "execute_staged_goal_delete",
-            "update_workout_set", "execute_staged_set_update",
-            "delete_workout_set", "execute_staged_set_delete",
-        }
+        cache.effective_prompt = effective_prompt
 
         # Build Gemini contents once; updated incrementally to preserve thought_signature
-        gemini_contents = self._convert_messages_to_contents(messages)
+        cache.gemini_contents = self._convert_messages_to_contents(messages)
 
-        for iteration in range(max_iterations):
-            # Force at least one tool call on the first iteration
-            tool_config = types.ToolConfig(
-                function_calling_config=types.FunctionCallingConfig(mode="ANY")
-            ) if iteration == 0 else None
+        # execute_attempted: True once any execute_staged_* call is ATTEMPTED
+        # (approved or blocked pending confirmation). A complete staged batch
+        # always reaches this gate; a clarification turn never does — so the
+        # coordinator reads it to tell "staging complete" from "pending a
+        # logging clarification".
+        return {
+            "messages": messages,
+            "new_exchange_start": new_exchange_start,
+            "iteration": 0,
+            "tool_calls_made": 0,
+            "execute_attempted": False,
+            "write_cancelled": False,
+        }
 
-            if self._cache_name:
-                iter_config = types.GenerateContentConfig(
-                    cached_content=self._cache_name,
-                    tool_config=tool_config,
-                    temperature=0.3,
-                    max_output_tokens=4000,
-                    thinking_config=types.ThinkingConfig(thinking_budget=1024),
+    async def _op_agent_step(self, state: dict, cache) -> dict:
+        """Node: ONE Gemini tool-calling step (old loop iteration head)."""
+        question = state["question"]
+        messages = state["messages"]
+        iteration = state["iteration"]
+        gemini_contents = cache.gemini_contents
+
+        # Force at least one tool call on the first iteration
+        tool_config = types.ToolConfig(
+            function_calling_config=types.FunctionCallingConfig(mode="ANY")
+        ) if iteration == 0 else None
+
+        if self._cache_name:
+            iter_config = types.GenerateContentConfig(
+                cached_content=self._cache_name,
+                tool_config=tool_config,
+                temperature=0.3,
+                max_output_tokens=4000,
+                thinking_config=types.ThinkingConfig(thinking_budget=1024),
+            )
+        else:
+            iter_config = types.GenerateContentConfig(
+                system_instruction=cache.effective_prompt,
+                tools=self._gemini_tools,
+                tool_config=tool_config,
+                temperature=0.3,
+                max_output_tokens=4000,
+                thinking_config=types.ThinkingConfig(thinking_budget=1024),
+            )
+
+        try:
+            combined_text, fc_parts, model_content = await asyncio.to_thread(
+                self._run_collect,
+                gemini_contents,
+                iter_config,
+            )
+            if model_content is not None:
+                gemini_contents.append(model_content)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if _ckpt.is_rate_limit(exc):
+                # Checkpoint the exchange so 'continue' resumes the loop
+                # without re-running completed tool calls. Tool results
+                # are mechanically pruned on save (head+tail, no LLM).
+                try:
+                    _ckpt.save_checkpoint(
+                        route="operational",
+                        question=question,
+                        messages=messages[state["new_exchange_start"]:],
+                    )
+                except Exception:
+                    pass  # checkpoint failure must not mask the 429
+                raise _ckpt.QuotaInterrupted(
+                    exc, _ckpt.MSG_OPERATIONAL_INTERRUPTED
                 )
-            else:
-                iter_config = types.GenerateContentConfig(
-                    system_instruction=effective_prompt,
-                    tools=self._gemini_tools,
-                    tool_config=tool_config,
-                    temperature=0.3,
-                    max_output_tokens=4000,
-                    thinking_config=types.ThinkingConfig(thinking_budget=1024),
-                )
+            raise  # Let cli.py handle all errors cleanly
+
+        # Store assistant turn in OpenAI-format dict for history
+        msg_dict: dict = {"role": "assistant", "content": combined_text}
+        if fc_parts:
+            msg_dict["tool_calls"] = [
+                {
+                    "id": f"call_{iteration}_{i}",
+                    "type": "function",
+                    "function": {
+                        "name": p.function_call.name,
+                        "arguments": json.dumps(dict(p.function_call.args)),
+                    },
+                }
+                for i, p in enumerate(fc_parts)
+            ]
+        messages.append(msg_dict)
+
+        return {
+            "messages": messages,
+            "has_tool_calls": bool(fc_parts),
+            "last_text": combined_text,
+        }
+
+    async def _op_exec_tools(self, state: dict, cache) -> dict:
+        """Node: execute the pending tool calls over MCP, including the
+        WRITE_TOOLS confirmation gate (old loop tool-execution block). The
+        custom tools node — names/args come from the assistant message's
+        tool_calls (the same data the old fc_parts zip carried)."""
+        messages = state["messages"]
+        tool_calls = messages[-1].get("tool_calls") or []
+        execute_attempted = state["execute_attempted"]
+        gemini_contents = cache.gemini_contents
+
+        write_cancelled = False
+        tool_response_parts: list = []
+        for tc_dict in tool_calls:
+            tool_name = tc_dict["function"]["name"]
+            arguments = json.loads(tc_dict["function"]["arguments"])
+            tool_call_id = tc_dict["id"]
+
+            if tool_name in _EXECUTE_TOOL_NAMES:
+                execute_attempted = True
+
+            print("[thinking...]", flush=True)
+
+            if tool_name in WRITE_TOOLS and self.confirmation_handler:
+                approved = await self.confirmation_handler(tool_name, arguments)
+                if not approved:
+                    result = json.dumps({
+                        "cancelled": True,
+                        "message": "Write action cancelled by user. No changes were made.",
+                    })
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "content": result,
+                    })
+                    tool_response_parts.append(types.Part.from_function_response(
+                        name=tool_name,
+                        response={"cancelled": True, "message": "Write action cancelled by user. No changes were made."},
+                    ))
+                    write_cancelled = True
+                    continue
 
             try:
-                combined_text, fc_parts, model_content = await asyncio.to_thread(
-                    self._run_collect,
-                    gemini_contents,
-                    iter_config,
-                )
-                if model_content is not None:
-                    gemini_contents.append(model_content)
-            except asyncio.CancelledError:
-                raise
+                result = await self.call_tool(tool_name, arguments)
             except Exception as exc:
-                if _ckpt.is_rate_limit(exc):
-                    # Checkpoint the exchange so 'continue' resumes the loop
-                    # without re-running completed tool calls. Tool results
-                    # are mechanically pruned on save (head+tail, no LLM).
-                    try:
-                        _ckpt.save_checkpoint(
-                            route="operational",
-                            question=question,
-                            messages=messages[new_exchange_start:],
-                        )
-                    except Exception:
-                        pass  # checkpoint failure must not mask the 429
-                    raise _ckpt.QuotaInterrupted(
-                        exc, _ckpt.MSG_OPERATIONAL_INTERRUPTED
-                    )
-                raise  # Let cli.py handle all errors cleanly
+                result = f"Tool error: {exc}"
 
-            # Store assistant turn in OpenAI-format dict for history
-            msg_dict: dict = {"role": "assistant", "content": combined_text}
-            if fc_parts:
-                msg_dict["tool_calls"] = [
-                    {
-                        "id": f"call_{iteration}_{i}",
-                        "type": "function",
-                        "function": {
-                            "name": p.function_call.name,
-                            "arguments": json.dumps(dict(p.function_call.args)),
-                        },
-                    }
-                    for i, p in enumerate(fc_parts)
-                ]
-            messages.append(msg_dict)
+            if len(result) > 800:
+                result = result[:800] + "... [truncated]"
 
+            try:
+                parsed = json.loads(result)
+                if tool_name in {"log_workout", "set_goal"} and "staged_key" in parsed:
+                    self._staged_active = True
+                elif tool_name in _EXECUTE_TOOL_NAMES:
+                    self._staged_active = False
+            except (json.JSONDecodeError, TypeError):
+                pass
 
-            if not fc_parts:
-                # No function calls — final answer
-                final_answer = combined_text or ""
-                if tool_calls_made >= 2:
-                    final_answer = await self._reflect(question, final_answer)
-                # Strip leaked Thought: reasoning and deduplicate repeated lines
-                final_answer = re.sub(
-                    r'(?i)^(thought:.*?\n)+', '', final_answer, flags=re.MULTILINE
-                ).strip()
-                lines = final_answer.split('\n')
-                seen: set = set()
-                deduped: list = []
-                for line in lines:
-                    stripped = line.strip()
-                    if stripped and stripped not in seen:
-                        seen.add(stripped)
-                        deduped.append(line)
-                final_answer = '\n'.join(deduped).strip()
-                if not final_answer:
-                    final_answer = "I wasn't able to form a clear answer. Please try rephrasing."
-                self._save_exchange(messages, new_exchange_start)
-                _now = _datetime.now().isoformat()
-                self.chat_history.append({"role": "user", "text": question, "timestamp": _now})
-                self.chat_history.append({"role": "assistant", "text": final_answer, "timestamp": _now})
-                return {
-                    "question": question,
-                    "answer": final_answer,
-                    "tool_calls_made": tool_calls_made,
-                    "error": None,
-                    "staging_reached_confirm": execute_attempted,
-                }
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": result,
+            })
+            try:
+                response_data = json.loads(result)
+            except (json.JSONDecodeError, TypeError):
+                response_data = {"result": result}
+            tool_response_parts.append(types.Part.from_function_response(
+                name=tool_name,
+                response=response_data,
+            ))
 
-            # Execute tool calls
-            write_cancelled = False
-            tool_response_parts: list = []
-            for tc_dict, fc_part in zip(msg_dict["tool_calls"], fc_parts):
-                tool_name = fc_part.function_call.name
-                arguments = dict(fc_part.function_call.args)
-                tool_call_id = tc_dict["id"]
+        if tool_response_parts:
+            gemini_contents.append(types.Content(role="user", parts=tool_response_parts))
 
-                if tool_name in _execute_tool_names:
-                    execute_attempted = True
-
-                print("[thinking...]", flush=True)
-
-                if tool_name in WRITE_TOOLS and self.confirmation_handler:
-                    approved = await self.confirmation_handler(tool_name, arguments)
-                    if not approved:
-                        result = json.dumps({
-                            "cancelled": True,
-                            "message": "Write action cancelled by user. No changes were made.",
-                        })
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call_id,
-                            "content": result,
-                        })
-                        tool_response_parts.append(types.Part.from_function_response(
-                            name=tool_name,
-                            response={"cancelled": True, "message": "Write action cancelled by user. No changes were made."},
-                        ))
-                        write_cancelled = True
+            for prev_content in gemini_contents[:-1]:
+                if not (hasattr(prev_content, "parts") and prev_content.parts):
+                    continue
+                for part in prev_content.parts:
+                    if not hasattr(part, "function_response") or part.function_response is None:
                         continue
-
-                try:
-                    result = await self.call_tool(tool_name, arguments)
-                except Exception as exc:
-                    result = f"Tool error: {exc}"
-
-                if len(result) > 800:
-                    result = result[:800] + "... [truncated]"
-
-                try:
-                    parsed = json.loads(result)
-                    if tool_name in {"log_workout", "set_goal"} and "staged_key" in parsed:
-                        self._staged_active = True
-                    elif tool_name in _execute_tool_names:
-                        self._staged_active = False
-                except (json.JSONDecodeError, TypeError):
-                    pass
-
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call_id,
-                    "content": result,
-                })
-                try:
-                    response_data = json.loads(result)
-                except (json.JSONDecodeError, TypeError):
-                    response_data = {"result": result}
-                tool_response_parts.append(types.Part.from_function_response(
-                    name=tool_name,
-                    response=response_data,
-                ))
-
-            if tool_response_parts:
-                gemini_contents.append(types.Content(role="user", parts=tool_response_parts))
-
-                for prev_content in gemini_contents[:-1]:
-                    if not (hasattr(prev_content, "parts") and prev_content.parts):
+                    resp = part.function_response.response
+                    if not isinstance(resp, dict):
                         continue
-                    for part in prev_content.parts:
-                        if not hasattr(part, "function_response") or part.function_response is None:
-                            continue
-                        resp = part.function_response.response
-                        if not isinstance(resp, dict):
-                            continue
-                        text = resp.get("text") or resp.get("content") or resp.get("result") or ""
-                        if isinstance(text, str) and len(text) > 1500:
-                            n = len(text) - 800
-                            truncated = text[:400] + f" [...{n} chars truncated for context efficiency...] " + text[-400:]
-                            for key in ("text", "content", "result"):
-                                if key in resp:
-                                    resp[key] = truncated
-                                    break
+                    text = resp.get("text") or resp.get("content") or resp.get("result") or ""
+                    if isinstance(text, str) and len(text) > 1500:
+                        n = len(text) - 800
+                        truncated = text[:400] + f" [...{n} chars truncated for context efficiency...] " + text[-400:]
+                        for key in ("text", "content", "result"):
+                            if key in resp:
+                                resp[key] = truncated
+                                break
 
-            tool_calls_made += len(fc_parts)
+        return {
+            "messages": messages,
+            "tool_calls_made": state["tool_calls_made"] + len(tool_calls),
+            "execute_attempted": execute_attempted,
+            "write_cancelled": write_cancelled,
+            "iteration": state["iteration"] + 1,
+        }
 
-            if write_cancelled:
-                messages.append({
-                    "role": "user",
-                    "content": "The write action was cancelled. Do not retry it.",
-                })
-                self._save_exchange(messages, new_exchange_start)
-                _cancelled_answer = combined_text or "Write action cancelled. No changes were made."
-                _now = _datetime.now().isoformat()
-                self.chat_history.append({"role": "user", "text": question, "timestamp": _now})
-                self.chat_history.append({"role": "assistant", "text": _cancelled_answer, "timestamp": _now})
-                return {
-                    "question": question,
-                    "answer": _cancelled_answer,
-                    "tool_calls_made": tool_calls_made,
-                    "error": None,
-                    "staging_reached_confirm": execute_attempted,
-                }
+    async def _op_finalize_answer(self, state: dict) -> dict:
+        """Node: no function calls — final answer (old loop termination)."""
+        question = state["question"]
+        messages = state["messages"]
+        combined_text = state.get("last_text")
+        tool_calls_made = state["tool_calls_made"]
 
-        self._save_exchange(messages, new_exchange_start)
+        final_answer = combined_text or ""
+        if tool_calls_made >= 2:
+            final_answer = await self._reflect(question, final_answer)
+        # Strip leaked Thought: reasoning and deduplicate repeated lines
+        final_answer = re.sub(
+            r'(?i)^(thought:.*?\n)+', '', final_answer, flags=re.MULTILINE
+        ).strip()
+        lines = final_answer.split('\n')
+        seen: set = set()
+        deduped: list = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped and stripped not in seen:
+                seen.add(stripped)
+                deduped.append(line)
+        final_answer = '\n'.join(deduped).strip()
+        if not final_answer:
+            final_answer = "I wasn't able to form a clear answer. Please try rephrasing."
+        self._save_exchange(messages, state["new_exchange_start"])
+        _now = _datetime.now().isoformat()
+        self.chat_history.append({"role": "user", "text": question, "timestamp": _now})
+        self.chat_history.append({"role": "assistant", "text": final_answer, "timestamp": _now})
+        return {"result": {
+            "question": question,
+            "answer": final_answer,
+            "tool_calls_made": tool_calls_made,
+            "error": None,
+            "staging_reached_confirm": state["execute_attempted"],
+        }}
+
+    def _op_finalize_cancelled(self, state: dict) -> dict:
+        """Node: a write was cancelled at the confirmation gate."""
+        question = state["question"]
+        messages = state["messages"]
+        messages.append({
+            "role": "user",
+            "content": "The write action was cancelled. Do not retry it.",
+        })
+        self._save_exchange(messages, state["new_exchange_start"])
+        _cancelled_answer = state.get("last_text") or "Write action cancelled. No changes were made."
+        _now = _datetime.now().isoformat()
+        self.chat_history.append({"role": "user", "text": question, "timestamp": _now})
+        self.chat_history.append({"role": "assistant", "text": _cancelled_answer, "timestamp": _now})
+        return {"result": {
+            "question": question,
+            "answer": _cancelled_answer,
+            "tool_calls_made": state["tool_calls_made"],
+            "error": None,
+            "staging_reached_confirm": state["execute_attempted"],
+        }}
+
+    def _op_finalize_max_iter(self, state: dict) -> dict:
+        """Node: the 12-iteration guard fired (old loop fallthrough)."""
+        question = state["question"]
+        self._save_exchange(state["messages"], state["new_exchange_start"])
         _max_iter_answer = "I reached the maximum number of steps without completing your request. Please try rephrasing."
         _now = _datetime.now().isoformat()
         self.chat_history.append({"role": "user", "text": question, "timestamp": _now})
         self.chat_history.append({"role": "assistant", "text": _max_iter_answer, "timestamp": _now})
-        return {
+        return {"result": {
             "question": question,
             "answer": _max_iter_answer,
-            "tool_calls_made": tool_calls_made,
+            "tool_calls_made": state["tool_calls_made"],
             "error": "max_iterations_reached",
-            "staging_reached_confirm": execute_attempted,
-        }
+            "staging_reached_confirm": state["execute_attempted"],
+        }}
 
     # ------------------------------------------------------------------ #
     #  Checkpoint resume                                                   #
