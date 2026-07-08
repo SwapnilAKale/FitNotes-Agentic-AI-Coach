@@ -487,6 +487,29 @@ def _flatten_category_blocks(date_str: str, category: str, blocks: list) -> list
     return out
 
 
+def _build_category_display(target: str) -> tuple:
+    """
+    One category target's flat lines PLUS the exercise names contained in its
+    displayed date(s) — the structural fact build_all_display_sets needs for the
+    exercise-inside-category dedup. (flat_lines, contained_exercise_names).
+    """
+    r = get_category_session(target, "recent")
+    blocks = r.get("exercises") or []
+    if not blocks or not r.get("date"):
+        return [], set()
+    contained = {b["exercise"] for b in blocks}
+    out = _flatten_category_blocks(r["date"], r["category"], blocks)
+    if _category_prior_needed(blocks):
+        prior = _prior_category_date(r["category"], r["date"])
+        if prior:
+            pr = get_category_session(r["category"], prior)
+            pblocks = pr.get("exercises") or []
+            if pblocks:
+                out += _flatten_category_blocks(pr["date"], pr["category"], pblocks)
+                contained |= {b["exercise"] for b in pblocks}
+    return out, contained
+
+
 def build_display_sets(kind: str, target: str) -> list:
     """
     The flat list[str] attached to the analytical package as `display_sets`.
@@ -510,18 +533,37 @@ def build_display_sets(kind: str, target: str) -> list:
         return out
 
     if kind == "category":
-        r = get_category_session(target, "recent")
-        blocks = r.get("exercises") or []
-        if not blocks or not r.get("date"):
-            return []
-        out = _flatten_category_blocks(r["date"], r["category"], blocks)
-        if _category_prior_needed(blocks):
-            prior = _prior_category_date(r["category"], r["date"])
-            if prior:
-                pr = get_category_session(r["category"], prior)
-                pblocks = pr.get("exercises") or []
-                if pblocks:
-                    out += _flatten_category_blocks(pr["date"], pr["category"], pblocks)
-        return out
+        return _build_category_display(target)[0]
 
     return []
+
+
+def build_all_display_sets(targets: list) -> list:
+    """
+    Flatten every display target into ONE display_sets list, with the
+    exercise-inside-category dedup: an exercise target whose block already
+    appears inside a built category block (the exercise was trained on one of
+    the category's displayed dates) is emitted ONCE — the category copy is kept
+    (it carries the date header and the same-day context, and containment
+    implies the category block already shows that exercise's own most-recent
+    session). An exercise NOT on any displayed category date keeps its
+    standalone block — that is the only place its latest session shows.
+
+    Output order preserves the historical flatten order: exercise blocks first,
+    category blocks after. Exercise-only and category-only target lists are
+    byte-identical to the per-target build_display_sets calls.
+    """
+    cat_lines: list = []
+    contained: set = set()
+    for kind, target in targets:
+        if kind == "category":
+            lines, names = _build_category_display(target)
+            cat_lines.extend(lines)
+            contained |= names
+
+    flat: list = []
+    for kind, target in targets:
+        if kind == "exercise" and target not in contained:
+            flat.extend(build_display_sets("exercise", target))
+    flat.extend(cat_lines)
+    return flat

@@ -125,15 +125,21 @@ def test_package_no_display_sets_for_broad_scope():
 def test_package_display_sets_for_exercise_plus_group():
     # End-to-end regression for the XOR-drop bug: "show me my last Lat Pulldown
     # session" sometimes also carries muscle_groups=["Back"] from the classifier.
-    # Under the old XOR this attached NOTHING; now both blocks are built and
-    # flattened — an exercise header AND a category header must both be present.
+    # Under the old XOR this attached NOTHING. REWRITTEN for the Sumo-triplication
+    # dedup: when the exercise appears inside the category block (Lat Pulldown is
+    # on the Back block's displayed date), the standalone copy is skipped and the
+    # exercise shows EXACTLY ONCE — inside the category block. display_sets is
+    # still attached (never dropped), and the category header is present.
     pkg = prepare_analysis_package(query_period_days=None,
                                    exercise_names=["Lat Pulldown"],
                                    muscle_groups=["Back"])
     ds = pkg.get("display_sets")
     assert isinstance(ds, list) and ds
-    assert any(" — Lat Pulldown (" in s for s in ds)     # the exercise block
     assert any(s.endswith("— Back:") for s in ds)        # the category block
+    # Exercise appears exactly once, as an in-category sub-block — never also
+    # as a standalone "<date> — Lat Pulldown (" block (the duplication).
+    assert sum(1 for s in ds if s.startswith("Lat Pulldown (")) == 1
+    assert not any(" — Lat Pulldown (" in s for s in ds)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

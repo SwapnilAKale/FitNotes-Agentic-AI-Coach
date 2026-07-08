@@ -103,7 +103,10 @@ def _display_scope(
     Display targets for the package's `display_sets` (pure — no SQL, no LLM):
     ONE per resolved scope present — each resolved exercise AND each muscle group.
 
-    No XOR, no precedence, no dedup. The Analysis Agent picks display-vs-analyze
+    No XOR, no precedence. Dedup happens at flatten time
+    (session_display.build_all_display_sets): an exercise target already
+    contained in a built category block is emitted once, category copy kept.
+    The Analysis Agent picks display-vs-analyze
     from the QUESTION (analytical questions ignore display_sets), so building a
     block for every present scope is always safe. This deliberately supersedes the
     old strict XOR, which dropped display entirely when a single-exercise question
@@ -232,9 +235,10 @@ def prepare_analysis_package(
     targets = _display_scope(exercise_names, muscle_groups, unresolved)
     if targets:
         from . import session_display  # local import avoids any import cycle
-        flat: list = []
-        for kind, target in targets:
-            flat.extend(session_display.build_display_sets(kind, target))
+        # build_all_display_sets applies the exercise-inside-category dedup:
+        # an exercise already shown inside a category block is emitted once
+        # (category copy kept); non-overlapping targets are unchanged.
+        flat = session_display.build_all_display_sets(targets)
         if flat:
             trimmed["display_sets"] = flat
 

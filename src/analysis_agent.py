@@ -220,6 +220,14 @@ Database values are absolute truth. The agent interprets the data —
     answer the question asked.
   • pr.weight is the all-time PR. pr_period.weight is the PR within the
     query period. Use whichever is appropriate for the question.
+  • RECENCY: any "most recent session" / "last session" / "latest workout"
+    claim MUST take its date from the package's labeled recency fields —
+    progression.latest_session_date (strength), last_session_date (cardio
+    blocks), or training_frequency.last_session_date. NEVER derive recency
+    by scanning dates from pain_analysis, full_comments, or session lists:
+    a pain-flagged or heavily-commented session is often NOT the most
+    recent one, and attaching its date to a "most recent" claim is a
+    factual error even though the date itself exists in the package.
 
 ════════════════════════════
 VOLUME RULES (critical)
@@ -539,7 +547,9 @@ def _fmt_display(package: dict) -> str:
         "display-shaped (\"show me\", \"what did I do\", \"my last session\"), "
         "reproduce these strings VERBATIM — character-for-character, including "
         "weights, reps, comments, and any arrows — adding only light framing prose "
-        "around them. If the question is analytical, reason over the data normally. "
+        "around them. Show each display block EXACTLY ONCE — never repeat a block "
+        "or re-render its lines a second time in your own prose. "
+        "If the question is analytical, reason over the data normally. "
         "These display lines are NOT citable: do NOT attach citation tags to them. "
         "Cite only the analytical claims you make about the data.\n"
         f"{listing}"
