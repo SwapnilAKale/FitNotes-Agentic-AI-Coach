@@ -71,6 +71,14 @@ IMPROVEMENT_TRIGGER_PCT = 20.0
 # OWN sessions), never a per-user or per-exercise hardcode.
 NEW_BEST_WEIGHT_TOL_KG          = 0.05  # kg tolerance for "same weight" across unit-switch rounding
 CURRENT_ABILITY_SESSIONS        = 3     # "current" = best (weight→reps) over the exercise's last N sessions; one back-off/high-rep day cannot redefine it
+# ── Deload-block detection (deload ≠ regression) ──────────────────────────────
+# A deload is a SHARP step-down from a STABLE higher level, bounded in length; a
+# regression is a decline trend. All three ratios/caps must hold simultaneously
+# so ambiguous cases fall through to the regression-visible path (bias: masking
+# a real regression as "deload" is the worse error).
+DELOAD_STEP_RATIO         = 0.75  # block max ≤ 75% of established level = categorical step-down, not noise
+DELOAD_BASELINE_STABILITY = 0.80  # each pre-block baseline session ≥ 80% of the baseline max = stable level
+DELOAD_MAX_SESSIONS       = 6     # a "deload" persisting longer is treated as the new reality (regression path)
 PLATEAU_MIN_SESSIONS_SINCE_BEST = 5     # need ≥ this many of THIS exercise's sessions with no new best before a plateau — normal gaps between PRs during a rising run must not count
 PLATEAU_SLOPE_WINDOW            = 6     # sessions used for the e1RM trend-direction gate; a rising recent e1RM slope blocks a plateau regardless of the count
 MIN_SESSIONS_FOR_TREND          = 4     # below this, refuse to opine on plateau/regression (thin data → report sample size only)
@@ -971,6 +979,40 @@ def _recent_best_session(sessions: list, default_unit: str, k: int) -> dict:
     return max(window, key=lambda s: _session_wr_kg(s, default_unit))
 
 
+def _detect_deload_block(maxes_kg: list) -> Optional[int]:
+    """
+    Length L of a trailing DELOAD block, or None. A deload is a sharp,
+    categorical step-down from a stable established level, bounded in length —
+    never a decline trend. For each candidate L (largest wins), with
+    baseline = the 3 sessions immediately before the block:
+
+      1. stable prior level : min(baseline) >= DELOAD_BASELINE_STABILITY * max(baseline)
+      2. categorical block  : every block session <= DELOAD_STEP_RATIO * max(baseline)
+      3. sharp entry        : first block session <= DELOAD_STEP_RATIO * previous session
+
+    A gradual decline (145→130→120→110→100) fails (2)+(3) for every L and falls
+    through to the regression path; a block longer than DELOAD_MAX_SESSIONS is
+    treated as the new reality (regression path). Bias: all conditions must
+    hold, so ambiguity NEVER masks a real regression as a deload.
+    """
+    n = len(maxes_kg)
+    best_l = None
+    for L in range(1, DELOAD_MAX_SESSIONS + 1):
+        if n - L < 3:
+            break
+        prior3 = maxes_kg[n - L - 3 : n - L]
+        base   = max(prior3)
+        if base <= 0:
+            continue
+        stable = min(prior3) >= DELOAD_BASELINE_STABILITY * base
+        block  = maxes_kg[n - L :]
+        categorical = all(m <= DELOAD_STEP_RATIO * base for m in block)
+        sharp  = maxes_kg[n - L] <= DELOAD_STEP_RATIO * maxes_kg[n - L - 1]
+        if stable and categorical and sharp:
+            best_l = L
+    return best_l
+
+
 def _compute_progression(sessions: list) -> dict:
     if not sessions: return {}
     first = sessions[0]; last = sessions[-1]
@@ -1008,13 +1050,28 @@ def _compute_progression(sessions: list) -> dict:
     # ── "Current ability" = robust recent best, NOT the single last session ────
     # Best (weight → reps) over the exercise's last CURRENT_ABILITY_SESSIONS, so
     # a lone back-off / high-rep day cannot lower current below the working max.
-    cur_session    = _recent_best_session(sessions, last_unit, CURRENT_ABILITY_SESSIONS)
+    # DELOAD BLOCK: when the trailing sessions are a detected deload (sharp,
+    # categorical step-down from a stable level — see _detect_deload_block), the
+    # k-session window is saturated with deload days and its max is NOT current
+    # ability. Current then anchors on the ESTABLISHED level: the best of the
+    # k sessions immediately BEFORE the block.
+    maxes_kg   = [_mww_kg(s) for s in sessions]
+    deload_len = _detect_deload_block(maxes_kg)
+    if deload_len:
+        cur_session   = _recent_best_session(
+            sessions[:-deload_len], last_unit, CURRENT_ABILITY_SESSIONS)
+        current_basis = (
+            f"established working level (best of the "
+            f"{min(CURRENT_ABILITY_SESSIONS, n - deload_len)} sessions before "
+            f"the {deload_len}-session deload block)")
+    else:
+        cur_session   = _recent_best_session(sessions, last_unit, CURRENT_ABILITY_SESSIONS)
+        current_basis = f"best of last {min(CURRENT_ABILITY_SESSIONS, n)} sessions"
     current_kg     = _mww_kg(cur_session)
     current_weight = (cur_session["max_working_weight"]
                       if cur_session.get("unit", last_unit) == last_unit
                       else _to_last_unit(current_kg))
     current_reps   = cur_session.get("reps_at_max", 0)
-    current_basis  = f"best of last {min(CURRENT_ABILITY_SESSIONS, n)} sessions"
 
     # ── Start anchor (Fix 2: same-unit baseline across a unit switch) ──────────
     # Normally the window's first session. When the window spans a unit switch
@@ -1082,13 +1139,21 @@ def _compute_progression(sessions: list) -> dict:
     e1rm_rising  = _trend(recent_e1rms, 0.02, 0.02) == "increasing"
 
     # ── Plateau: ALL of (a) enough sessions since the last new best,
-    #    (b) recent e1RM not rising, (c) enough sessions to judge ───────────────
+    #    (b) recent e1RM not rising, (c) enough sessions to judge,
+    #    (d) NOT inside a detected deload block (an intentional back-off is
+    #    neither a plateau nor a regression) ──────────────────────────────────
     is_plateau = (trend_assessable
+                  and deload_len is None
                   and sessions_since_best >= PLATEAU_MIN_SESSIONS_SINCE_BEST
                   and not e1rm_rising)
     plateau_since = last_new_best_date if is_plateau else None
 
-    if not trend_assessable:
+    if deload_len:
+        plateau_note = (
+            f"deload/back-off block in progress ({deload_len} lighter "
+            f"session(s) since {sessions[n - deload_len]['date']}) — not a "
+            f"plateau; current ability reflects the established pre-deload level")
+    elif not trend_assessable:
         plateau_note = f"not enough sessions to assess trend (only {n} logged)"
     elif is_plateau:
         plateau_note = (f"no new best in the last {sessions_since_best} "
@@ -1112,6 +1177,30 @@ def _compute_progression(sessions: list) -> dict:
             "current_basis":     current_basis,
             "regression_amount": round(peak_weight - current_weight, 1),
             "regression_pct":    round((peak_weight - current_weight) / peak_weight * 100, 1),
+        }
+
+    # ── Training state (deterministic — the draft reads this, never infers) ───
+    # "deload" only when ALL detection conditions held; any ambiguity falls
+    # through to "regression" (visible), never the other way around.
+    if not trend_assessable:
+        training_state = "insufficient_data"
+    elif deload_len:
+        training_state = "deload"
+    elif regression_from_peak is not None:
+        training_state = "regression"
+    else:
+        training_state = "working"
+
+    deload_block = None
+    if deload_len:
+        deload_block = {
+            "sessions":           deload_len,
+            "start_date":         sessions[n - deload_len]["date"],
+            "block_max_weight":   _to_last_unit(max(maxes_kg[n - deload_len:])),
+            "established_weight": current_weight,
+            "note": ("recent sessions are a deliberate back-off/deload block — "
+                     "current ability reflects the established pre-deload "
+                     "level, not the deload weights"),
         }
 
     dim_returns = None
@@ -1173,6 +1262,9 @@ def _compute_progression(sessions: list) -> dict:
         "trend_assessable":     trend_assessable,
         "e1rm_recent_rising":   e1rm_rising,
         "regression_from_peak": regression_from_peak,
+        # ── Deterministic training-state classification (deload ≠ regression) ─
+        "training_state":       training_state,
+        "deload_block":         deload_block,
         "diminishing_returns":  dim_returns,
     }
 
