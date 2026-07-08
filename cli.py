@@ -66,8 +66,11 @@ async def _finalize_staged_workout(session, coordinator, result, question) -> st
             "format_staged_workout_for_confirmation", {}))
         # verify_log_staging skips the LLM (verdict ERROR) when preview is
         # missing — a name-blind diff could spuriously FAIL a good batch.
+        # No [question] fallback: a missing flow thread must skip-verify
+        # (ERROR, fail-open), never diff the slot against the bare reply
+        # text and FAIL a good batch. Same seam as server.py's panel verify.
         verdict = await coordinator.verify_log_staging(
-            result.get("log_flow_turns") or [question],
+            result.get("log_flow_turns"),
             slot_raw, fmt.get("preview"))
     except Exception as exc:
         print(f"[cli] staging verify errored: {exc}", file=sys.stderr)

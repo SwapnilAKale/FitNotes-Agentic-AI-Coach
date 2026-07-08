@@ -636,8 +636,11 @@ async def _process_turn(message: str) -> JSONResponse:
                         # never re-pay a completed LLM call on resume.
                         verdict = restored
                     elif preview_source == "slot":
+                        # No [message] fallback: a missing flow thread must
+                        # skip-verify (ERROR, fail-open), never diff the slot
+                        # against the bare reply text and FAIL a good batch.
                         verdict = await coordinator.verify_log_staging(
-                            result.get("log_flow_turns") or [message],
+                            result.get("log_flow_turns"),
                             slot_raw, preview)
                     else:
                         verdict = {"verdict": "ERROR",

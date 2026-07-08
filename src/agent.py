@@ -260,6 +260,11 @@ class AgentSession:
         self._context_messages: list[dict] = []  # pinned user-context pair, prepended to every call
         self.confirmation_handler: callable | None = None
         self._staged_active: bool = False
+        # Per-turn write-effect facts (reset at answer() entry; see WRITE_TOOLS
+        # tracking in _op_exec_tools). Surfaced in the result dict as
+        # db_write_effect / staged_this_turn for the Coordinator's claim gate.
+        self._turn_write_effect: bool = False
+        self._turn_staged: bool = False
         self._base_system_prompt: str = SYSTEM_PROMPT
         self.chat_history: list[dict] = []
         self._cache_name: str | None = None
@@ -694,6 +699,13 @@ class AgentSession:
         from src.graph.persistence import cleanup_turn, new_turn_id, turn_config
         from src.graph.state import GraphRunContext, RunCache
 
+        # Per-turn write-effect signals (instance attrs, never graph state):
+        # did any WRITE_TOOLS call actually write (success:true) or stage
+        # (staged_key) this turn? Read by the finalize nodes into the result
+        # dict so the Coordinator can gate write-success claims on fact.
+        self._turn_write_effect = False
+        self._turn_staged = False
+
         turn_id = new_turn_id()
         state = await get_operational_graph().ainvoke(
             {"question": question, "resume_messages": resume_messages},
@@ -900,6 +912,15 @@ class AgentSession:
                     self._staged_active = True
                 elif tool_name in _EXECUTE_TOOL_NAMES:
                     self._staged_active = False
+                # Per-turn write-effect facts for the Coordinator's
+                # success-claim gate: a WRITE_TOOLS call that actually wrote
+                # (success:true — direct writes and executes) or staged
+                # (staged_key) something this turn.
+                if tool_name in WRITE_TOOLS and isinstance(parsed, dict):
+                    if parsed.get("success") is True:
+                        self._turn_write_effect = True
+                    if "staged_key" in parsed:
+                        self._turn_staged = True
             except (json.JSONDecodeError, TypeError):
                 pass
 
@@ -981,6 +1002,8 @@ class AgentSession:
             "tool_calls_made": tool_calls_made,
             "error": None,
             "staging_reached_confirm": state["execute_attempted"],
+            "db_write_effect": self._turn_write_effect,
+            "staged_this_turn": self._turn_staged,
         }}
 
     def _op_finalize_cancelled(self, state: dict) -> dict:
@@ -1002,6 +1025,8 @@ class AgentSession:
             "tool_calls_made": state["tool_calls_made"],
             "error": None,
             "staging_reached_confirm": state["execute_attempted"],
+            "db_write_effect": self._turn_write_effect,
+            "staged_this_turn": self._turn_staged,
         }}
 
     def _op_finalize_max_iter(self, state: dict) -> dict:
@@ -1018,6 +1043,8 @@ class AgentSession:
             "tool_calls_made": state["tool_calls_made"],
             "error": "max_iterations_reached",
             "staging_reached_confirm": state["execute_attempted"],
+            "db_write_effect": self._turn_write_effect,
+            "staged_this_turn": self._turn_staged,
         }}
 
     # ------------------------------------------------------------------ #

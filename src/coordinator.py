@@ -557,6 +557,30 @@ Return ONLY valid JSON, no preamble, no markdown fences:
 # FAIL response — a re-state prompt in the existing message style, not a raw error.
 MSG_VERIFY_RESTATE = "I may have misread that — could you re-state the workout?"
 
+# ── Write-success claim gate (Fix: false "successfully logged") ───────────────
+# Claim-PRESENCE detector only. The DECIDING gate is structural — the guard in
+# _run_operational can fire only when the turn deterministically wrote nothing
+# (db_write_effect False), staged nothing (staged_this_turn False), and
+# attempted no execute (staging_reached_confirm False). In that state any
+# completed-write claim is false by construction, so a regex false-positive is
+# harmless (the replacement is still truthful) and a false-negative merely
+# preserves the old behavior. The regex can never suppress a legitimate answer
+# (e.g. a clarification question), because legitimacy is decided by the flags.
+_WRITE_SUCCESS_CLAIM_RE = re.compile(
+    r"(?i)(?:"
+    r"successfully\s+(?:logg|sav|record|writ|add|updat|delet)"
+    r"|(?:logged|saved|recorded|written|added)\b[^.\n]{0,60}?"
+    r"(?:successfully|to\s+your\s+(?:database|log|workout|fitnotes))"
+    r"|has\s+been\s+(?:logged|saved|recorded|written|added)"
+    r"|✅[^\n]{0,80}(?:logged|saved|recorded|written)"
+    r")"
+)
+
+MSG_NO_WRITE_OCCURRED = (
+    "⚠️ Nothing was written to your database this turn — no write was "
+    "executed. Please re-state your logging request (tip: start with /log)."
+)
+
 
 def format_verify_fail_message(preview: str) -> str:
     return (
@@ -1979,7 +2003,24 @@ class Coordinator:
                 logger.warning("[coordinator] checkpoint enrichment failed: %s", e)
             raise
         answer = result.get("answer", "")
-        if log_boundary:
+        # ── Write-success claim gate: a success claim can never ship unless a
+        # write/stage/execute actually happened this turn. Structural facts
+        # decide (all three False ⇒ any completed-write claim is false by
+        # construction); the regex only detects that a claim is being made,
+        # so a clarification question with the same flags is never touched.
+        if (not result.get("db_write_effect")
+                and not result.get("staged_this_turn")
+                and not result.get("staging_reached_confirm")
+                and _WRITE_SUCCESS_CLAIM_RE.search(answer)):
+            logger.warning(
+                "[coordinator] suppressed unbacked write-success claim: %r",
+                answer[:120])
+            answer = MSG_NO_WRITE_OCCURRED
+        if log_boundary or fallback_write:
+            # Fallback (regex-inferred) writes are the same flow as /log turns:
+            # a turn that ends pending a logging clarification must carry the
+            # originating flow-turn text into the next reply, or the stage-2
+            # verify diffs the staged batch against the bare reply ("Today").
             self._pending_log_carry = not result.get("staging_reached_confirm", False)
         if trailing_note:
             answer = answer.rstrip() + "\n\n" + _LOG_TRAILING_NOTE
@@ -2004,6 +2045,14 @@ class Coordinator:
         _call_with_per_minute_retry and no retry loop: +1 call per logging turn
         is the quota budget; a 429/503 here is an ERROR, never a blocker.
         """
+        if not flow_turns:
+            # No originating request text (a lost/absent flow thread) is a
+            # NON-VERIFIABLE state, never a mismatch: diffing the slot against
+            # a bare reply ("Today") produces a confidently-wrong FAIL that
+            # discards a good batch. ERROR fails open to the human confirm
+            # gate, which still shows the slot-rendered preview.
+            return {"verdict": "ERROR",
+                    "reason": "originating request unavailable — verify skipped"}
         if not preview:
             # A name-blind diff (opaque exercise_ids, kg-converted weights, no
             # rendering) could spuriously FAIL a good batch — skip instead.

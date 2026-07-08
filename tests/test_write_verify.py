@@ -431,11 +431,17 @@ def test_server_verify_receives_assembled_flow_turns(srv, monkeypatch):
     assert seen["preview"] == _PREVIEW
 
 
-def test_server_verify_falls_back_to_raw_message_without_flow_turns(srv, monkeypatch):
+def test_server_verify_never_receives_bare_message_without_flow_turns(srv, monkeypatch):
+    # REWRITTEN (was: ...falls_back_to_raw_message...): the old [message]
+    # fallback diffed the staged slot against the bare reply text and turned a
+    # lost flow thread into a confidently-wrong FAIL that discarded a good
+    # batch. The caller now passes the missing thread through as-is; the REAL
+    # verify_log_staging skip-guards it into a fail-open ERROR (panel still
+    # shows — pinned separately in test_write_path_fixes.py).
     _, _, seen = _drive_workout_turn(
         srv, monkeypatch, verdict={"verdict": "PASS", "reason": ""},
         flow_turns=None, message="log bench 100x5")
-    assert seen["flow"] == ["log bench 100x5"]
+    assert seen["flow"] is None                # bare reply never becomes Input A
 
 
 # ══════════════════════════════════════════════════════════════════════════════

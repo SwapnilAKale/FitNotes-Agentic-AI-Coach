@@ -1421,7 +1421,18 @@ def _log_workout_sync(arguments: dict) -> str:
             # Strength: weight×reps; unit column is the vestigial constant 0.
             weight = float(s["weight"])
             reps = int(s["reps"])
-            metric_weight = weight / 2.2046
+            # Storage invariant: metric_weight = typed_number / 2.2046, where
+            # the typed number is in the exercise's NATIVE display unit
+            # (kg-native rule). A kg input on an lbs-native exercise must be
+            # converted to typed lbs first: X kg = X*2.2046 lbs, so
+            # metric_weight = (X*2.2046)/2.2046 = X — the kg figure directly
+            # (same rule as the analytical comment-unit override). kg on a
+            # kg-native exercise and lbs/absent stay typed_number/2.2046.
+            set_unit = str(s.get("unit") or arguments.get("unit") or "").strip().lower()
+            if set_unit == "kg" and not _is_kg_native_rule(exercise_name, date_str):
+                metric_weight = weight
+            else:
+                metric_weight = weight / 2.2046
             is_pr = metric_weight > current_pr_metric
             if is_pr:
                 current_pr_metric = metric_weight
