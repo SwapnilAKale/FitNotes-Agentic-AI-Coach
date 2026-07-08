@@ -120,6 +120,44 @@ def _permissive_pick(query: str, candidates: list, counts: dict) -> "str | None"
     return None
 
 
+def _word_multiset(s: str) -> tuple:
+    """Sorted lowercase word multiset — the categorical name-equality signal for
+    the Tier-3 permutation rescue (word ORDER is the only thing it ignores)."""
+    return tuple(sorted(s.lower().split()))
+
+
+def _expand_queries(term: str) -> list:
+    """The term plus one-word plural/singular flips (trailing-s), deduped.
+    Shared by Tier 3's word matching and the permutation rescue."""
+    variants = [term]
+    words = term.split()
+    for i, word in enumerate(words):
+        flipped = word[:-1] if word.lower().endswith("s") else word + "s"
+        variant = " ".join(words[:i] + [flipped] + words[i + 1:])
+        if variant != term:
+            variants.append(variant)
+    return list(dict.fromkeys(variants))
+
+
+def _permutation_match(query: str, candidates: list) -> "str | None":
+    """
+    Tier-3 READ-path rescue (bug 2.4): the user typing a word PERMUTATION of
+    exactly one exercise name ("dumbbell flat bench press" → "Flat Dumbbell
+    Bench Press") is naming THAT exercise — categorical name evidence, no tuned
+    threshold (difflib ≥0.75 is NOT single here: Incline/Decline score 0.766).
+    Plural-flip tolerant via _expand_queries. Returns the sole permutation
+    match, or None (zero or ≥2 matches → fall through to ask/pick as before).
+
+    Callers pass ALL exercise names, not the Tier-3 candidate pool: the Tier-3
+    SQL LIMITs 8 alphabetically BEFORE the ≥2-word filter, so the true
+    permutation match can be crowded out of the pool entirely (the live
+    "dumbbell flat bench press" case).
+    """
+    variant_sets = {_word_multiset(v) for v in _expand_queries(query)}
+    matches = [c for c in candidates if _word_multiset(c) in variant_sets]
+    return matches[0] if len(matches) == 1 else None
+
+
 def _connect(db_path: str) -> sqlite3.Connection:
     normalized = db_path.replace("\\", "/")
     uri = f"file:{normalized}?mode=ro"
@@ -200,22 +238,16 @@ def _resolve(query: str, conn: sqlite3.Connection, permissive: bool = False) -> 
             picked = _permissive_pick(query, candidates, counts)
             if picked:
                 return {"match": picked, "candidates": []}
-            candidates = _order_by_data(query, candidates, counts)
+            # 2.3: the ≥2-real-data ASK offers ONLY real-data candidates —
+            # never a 0-set name ("squat" must not offer Barbell Squat).
+            # 0-real-data (name-only fallback) keeps the full list unchanged.
+            with_data = [c for c in candidates if counts.get(c, 0) >= _LOGGED_FLOOR]
+            candidates = _order_by_data(query, with_data or candidates, counts)
         return {"match": None, "candidates": candidates}
 
-    # Tier 3: plural/singular expansion + word-by-word matching.
-    # For each word, also try flipping its trailing-s.
-    # Only keep exercises where at least 2 query words match (1 for single-word queries).
-    def _expand_queries(term):
-        variants = [term]
-        words = term.split()
-        for i, word in enumerate(words):
-            flipped = word[:-1] if word.lower().endswith("s") else word + "s"
-            variant = " ".join(words[:i] + [flipped] + words[i + 1:])
-            if variant != term:
-                variants.append(variant)
-        return list(dict.fromkeys(variants))
-
+    # Tier 3: plural/singular expansion + word-by-word matching (module-level
+    # _expand_queries). Only keep exercises where at least 2 query words match
+    # (1 for single-word queries).
     def _dedup(names):
         seen = {}
         for n in names:
@@ -241,11 +273,23 @@ def _resolve(query: str, conn: sqlite3.Connection, permissive: bool = False) -> 
     candidates = _filter_by_token(_dedup(raw))[:8]
     if candidates:
         if permissive:
+            # 2.4 rescue FIRST: an exact word-permutation of ONE exercise name
+            # is the user naming that exercise — beats ask AND data heuristics
+            # (may legitimately pick a 0-set exercise the user named precisely).
+            # Checked against ALL names — the LIMIT-8 pool can crowd out the
+            # true match (see _permutation_match docstring).
+            all_names = [r["name"] for r in
+                         conn.execute("SELECT name FROM exercise").fetchall()]
+            perm = _permutation_match(query, all_names)
+            if perm:
+                return {"match": perm, "candidates": []}
             counts = _logged_counts(conn, candidates)
             picked = _permissive_pick(query, candidates, counts)
             if picked:
                 return {"match": picked, "candidates": []}
-            candidates = _order_by_data(query, candidates, counts)
+            # 2.3: ask offers only real-data candidates (see Tier 2).
+            with_data = [c for c in candidates if counts.get(c, 0) >= _LOGGED_FLOOR]
+            candidates = _order_by_data(query, with_data or candidates, counts)
         return {"match": None, "candidates": candidates}
 
     # Tier 4: fuzzy character-level match using difflib.SequenceMatcher.
@@ -266,6 +310,14 @@ def _resolve(query: str, conn: sqlite3.Connection, permissive: bool = False) -> 
     )
     candidates = _filter_by_token([name for ratio, name in scored if ratio >= 0.75][:5])
     if candidates:
+        if permissive:
+            counts = _logged_counts(conn, candidates)
+            picked = _permissive_pick(query, candidates, counts)
+            if picked:
+                return {"match": picked, "candidates": []}
+            # 2.3: ask offers only real-data candidates (see Tier 2).
+            with_data = [c for c in candidates if counts.get(c, 0) >= _LOGGED_FLOOR]
+            candidates = _order_by_data(query, with_data or candidates, counts)
         return {"match": None, "candidates": candidates}
 
     return {"match": None, "candidates": []}
