@@ -763,8 +763,10 @@ class Coordinator:
         # ── 0. Checkpoint: resume, confirm-before-discard, or pass through ────
         # Continue-intent is checked BEFORE the write-intent guard so "continue"
         # always resumes the interrupted question, never classifies as new.
-        # A live slot is never silently discarded — a NEW question prompts for
-        # confirmation first. (Stale >48h slots are dropped silently on load.)
+        # An interrupted-question slot is never silently discarded — a NEW
+        # question prompts for confirmation first. A staged-slot checkpoint
+        # (an unconfirmed /log panel) IS silently discarded on a new question.
+        # (Stale >48h slots are dropped silently on load.)
         cp = _ckpt.load_checkpoint()
         if _ckpt.is_continue_intent(question):
             if cp is not None:
@@ -774,7 +776,19 @@ class Coordinator:
             # question. Return a plain notice — no LLM call.
             return self._no_resume_response()
         elif cp is not None:
-            if cp.get("awaiting_discard_confirm"):
+            if cp.get("staged_slot"):
+                # An unconfirmed staged batch is cheap to recreate by re-logging
+                # — a new question means the user moved on, so drop it silently,
+                # mirroring the in-session turn-start discard_staged_writes
+                # clear-on-entry (its persistent shadow must follow the same
+                # lifecycle). The confirm-before-discard prompt is reserved for
+                # interrupted questions whose paid LLM stages are worth
+                # protecting; 'continue' (handled above) still restores the
+                # staged batch until then.
+                logger.info("[coordinator] discarded unconfirmed staged-slot "
+                            "checkpoint on new question")
+                _ckpt.clear_checkpoint()
+            elif cp.get("awaiting_discard_confirm"):
                 # This message answers the discard prompt for the live slot.
                 if _ckpt.is_discard_intent(question):
                     # Discard saved; process the stashed new question.
@@ -795,8 +809,13 @@ class Coordinator:
                 _ckpt.mark_awaiting_discard(cp, question)
                 return self._confirm_response(_ckpt.discard_confirm_prompt(cp))
 
-        return await self._route_fresh(question, log_carry=log_carry,
-                                       flow_turns=flow_turns)
+        result = await self._route_fresh(question, log_carry=log_carry,
+                                         flow_turns=flow_turns)
+        # The resolved question can differ from the transport message (a 'new'
+        # discard-confirm turn processes the stashed pending question) — expose
+        # it so the server's checkpoint-2 save never stores the control word.
+        result.setdefault("resolved_question", question)
+        return result
 
     async def _route_fresh(self, question: str, log_carry: bool = False,
                            flow_turns: Optional[list] = None) -> dict:

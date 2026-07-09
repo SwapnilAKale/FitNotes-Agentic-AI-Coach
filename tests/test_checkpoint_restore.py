@@ -419,6 +419,45 @@ def test_server_normal_pass_writes_checkpoint2(srv, monkeypatch):
     assert saved[0]["verify_verdict"]["verdict"] == "PASS"
 
 
+def test_server_checkpoint2_prefers_resolved_question_over_message(srv, monkeypatch):
+    # A 'new' discard-confirm turn processes the stashed /log question — the
+    # checkpoint-2 save must store that resolved question, never the literal
+    # control word the user typed.
+    saved: list = []
+    stashed_q = "/log bench 100 lbs x 5"
+
+    async def route(msg):
+        srv._state["pending_confirmation"] = True
+        srv._state["pending_execute_kind"] = "workout"
+        return {"answer": "", "route": "operational", "flagged_claims": [],
+                "error": None, "log_boundary": True,
+                "log_flow_turns": ["bench 100 lbs x 5"],
+                "resolved_question": stashed_q}
+
+    async def call_tool(name, args):
+        if name == "format_staged_workout_for_confirmation":
+            return json.dumps({"preview": _PREVIEW})
+        if name == "read_staged_workout_slot":
+            return json.dumps({"staged_workouts": _SLOT})
+        return json.dumps({"ok": True})
+
+    async def verify_log_staging(flow, slot_json, preview):
+        return dict(_PASS)
+
+    monkeypatch.setattr(srv, "coordinator", SimpleNamespace(
+        route=route, verify_log_staging=verify_log_staging))
+    monkeypatch.setattr(srv, "session", SimpleNamespace(call_tool=call_tool))
+    monkeypatch.setattr(srv._ckpt, "save_checkpoint",
+                        lambda **kw: saved.append(kw) or kw)
+
+    body = _body(asyncio.run(srv._process_turn("new")))
+
+    assert body["type"] == "confirmation_required"
+    assert len(saved) == 1
+    assert saved[0]["question"] == stashed_q
+    assert saved[0]["question"] != "new"
+
+
 def _confirm_session(calls, execute_result):
     async def call_tool(name, args):
         calls.append((name, args))

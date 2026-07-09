@@ -153,8 +153,8 @@ Exercise Quirks: add_exercise_quirk, update_exercise_quirk, delete_exercise_quir
 
 Architecture
 Single-Agent System
-Agent Loop (ReAct)
-Hand-built ReAct loop — no LangChain or LangGraph. Each question: Thought → Tool Selection → Tool Execution → Observation → repeat until answer. Max 7 iterations. A reflection step reviews the answer before returning it. Building the loop from scratch teaches what frameworks abstract away: context accumulation costs, tool schema sizing, graceful error handling, and why confirmation gates must live outside the agent.
+Agent Loop (ReAct via LangGraph)
+ReAct loop orchestrated by LangGraph StateGraph with custom Gemini-native tool node. Topology: parent CoordinatorGraph → conditional edges dispatch to OperationalSubgraph (ReAct loop) or AnalyticalSubgraph (deterministic data pipeline). Each operational iteration: agent_step node calls Gemini → conditional edge routes to exec_tools (custom node invoking MCP) or finalize. Max 7 iterations, bounded by OperationalState counter. Reflection step reviews answer before finalize returns it. AsyncCompatSqliteSaver handles langgraph-checkpoint-sqlite 3.x async/event-loop incompatibility. Expensive artifacts (366 KB package) excluded from checkpoints via RunCache; rebuilt free on resume from simple inputs.
 RAG Pipeline
 Three-stage retrieval: query rewriting (casual English → academic terms) → BM25 + dense hybrid search → cross-encoder reranking (threshold 0.0). A relevance gate filters topically adjacent but irrelevant documents before answer composition. Section-aware chunking splits academic papers on headers first (Introduction, Methods, Results, Discussion, Conclusion) before word-count chunking within sections — conclusion chunks surface directly rather than being buried in 6000-char mixed-content blocks.
 Exercise Session Display

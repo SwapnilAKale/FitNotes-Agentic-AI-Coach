@@ -293,6 +293,9 @@ def test_d_discard_keyword_processes_stashed(slot, coord, monkeypatch):
     assert not slot.exists()
     # The stashed new question (not the bare "new") is what gets processed
     assert seen["op"] == 1 and seen["last"] == NEW_Q
+    # ...and is exposed to the server, so a checkpoint-2 save on this turn
+    # stores the real question — never the control word 'new'.
+    assert result.get("resolved_question") == NEW_Q
 
 
 def test_d_ambiguous_reply_reasks_keeps_slot(slot, coord, monkeypatch):
@@ -303,6 +306,67 @@ def test_d_ambiguous_reply_reasks_keeps_slot(slot, coord, monkeypatch):
     assert result["route"] == "checkpoint_confirm"
     assert seen["op"] == 0 and seen["an"] == 0
     assert slot.exists()                         # never silently discarded
+
+
+# ── d3. Staged-slot checkpoint (unconfirmed /log panel): silent discard ───────
+# An unconfirmed staged batch is cheap to recreate by re-logging, so a new
+# question drops its checkpoint silently (mirroring the in-session turn-start
+# discard_staged_writes) instead of nagging with the confirm prompt. Only
+# 'continue' restores it; interrupted-question checkpoints keep the prompt.
+
+STAGED_SLOT = [{"exercise_id": 37, "date": "2026-07-09",
+                "sets": [{"metric_weight": 45.36, "reps": 5, "unit": 0}]}]
+
+
+def _staged_slot_cp(question="/log bench 100 lbs x 5"):
+    return ckpt.save_checkpoint(route="operational", question=question,
+                                staged_slot=STAGED_SLOT,
+                                log_flow_turns=["bench 100 lbs x 5"],
+                                verify_verdict={"verdict": "PASS", "reason": ""})
+
+
+def test_d3_staged_slot_discarded_silently_on_new_question(slot, coord, monkeypatch):
+    _staged_slot_cp()
+    seen = _count_processing(coord, monkeypatch)
+
+    result = asyncio.run(coord.route(NEW_Q))
+
+    # No confirm prompt: the new question is processed directly...
+    assert result["route"] == "operational"
+    assert "interrupted question waiting" not in result["answer"]
+    assert seen["op"] == 1 and seen["last"] == NEW_Q
+    # ...and the unconfirmed-panel checkpoint is gone for good.
+    assert not slot.exists()
+
+
+def test_d3_staged_slot_continue_still_resumes(slot, coord, monkeypatch):
+    _staged_slot_cp()
+    resumed = {}
+
+    async def fake_resume(cp):
+        resumed["cp"] = cp
+        return {"answer": "RESUMED", "route": "operational",
+                "flagged_claims": [], "error": None}
+    monkeypatch.setattr(coord, "_resume", fake_resume)
+
+    result = asyncio.run(coord.route("continue"))
+    # continue-intent is handled BEFORE the silent discard: the staged batch
+    # stays restorable until the user moves on with a different question.
+    assert result["answer"] == "RESUMED"
+    assert resumed["cp"]["staged_slot"] == STAGED_SLOT
+
+
+def test_d3_operational_non_staged_checkpoint_still_prompts(slot, coord, monkeypatch):
+    # Negative guard: only a staged_slot bypasses the prompt — an agent-loop
+    # 429 checkpoint (operational, no slot) keeps confirm-before-discard.
+    ckpt.save_checkpoint(route="operational", question=SAVED_Q,
+                         messages=[{"role": "user", "content": SAVED_Q}])
+    seen = _count_processing(coord, monkeypatch)
+
+    result = asyncio.run(coord.route(NEW_Q))
+    assert result["route"] == "checkpoint_confirm"
+    assert seen["op"] == 0 and seen["an"] == 0
+    assert slot.exists()
 
 
 def test_d_c_stale_slot_no_prompt_processes_directly(slot, coord, monkeypatch):

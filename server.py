@@ -686,14 +686,19 @@ async def _process_turn(message: str) -> JSONResponse:
                 # verified slot (keep-until-confirm: /confirm outcomes clear
                 # it). On a resume turn `message` is "continue", but the flow
                 # turns and original question ride the result dict from the
-                # checkpoint — the re-save never stores ["continue"].
+                # checkpoint — the re-save never stores ["continue"]. Same on
+                # a discard-confirm turn, where `message` is 'new': the
+                # coordinator's resolved_question carries the stashed question
+                # it actually processed, so prefer it over `message`.
                 if verdict.get("verdict") == "PASS":
                     try:
                         slot_list = json.loads(slot_raw).get("staged_workouts")
                         if slot_list:
                             _ckpt.save_checkpoint(
                                 route="operational",
-                                question=result.get("restored_question") or message,
+                                question=(result.get("restored_question")
+                                          or result.get("resolved_question")
+                                          or message),
                                 staged_slot=slot_list,
                                 log_flow_turns=(result.get("log_flow_turns")
                                                 or [message]),
