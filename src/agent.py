@@ -557,7 +557,10 @@ class AgentSession:
                     "description": (
                         "Store a fact about the user for future sessions. Call when the user "
                         "tells you something personal, states a preference, mentions an injury, "
-                        "reveals a training pattern, or clarifies a data convention not in user_context.json."
+                        "reveals a training pattern, or clarifies a data convention not in user_context.json. "
+                        "Express any time reference as absolute dates (e.g. 'since 2026-04-01'), "
+                        "never relative to today ('last month', 'past 3 weeks') — the fact is "
+                        "re-read months later, when relative phrasing has gone stale."
                     ),
                     "parameters": {
                         "type": "object",
@@ -1217,7 +1220,8 @@ class AgentSession:
 
         prompt = (
             "You are extracting long-term facts worth remembering about this user's "
-            "fitness training. Review the conversation and extract ONLY facts that "
+            f"fitness training. Today's date is {_date.today().isoformat()}. "
+            "Review the conversation and extract ONLY facts that "
             "meet ALL of these criteria:\n\n"
             "EXTRACT:\n"
             "- Training preferences (frequency, timing, style)\n"
@@ -1234,8 +1238,13 @@ class AgentSession:
             "bar weights, unit preferences)\n"
             "- Anything that could change next session\n\n"
             "Format each fact as a single clear statement about the user.\n"
+            "TIME REFERENCES MUST BE ABSOLUTE: the fact is re-read months from "
+            "now, when phrasing relative to today has gone stale and misleads. "
+            "Use explicit dates or ranges (\"since 2026-04-01\", \"between "
+            "2026-04-10 and 2026-07-09\") — never \"last 3 months\", \"past 70 "
+            "days\", \"recently\".\n"
             "Example good fact: \"User has been unable to increase Barbell Curl "
-            "weight beyond 52 lbs for the past 3 months.\"\n"
+            "weight beyond 52 lbs since 2026-04-01 (as of 2026-07-09).\"\n"
             "Example bad fact: \"User asked about their Barbell Curl PR.\"\n\n"
             f"Conversation:\n{conversation_text}\n\n"
             "Return JSON array of facts to store, or empty array [] if nothing qualifies."

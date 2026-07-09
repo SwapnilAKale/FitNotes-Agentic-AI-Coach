@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -36,6 +37,45 @@ def _get_chroma_collection():
 MEMORY_PATH = Path("data/memory.json")
 MAX_FACTS = 30
 
+# ── Relative-time disambiguation guard ───────────────────────────────────────
+# Stored facts are re-read on later sessions with NO per-fact date attached
+# (the prompt formatters emit content only, never created_at), so a fact
+# phrased relative to its write date ("stalled over the last 70 days") turns
+# false as time passes. Deterministic fix at the single write chokepoint
+# (add_fact serves both the auto-extractor and the remember_fact tool): any
+# content carrying a relative-time phrase gets a fixed anchor appended —
+# "(as of YYYY-MM-DD)" — which makes the statement interpretable forever.
+# The regex is deliberately BROAD: a false positive costs one harmless anchor
+# suffix, a false negative ships an ambiguous memory (safe-not-fast bias).
+_RELATIVE_TIME_RE = re.compile(
+    r"\b(?:"
+    r"(?:last|past|previous|next|coming)\s+"
+    r"(?:\d+\s+|few\s+|couple(?:\s+of)?\s+|several\s+)?"
+    r"(?:day|week|month|year|session)s?\b"
+    r"|\d+\s+(?:day|week|month|year|session)s?\s+ago\b"
+    r"|recent(?:ly)?\b"
+    r"|currently\b|now\b|nowadays\b|these\s+days\b"
+    r"|today\b|yesterday\b|tomorrow\b"
+    r"|this\s+(?:week|month|year)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+# A trailing anchor stamp. Used both to avoid double-stamping and to strip the
+# stamp for dedup comparison (the same fact re-extracted on a different day
+# would otherwise differ only by its stamp and store twice).
+_AS_OF_RE = re.compile(r"\s*\(as of \d{4}-\d{2}-\d{2}\)\s*$", re.IGNORECASE)
+
+
+def _has_relative_time(content: str) -> bool:
+    """True when the content contains a time reference relative to 'now'."""
+    return bool(_RELATIVE_TIME_RE.search(content or ""))
+
+
+def _strip_as_of(content: str) -> str:
+    """Content without its trailing '(as of YYYY-MM-DD)' stamp, stripped."""
+    return _AS_OF_RE.sub("", content or "").strip()
+
 
 def load_memory() -> dict:
     if not MEMORY_PATH.exists():
@@ -66,9 +106,19 @@ def add_fact(category: str, content: str,
     # use. See src/demographics.py for the tier model + full policy.
     memory = load_memory()
 
+    content = (content or "").strip()
+
+    # Dedup on stamp-STRIPPED content: the same fact re-saved on a different
+    # day would carry a different "(as of ...)" stamp — still a duplicate.
+    norm_new = _strip_as_of(content).lower()
     for fact in memory["facts"]:
-        if fact["content"].strip().lower() == content.strip().lower():
+        if _strip_as_of(fact["content"]).lower() == norm_new:
             return {"status": "duplicate", "message": "Already stored."}
+
+    # Relative-time guard: anchor any relative phrasing to today's date so the
+    # fact stays interpretable on every future read. Never double-stamps.
+    if _has_relative_time(_strip_as_of(content)) and not _AS_OF_RE.search(content):
+        content = f"{content} (as of {datetime.now().date().isoformat()})"
 
     fact = {
         "id": str(uuid.uuid4())[:8],
