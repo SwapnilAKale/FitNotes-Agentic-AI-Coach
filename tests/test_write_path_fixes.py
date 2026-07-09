@@ -251,15 +251,20 @@ def _staged_metric(exercise, date, set_dict):
     return cs._staged_writes["workout"][-1]["sets"][0]["metric_weight"]
 
 
-def test_kg_on_lbs_native_stores_kg_figure_directly(db):
-    # 60 kg on Barbell Row (lbs-native): typed lbs = 60*2.2046 = 132.28, so
-    # metric_weight = 132.28/2.2046 = 60.0 — recovers to 132.3 lbs ≡ 60 kg.
-    m = _staged_metric("Barbell Row", "2026-07-05",
-                       {"weight": 60, "unit": "kg", "reps": 8})
-    assert m == pytest.approx(60.0)
-    assert m * 2.2046 == pytest.approx(132.276, abs=0.01)   # read-back mass
-    # Negative: the old lbs-assumed value (60/2.2046 = 27.2158) must be gone.
-    assert m != pytest.approx(27.2158, abs=0.01)
+def test_kg_on_lbs_native_is_refused_never_staged(db):
+    # REWRITTEN (Issue 1 final, old→new): this used to pin the raw-store
+    # special case (60 kg on lbs-native → metric_weight = 60.0). That branch
+    # is deleted — a non-native-unit set is now REFUSED at the boundary
+    # before anything is staged (an agent-side unit change either poisons
+    # aggregates with a mixed frame or contradicts the next backup upload).
+    out = json.loads(cs._log_workout_sync(
+        {"exercise_name": "Barbell Row", "date": "2026-07-05",
+         "sets": [{"weight": 60, "unit": "kg", "reps": 8}]}))
+    assert out.get("error") and out.get("needs_clarification")
+    assert out.get("unit_mismatch") is True
+    assert "lbs" in out["message"]                    # names the native unit
+    assert "132.3" in out["message"]                  # tool-computed ≈ conversion
+    assert cs._staged_writes.get("workout", []) == [] # NOTHING staged
 
 
 def test_lbs_input_byte_unchanged(db):
@@ -289,12 +294,18 @@ def test_deadlift_kg_era_kg_input_unchanged(db):
     assert m == pytest.approx(54.4316, abs=0.001)           # the live-DB value
 
 
-def test_deadlift_lbs_era_stays_lbs_typed(db):
-    # Before the 2025-12-26 switch Deadlift was lbs-native: a kg input there
-    # converts like any lbs-native exercise (metric = the kg figure).
-    m = _staged_metric("Deadlift", "2025-11-01",
-                       {"weight": 60, "unit": "kg", "reps": 5})
-    assert m == pytest.approx(60.0)
+def test_deadlift_lbs_era_kg_input_refused(db):
+    # REWRITTEN (Issue 1 final, old→new): before the 2025-12-26 switch
+    # Deadlift was lbs-native, and this used to pin the raw-store conversion
+    # (metric = the kg figure). The guard is date-aware: a kg input in the
+    # lbs era is now refused with a restate ask, exactly like any lbs-native
+    # exercise. (The kg-era kg input staying /2.2046 is pinned above.)
+    out = json.loads(cs._log_workout_sync(
+        {"exercise_name": "Deadlift", "date": "2025-11-01",
+         "sets": [{"weight": 60, "unit": "kg", "reps": 5}]}))
+    assert out.get("error") and out.get("unit_mismatch") is True
+    assert "lbs" in out["message"]
+    assert cs._staged_writes.get("workout", []) == []
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -50,8 +50,9 @@ def _make_db(path):
             comment TEXT
         );
         INSERT INTO exercise (_id, name, category_id) VALUES
-            (1, 'Test Press', 5),     -- strength (Back)
-            (2, 'Treadmill', 8);      -- cardio
+            (1, 'Test Press', 5),                 -- strength (Back), lbs-native
+            (2, 'Treadmill', 8),                  -- cardio
+            (99, 'Seated Machine Curl (Kg)', 2);  -- strength, kg-native (high _id: several tests insert their own _id 3/4)
         """
     )
     conn.commit()
@@ -125,9 +126,13 @@ def test_cardio_duration_only_writes_unit2_distance_zero(db):
 
 def test_strength_unit_stays_zero_regression(db):
     # The vestigial constant must remain 0, and cardio columns default to 0.
+    # REWRITTEN (Issue 1 final, old→new): this used to stage 80 kg — a
+    # MISMATCHED unit on lbs-native Test Press — which the native-unit guard
+    # now refuses (pinned in test_unit_guard.py). The intent here is the
+    # unit-column/comment-row invariants, so the set uses the matched unit.
     _stage_execute({
         "exercise_name": "Test Press", "date": "2026-06-04",
-        "sets": [{"weight": 80.0, "unit": "kg", "reps": 8}],
+        "sets": [{"weight": 80.0, "unit": "lbs", "reps": 8}],
     })
     r = _rows(db)[0]
     assert r["unit"] == 0
@@ -157,10 +162,14 @@ def test_multi_set_comment_lands_on_correct_owner(db):
 # ── Negative assertion — lbs/kg param never reaches the unit column ────────────
 
 def test_unit_param_never_leaks_into_metric_code(db):
-    for u in ("lbs", "kg"):
+    # REWRITTEN (Issue 1 final, old→new): both units used to stage on
+    # lbs-native Test Press; the native-unit guard now refuses the kg
+    # iteration before staging. The intent — the lbs/kg param never reaches
+    # the metric-code column — holds per unit on a MATCHING exercise.
+    for exercise, u in (("Test Press", "lbs"), ("Seated Machine Curl (Kg)", "kg")):
         cs._staged_writes.clear()
         cs._log_workout_sync({
-            "exercise_name": "Test Press", "date": "2026-06-06",
+            "exercise_name": exercise, "date": "2026-06-06",
             "sets": [{"weight": 100.0, "unit": u, "reps": 5}],
         })
         staged = cs._staged_writes["workout"][0]["sets"][0]   # slot is a list of workouts (Fix 3)

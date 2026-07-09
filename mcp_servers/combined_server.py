@@ -137,7 +137,12 @@ async def list_tools() -> list[types.Tool]:
                                 "unit": {
                                     "type": "string",
                                     "enum": ["lbs", "kg"],
-                                    "description": "display unit of weight (lbs/kg). Strength only.",
+                                    "description": (
+                                        "display unit of weight (lbs/kg). Strength only. "
+                                        "Pass EXACTLY the unit the user stated — a unit "
+                                        "that mismatches the exercise's native unit is "
+                                        "refused with a restate ask, never converted."
+                                    ),
                                 },
                                 "reps": {"type": "integer", "description": "strength: reps performed"},
                                 "comment": {
@@ -1392,6 +1397,36 @@ def _log_workout_sync(arguments: dict) -> str:
     pr_row = cursor.fetchone()
     current_pr_metric = pr_row["max_w"] if pr_row and pr_row["max_w"] is not None else 0.0
 
+    # ── Native-unit guard (Issue 1, final direction) ─────────────────────────
+    # The agent can NEVER log a weight in an exercise's non-native unit — an
+    # agent-side unit change (per-record or config) either poisons every
+    # aggregate with a mixed frame or contradicts the next uploaded backup.
+    # The wrong option is removed at the boundary: refuse BEFORE anything is
+    # staged (whole-call atomic — earlier calls' staged exercises untouched)
+    # and ask for the weight restated in the native unit. The ≈-conversion is
+    # tool-computed so the user can simply confirm the converted number; the
+    # LLM does no math. Cardio has no weight unit — the guard skips it.
+    if not is_cardio:
+        native_unit = "kg" if _is_kg_native_rule(exercise_name, date_str) else "lbs"
+        for s in sets:
+            set_unit = str(s.get("unit") or arguments.get("unit") or "").strip().lower()
+            if set_unit in ("kg", "lbs") and set_unit != native_unit:
+                w = float(s.get("weight") or 0)
+                conv = round(w * 2.2046, 1) if set_unit == "kg" else round(w / 2.2046, 1)
+                conn.close()
+                return json.dumps({
+                    "error": True,
+                    "needs_clarification": True,
+                    "unit_mismatch": True,
+                    "message": (
+                        f"{exercise_name} is logged in {native_unit}, not "
+                        f"{set_unit}. ({w:g} {set_unit} ≈ {conv:g} "
+                        f"{native_unit}.) Nothing was staged. Ask the user to "
+                        f"restate the weight in {native_unit} — the unit of an "
+                        f"exercise can never be changed from here."
+                    ),
+                })
+
     # Each staged set is the CANONICAL row (final column values for its metric
     # type), so the execute handler and WAL replay are blind, identical writers.
     # `unit` is the METRIC-TYPE code (0/2/3), never the lbs/kg display unit — the
@@ -1422,17 +1457,11 @@ def _log_workout_sync(arguments: dict) -> str:
             weight = float(s["weight"])
             reps = int(s["reps"])
             # Storage invariant: metric_weight = typed_number / 2.2046, where
-            # the typed number is in the exercise's NATIVE display unit
-            # (kg-native rule). A kg input on an lbs-native exercise must be
-            # converted to typed lbs first: X kg = X*2.2046 lbs, so
-            # metric_weight = (X*2.2046)/2.2046 = X — the kg figure directly
-            # (same rule as the analytical comment-unit override). kg on a
-            # kg-native exercise and lbs/absent stay typed_number/2.2046.
-            set_unit = str(s.get("unit") or arguments.get("unit") or "").strip().lower()
-            if set_unit == "kg" and not _is_kg_native_rule(exercise_name, date_str):
-                metric_weight = weight
-            else:
-                metric_weight = weight / 2.2046
+            # the typed number is in the exercise's NATIVE display unit. The
+            # native-unit guard above refused any non-native-unit set before
+            # staging, so every set that reaches here is native-framed — the
+            # old kg-on-lbs-native raw-store special case is deleted forward.
+            metric_weight = weight / 2.2046
             is_pr = metric_weight > current_pr_metric
             if is_pr:
                 current_pr_metric = metric_weight
