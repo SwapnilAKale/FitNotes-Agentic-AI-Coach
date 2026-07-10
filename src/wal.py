@@ -31,6 +31,8 @@ import json
 import logging
 import os
 import sqlite3
+import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -38,7 +40,35 @@ from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
-WAL_PATH = os.environ.get("AGENT_WRITES_PATH", "data/agent_writes.json")
+_DEFAULT_WAL_PATH = "data/agent_writes.json"
+WAL_PATH = os.environ.get("AGENT_WRITES_PATH", _DEFAULT_WAL_PATH)
+
+_pytest_redirect_warned = False
+
+
+def _effective_path() -> str:
+    """
+    The WAL path all file I/O actually uses.
+
+    Last-line guard: if we are running under pytest (PYTEST_CURRENT_TEST is
+    set, and it is inherited by MCP subprocesses spawned from a test) and
+    nobody isolated the WAL — no AGENT_WRITES_PATH override, WAL_PATH still
+    the default — redirect to a per-process temp file so test writes can
+    never pollute the real journal. Test fixtures that set WAL_PATH or the
+    env var keep full control.
+    """
+    global _pytest_redirect_warned
+    if (WAL_PATH == _DEFAULT_WAL_PATH
+            and "AGENT_WRITES_PATH" not in os.environ
+            and "PYTEST_CURRENT_TEST" in os.environ):
+        redirect = os.path.join(tempfile.gettempdir(),
+                                f"agent_writes.pytest-{os.getpid()}.json")
+        if not _pytest_redirect_warned:
+            _pytest_redirect_warned = True
+            print(f"[wal] pytest detected with no WAL isolation — "
+                  f"redirecting writes to {redirect}", file=sys.stderr)
+        return redirect
+    return WAL_PATH
 
 # One lock guards every read-modify-write of the WAL file. replay_writes
 # holds it for the whole replay so a concurrent append can't be lost.
@@ -55,10 +85,11 @@ class _ReplayConflict(Exception):
 # ── File I/O (callers must hold _lock) ─────────────────────────────────────────
 
 def _load() -> list:
-    if not os.path.exists(WAL_PATH):
+    path = _effective_path()
+    if not os.path.exists(path):
         return []
     try:
-        with open(WAL_PATH, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         if not isinstance(data, list):
             raise ValueError(f"expected a JSON list, got {type(data).__name__}")
@@ -66,22 +97,23 @@ def _load() -> list:
     except (json.JSONDecodeError, ValueError, OSError) as exc:
         # Never silently overwrite a corrupt WAL — move it aside so the
         # records can be recovered by hand, then start fresh.
-        quarantine = f"{WAL_PATH}.corrupt-{int(time.time())}"
+        quarantine = f"{path}.corrupt-{int(time.time())}"
         try:
-            os.replace(WAL_PATH, quarantine)
+            os.replace(path, quarantine)
             logger.error("[wal] %s is unreadable (%s) — moved to %s",
-                         WAL_PATH, exc, quarantine)
+                         path, exc, quarantine)
         except OSError:
             logger.error("[wal] %s is unreadable (%s) and could not be "
-                         "quarantined", WAL_PATH, exc)
+                         "quarantined", path, exc)
         return []
 
 
 def _save(records: list) -> None:
-    parent = os.path.dirname(WAL_PATH)
+    path = _effective_path()
+    parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, exist_ok=True)
-    tmp = WAL_PATH + ".tmp"
+    tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(records, f, indent=2)
     # Atomic on the same filesystem. On Windows, OneDrive/antivirus can hold
@@ -89,7 +121,7 @@ def _save(records: list) -> None:
     # PermissionError — retry briefly before giving up.
     for attempt in range(10):
         try:
-            os.replace(tmp, WAL_PATH)
+            os.replace(tmp, path)
             return
         except PermissionError:
             if attempt == 9:

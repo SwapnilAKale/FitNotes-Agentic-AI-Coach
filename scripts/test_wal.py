@@ -27,6 +27,11 @@ sys.path.insert(0, _REPO_ROOT)
 from dotenv import load_dotenv
 load_dotenv()
 
+# This script stages throwaway records — it must never touch the real
+# journal. Redirect before importing wal (WAL_PATH is read at import).
+os.environ["AGENT_WRITES_PATH"] = os.path.join(
+    tempfile.mkdtemp(prefix="wal_script_test_"), "agent_writes.json")
+
 from src import wal
 
 DB_PATH = os.environ.get("FITNOTES_DB_PATH", "./data/FitNotes_Backup.fitnotes")
