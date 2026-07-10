@@ -41,6 +41,7 @@ from src import coordinator as coordinator_mod          # noqa: E402
 from src.coordinator import (                            # noqa: E402
     Coordinator,
     MSG_NO_WRITE_OCCURRED,
+    MSG_STAGED_NOT_SAVED,
 )
 import mcp_servers.combined_server as cs                 # noqa: E402
 
@@ -349,14 +350,20 @@ def test_success_claim_ships_when_write_actually_happened(monkeypatch):
     assert answer == _FALSE_SUCCESS                     # backed claim untouched
 
 
-def test_success_claim_ships_on_staged_turn(monkeypatch):
+def test_staged_turn_saved_claim_rewritten_not_shipped(monkeypatch):
+    # REWRITTEN (was test_success_claim_ships_on_staged_turn): the old pin let
+    # a staged-only turn ship "successfully logged to your database" untouched
+    # — hole A of the claim gate. A staged batch is NOT a completed write; the
+    # gate now replaces the premature claim with the truthful staged-not-saved
+    # message (see test_confirmation_gate_integrity.py for the full matrix).
     agent = FakeAgent(answer_text=_FALSE_SUCCESS, staging_reached_confirm=False,
                       staged_this_turn=True)
     coord = _make_coord(monkeypatch, agent)
 
     answer = asyncio.run(coord._run_operational("log bench 100x5"))
 
-    assert answer == _FALSE_SUCCESS
+    assert answer == MSG_STAGED_NOT_SAVED
+    assert "successfully" not in answer.lower()
 
 
 def test_success_claim_ships_when_execute_attempted(monkeypatch):

@@ -576,9 +576,39 @@ _WRITE_SUCCESS_CLAIM_RE = re.compile(
     r")"
 )
 
+# Hole B: looser completion phrasings the narrow regex misses ("I've logged
+# your workout.", "Your workout is saved.", "You're all set!"). Checked ONLY
+# on logging-flow turns (log_boundary/fallback_write — /log boundary, carry
+# reply, or regex-inferred write), where such a phrase can only refer to the
+# workout write. Globally these are ordinary speech ("you're all set for
+# tomorrow", "I've saved that to memory") and replacing a legitimate
+# non-logging answer with the no-write message would be a real false
+# positive — the structural flow fact scopes the looser detector.
+_LOG_FLOW_CLAIM_RE = re.compile(
+    r"(?i)(?:"
+    # Unqualified first-person completions — no trailing qualifier required.
+    r"\bi(?:'ve|\s+have)?\s+(?:logged|saved|recorded|added|written|updated)\b"
+    # Subject-state completions ("Your workout is saved.", "3 sets were added").
+    r"|\b(?:workouts?|sets?|exercises?|goals?|entry|entries|it)\s+"
+    r"(?:is|was|are|were|(?:has|have)\s+been)\s+(?:now\s+)?"
+    r"(?:logged|saved|recorded|added|written|in\s+the\s+books)\b"
+    # "You're all set!" / "All set." — \b already excludes "all sets".
+    r"|\ball\s+set\b"
+    r")"
+)
+
 MSG_NO_WRITE_OCCURRED = (
     "⚠️ Nothing was written to your database this turn — no write was "
     "executed. Please re-state your logging request (tip: start with /log)."
+)
+
+# Hole A's truthful replacement: the turn DID stage a batch but no execute was
+# attempted and nothing was written — a completed-write claim is premature,
+# not baseless. Never claims failure (the CLI executes right after this text;
+# the web panel supersedes it when the slot is real).
+MSG_STAGED_NOT_SAVED = (
+    "⚠️ That isn't saved yet — it's staged and still needs your confirmation "
+    "before anything is written to your database."
 )
 
 
@@ -2024,17 +2054,35 @@ class Coordinator:
         answer = result.get("answer", "")
         # ── Write-success claim gate: a success claim can never ship unless a
         # write/stage/execute actually happened this turn. Structural facts
-        # decide (all three False ⇒ any completed-write claim is false by
-        # construction); the regex only detects that a claim is being made,
-        # so a clarification question with the same flags is never touched.
+        # decide; the regex only detects that a claim is being made, so a
+        # clarification question with the same flags is never touched. Tiers:
+        #   - wrote (db_write_effect) or reached the execute gate
+        #     (staging_reached_confirm) → untouched, the claim has backing;
+        #   - staged only (staged_this_turn, hole A) → the claim is premature,
+        #     not baseless: replace with the truthful staged-not-saved text
+        #     (never "nothing was written" — the CLI executes immediately
+        #     after this answer, and a false-failure line would contradict
+        #     the ✅ that follows);
+        #   - none of the three → any completed-write claim is false by
+        #     construction: replace with the no-write message.
+        # Claim presence: the narrow regex everywhere; the looser one only on
+        # logging-flow turns (see _LOG_FLOW_CLAIM_RE's rationale).
+        _claim_made = bool(_WRITE_SUCCESS_CLAIM_RE.search(answer)) or (
+            (log_boundary or fallback_write)
+            and bool(_LOG_FLOW_CLAIM_RE.search(answer)))
         if (not result.get("db_write_effect")
-                and not result.get("staged_this_turn")
                 and not result.get("staging_reached_confirm")
-                and _WRITE_SUCCESS_CLAIM_RE.search(answer)):
-            logger.warning(
-                "[coordinator] suppressed unbacked write-success claim: %r",
-                answer[:120])
-            answer = MSG_NO_WRITE_OCCURRED
+                and _claim_made):
+            if result.get("staged_this_turn"):
+                logger.warning(
+                    "[coordinator] rewrote premature saved-claim on a "
+                    "staged-only turn: %r", answer[:120])
+                answer = MSG_STAGED_NOT_SAVED
+            else:
+                logger.warning(
+                    "[coordinator] suppressed unbacked write-success claim: %r",
+                    answer[:120])
+                answer = MSG_NO_WRITE_OCCURRED
         if log_boundary or fallback_write:
             # Fallback (regex-inferred) writes are the same flow as /log turns:
             # a turn that ends pending a logging clarification must carry the

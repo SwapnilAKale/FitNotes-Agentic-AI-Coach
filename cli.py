@@ -59,9 +59,27 @@ async def _finalize_staged_workout(session, coordinator, result, question) -> st
     fails OPEN — the interactive gate already showed the write, and stage 3
     sees a not-verified signal. Returns the line to print.
     """
-    verdict = {"verdict": "ERROR", "reason": "verify unavailable"}
+    # Slot FIRST (same seam as server.py's ghost-panel guard): the gate flag
+    # was armed at tool-CALL time, so only the slot proves staging happened.
+    # PROVEN empty (successful read, empty list) ⇒ the call was refused (unit
+    # guard / clarification) — nothing to verify or execute; the agent's ask
+    # was already printed, so return no extra line. Read failure is UNKNOWN ⇒
+    # keep today's path (execute on an empty slot is a no-op error).
+    slot_raw = ""
     try:
         slot_raw = await session.call_tool("read_staged_workout_slot", {})
+        if json.loads(slot_raw).get("staged_workouts") == []:
+            print("[cli] ghost confirm suppressed — log_workout was called "
+                  "but staged nothing", file=sys.stderr)
+            return ""
+    except Exception as exc:
+        print(f"[cli] staged-slot read failed: {exc}", file=sys.stderr)
+    verdict = {"verdict": "ERROR", "reason": "verify unavailable"}
+    try:
+        if not slot_raw:
+            # Slot read failed above — non-verifiable, never diff a good
+            # batch against an empty string and FAIL it.
+            raise RuntimeError("slot read failed — verify skipped")
         fmt = json.loads(await session.call_tool(
             "format_staged_workout_for_confirmation", {}))
         # verify_log_staging skips the LLM (verdict ERROR) when preview is
@@ -272,7 +290,10 @@ async def main() -> None:
                         turn_state["staged_workout"] = False
                         line = await _finalize_staged_workout(
                             session, coordinator, result, question)
-                        print(f"{line}\n")
+                        # "" = ghost suppressed (nothing was staged) — the
+                        # agent's ask above is the turn's whole output.
+                        if line:
+                            print(f"{line}\n")
                     elif result.get("restore_staged"):
                         # Resume of a quota-interrupted /log turn: the
                         # coordinator restored the checkpointed batch — pass

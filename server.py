@@ -592,6 +592,11 @@ async def _process_turn(message: str) -> JSONResponse:
             # so without a source tag a live run can't tell a working slot-read
             # from a silent fallback — a false-pass. Surfaced in the response.
             preview_source = "args_fallback"
+            # Ghost-panel guard outcome: True means the pending flag was armed
+            # by a log_workout CALL that staged nothing (a refusal /
+            # clarification return) — fall through to the normal answer so the
+            # agent's ask reaches the user instead of a panel for no batch.
+            ghost_suppressed = False
             # Workout path: the panel gates the write, so it must render the
             # staged SLOT — the exact payload execute will write — formatted
             # deterministically in the MCP subprocess, not the tool args and
@@ -599,6 +604,30 @@ async def _process_turn(message: str) -> JSONResponse:
             # Defensive: any failure falls back to the args-based preview so
             # the panel never blanks.
             if _state["pending_execute_kind"] == "workout":
+                # Slot FIRST: _confirmation_handler arms pending at tool CALL
+                # time (a pre-call hook cannot see the outcome), so the slot is
+                # the only structural fact that says staging actually happened.
+                # PROVEN empty (successful read, empty list) ⇒ ghost — suppress
+                # the panel entirely. Read failure / malformed shape is UNKNOWN
+                # ⇒ fail toward the panel (execute on an empty slot is a no-op
+                # error, but suppressing a real batch would lose a write).
+                slot_raw = ""
+                slot_list = None
+                try:
+                    slot_raw = await session.call_tool(
+                        "read_staged_workout_slot", {})
+                    slot_list = json.loads(slot_raw).get("staged_workouts")
+                except Exception as exc:
+                    print(f"[server] staged-slot read failed: {exc}",
+                          file=sys.stderr)
+                if slot_list == []:
+                    _state["pending_execute_kind"] = None
+                    print("[server] ghost confirmation suppressed — "
+                          "log_workout was called but staged nothing",
+                          file=sys.stderr)
+                    ghost_suppressed = True
+            if (_state["pending_execute_kind"] == "workout"
+                    and not ghost_suppressed):
                 try:
                     slot = json.loads(await session.call_tool(
                         "format_staged_workout_for_confirmation", {}))
@@ -624,10 +653,11 @@ async def _process_turn(message: str) -> JSONResponse:
                 # human check of the slot rendering. Defensive throughout — a
                 # verify-layer crash must not 500 the turn.
                 verdict = {"verdict": "ERROR", "reason": "verify unavailable"}
-                slot_raw = ""
                 try:
-                    slot_raw = await session.call_tool(
-                        "read_staged_workout_slot", {})
+                    if slot_list is None and not slot_raw:
+                        # The slot-first read failed — non-verifiable, never
+                        # diff a good batch against an empty string and FAIL.
+                        raise RuntimeError("slot read failed — verify skipped")
                     restored = result.get("restored_verify")
                     if (isinstance(restored, dict)
                             and restored.get("verdict") == "PASS"):
@@ -707,11 +737,14 @@ async def _process_turn(message: str) -> JSONResponse:
                     except Exception as exc:
                         print(f"[server] staged checkpoint save failed: {exc}",
                               file=sys.stderr)
-            return JSONResponse(content={
-                "type": "confirmation_required",
-                "preview": preview,
-                "preview_source": preview_source,
-            })
+            if not ghost_suppressed:
+                return JSONResponse(content={
+                    "type": "confirmation_required",
+                    "preview": preview,
+                    "preview_source": preview_source,
+                })
+            # Ghost suppressed: fall through to the normal answer return —
+            # the agent's refusal/clarification ask is the turn's real output.
         # #2: the Coordinator already builds a graceful, user-facing answer for
         # BOTH the operational fallback (pipeline failure) AND the
         # DataAgentIntegrityError case. Surface THAT answer — never the raw error
