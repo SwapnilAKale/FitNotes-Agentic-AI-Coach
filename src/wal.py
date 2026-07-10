@@ -154,6 +154,30 @@ def get_records() -> list:
         return _load()
 
 
+def wipe() -> dict:
+    """
+    Empty the journal (user-initiated 'clear saved chat logs').
+
+    The current records are archived next to the WAL file first —
+    agent_writes.archive-<UTC-ts>.json — so a mistaken wipe is recoverable
+    by hand. An already-empty journal produces no archive.
+    """
+    with _lock:
+        records = _load()
+        archive = None
+        if records:
+            path = _effective_path()
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            archive = os.path.join(os.path.dirname(path) or ".",
+                                   f"agent_writes.archive-{stamp}.json")
+            with open(archive, "w", encoding="utf-8") as f:
+                json.dump(records, f, indent=2)
+            _save([])
+    if records:
+        logger.info("[wal] wiped %d records (archived to %s)", len(records), archive)
+    return {"wiped": len(records), "archive": archive}
+
+
 def replay_writes(db_path: str) -> dict:
     """
     Re-execute every pending WAL record against db_path.

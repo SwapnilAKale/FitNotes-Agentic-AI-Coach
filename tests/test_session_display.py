@@ -118,13 +118,15 @@ def test_category_mode_shares_bar_conversion():
     """Category-mode Barbell Row weights must equal _bar_inclusive_weight computed
     directly from the raw rows — proving the shared leaf conversion is applied,
     not bypassed."""
+    # 2026-03-30 is the only real Barbell Row session (the previous pin's
+    # 2026-06-14 rows were test pollution, removed in the Session-13 cleanup).
     ctx = load_user_context()
-    rows = _raw_rows("Barbell Row", "2026-06-14")
-    expected = [_bar_inclusive_weight(ctx, "Barbell Row", "2026-06-14", r["metric_weight"])[0]
+    rows = _raw_rows("Barbell Row", "2026-03-30")
+    expected = [_bar_inclusive_weight(ctx, "Barbell Row", "2026-03-30", r["metric_weight"])[0]
                 for r in rows]
-    assert expected == [104.1, 114.1, 124.1]  # cross-check the literal too
+    assert expected == [44.1, 44.1, 54.1, 44.1]  # cross-check the literal too
 
-    out = get_category_session("Back", "2026-06-14")
-    ex = out["exercises"][0]
+    out = get_category_session("Back", "2026-03-30")
+    ex = next(e for e in out["exercises"] if e["exercise"] == "Barbell Row")
     got = [float(s.split(" lbs ")[0].split(": ")[1]) for s in ex["display_sets"]]
     assert got == expected

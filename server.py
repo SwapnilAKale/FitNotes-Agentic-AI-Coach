@@ -30,7 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from src.agent import AgentSession
 from src.coordinator import Coordinator, MSG_VERIFY_RESTATE, format_verify_fail_message
 from src import checkpoint as _ckpt
-from src import wal
+from src import settings, wal
 
 DB_PATH = os.environ.get("FITNOTES_DB_PATH", "./data/FitNotes_Backup.fitnotes")
 FRONTEND_SERVER = Path(__file__).parent / "frontend" / "server.py"
@@ -422,6 +422,10 @@ class ChatRequest(BaseModel):
 
 class ConfirmRequest(BaseModel):
     confirmed: bool
+
+
+class SettingsRequest(BaseModel):
+    wal_replay_enabled: bool
 
 
 def _parse_retry_seconds(msg: str) -> int | None:
@@ -904,6 +908,22 @@ async def reload_db(new_exercises: list = None):
     return JSONResponse(content=payload)
 
 
+async def _maybe_replay_wal() -> dict:
+    """
+    Replay journaled writes onto the freshly written DB file — unless the
+    user turned replay off (settings: wal_replay_enabled). Skipping leaves
+    every journal entry pending, so a later upload with replay re-enabled
+    still applies them.
+    """
+    if not settings.get_setting("wal_replay_enabled", True):
+        print("[Server] WAL replay skipped — disabled in settings.")
+        return {"replayed": 0, "conflicts": 0, "skipped": True}
+    wal_result = await asyncio.to_thread(wal.replay_writes, DB_PATH)
+    print(f"[Server] WAL replay: {wal_result['replayed']} replayed, "
+          f"{wal_result['conflicts']} conflicts.")
+    return wal_result
+
+
 @app.post("/upload")
 async def upload_db(file: UploadFile):
     import tempfile
@@ -950,10 +970,8 @@ async def upload_db(file: UploadFile):
 
                 # The fresh backup just wiped any agent-written rows — replay
                 # the journaled writes onto the new file before the agent
-                # reinitializes against it.
-                wal_result = await asyncio.to_thread(wal.replay_writes, DB_PATH)
-                print(f"[Server] WAL replay: {wal_result['replayed']} replayed, "
-                      f"{wal_result['conflicts']} conflicts.")
+                # reinitializes against it (unless the user disabled replay).
+                wal_result = await _maybe_replay_wal()
 
         except Exception as e:
             try:
@@ -993,10 +1011,8 @@ async def upload_confirm():
             _state["pending_upload_path"] = None
             _state["pending_upload_contents"] = None
 
-            # Same replay as /upload — this path also replaces the DB file.
-            wal_result = await asyncio.to_thread(wal.replay_writes, DB_PATH)
-            print(f"[Server] WAL replay: {wal_result['replayed']} replayed, "
-                  f"{wal_result['conflicts']} conflicts.")
+            # Same replay gate as /upload — this path also replaces the DB file.
+            wal_result = await _maybe_replay_wal()
 
     reload_response = await reload_db()
     payload = json.loads(reload_response.body)
@@ -1019,6 +1035,32 @@ async def wal_status():
         "conflicts": by_status["conflict"],
         "records":   records,
     })
+
+
+@app.get("/settings")
+async def get_settings():
+    records = await asyncio.to_thread(wal.get_records)
+    pending = sum(1 for r in records if r.get("status", "pending") == "pending")
+    return JSONResponse(content={
+        "wal_replay_enabled": bool(settings.get_setting("wal_replay_enabled", True)),
+        "wal_pending": pending,
+    })
+
+
+@app.post("/settings")
+async def post_settings(body: SettingsRequest):
+    value = bool(body.wal_replay_enabled)
+    await asyncio.to_thread(settings.set_setting, "wal_replay_enabled", value)
+    return JSONResponse(content={"wal_replay_enabled": value})
+
+
+@app.post("/wal-wipe")
+async def wal_wipe():
+    """Archive-then-empty the write-ahead log (user 'clear saved chat logs')."""
+    result = await asyncio.to_thread(wal.wipe)
+    print(f"[Server] WAL wiped: {result['wiped']} records "
+          f"(archive: {result['archive']}).")
+    return JSONResponse(content=result)
 
 
 @app.post("/upload/article")
