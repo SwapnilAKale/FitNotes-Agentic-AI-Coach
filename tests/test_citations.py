@@ -38,6 +38,57 @@ def some_exercise(pkg):
     pytest.skip("no exercise with a pr.weight in the pinned DB")
 
 
+# ── B5: date-aware claim-number extraction ────────────────────────────────────
+
+def test_claim_number_iso_date_not_fragment():
+    tags = C.parse_tags(
+        "Your most recent session was 2026-06-25 "
+        "[[exercises|Sumo Squats|progression.latest_session_date]].")
+    assert tags[0].associated_number == "2026-06-25"      # full date, not "-25"
+
+
+def test_claim_number_human_dates():
+    mf = C.parse_tags("It was June 25, 2026 [[exercises|X|progression.latest_session_date]].")
+    assert mf[0].associated_number == "June 25, 2026"
+    df = C.parse_tags("It was 25 June 2026 [[exercises|X|progression.latest_session_date]].")
+    assert df[0].associated_number == "25 June 2026"
+
+
+def test_claim_number_plain_numbers_unchanged():
+    assert C.parse_tags("You lifted 130 lbs [[exercises|X|pr.weight]].")[0].associated_number == "130"
+    assert C.parse_tags("a 11.5% gain [[exercises|X|progression.weight_change_pct]] here")[0]  # parses
+    assert C.parse_tags("gained 11.5% [[exercises|X|progression.weight_change_pct]].")[0].associated_number == "11.5"
+    assert C.parse_tags("count is 9 [[exercises|X|training_frequency.session_count]].")[0].associated_number == "9"
+
+
+# ── B3: a resolved list-leaf cite uses the cheap grounding path ───────────────
+
+_B3_PKG = {"exercises": [{"name": "Sumo Squats",
+                          "progression": {"latest_session_date": "2026-06-25"},
+                          "pain_analysis": {"pain_occurrences": [{"date": "2026-06-15",
+                                                                  "comment": "knee"}]}}]}
+
+
+def test_list_leaf_cite_uses_cheap_path():
+    draft = ("Latest 2026-06-25 [[exercises|Sumo Squats|progression.latest_session_date]]. "
+             "Knee pain [[exercises|Sumo Squats|pain_analysis.pain_occurrences]].")
+    cited = C.extract_cited_values(draft, _B3_PKG)
+    assert any(c["status"] == C.OK_NONSCALAR for c in cited)     # the list leaf
+    gctx = C.build_grounding_context(cited, _B3_PKG)
+    assert gctx["mode"] == "cheap"                                # was "full" before B3
+    loc = "exercises|Sumo Squats|pain_analysis.pain_occurrences"
+    carried = next(cv for cv in gctx["cited_values"] if cv["location"] == loc)
+    assert isinstance(carried["value"], list) and carried["value"]  # its value rides along
+
+
+def test_unresolvable_cite_still_forces_full():
+    # A fabricated session-path cite (B4) does not resolve → full path stays (safe).
+    draft = ("flagged [[sessions|2026-06-15|has_pain_flag]] and latest 2026-06-25 "
+             "[[exercises|Sumo Squats|progression.latest_session_date]].")
+    gctx = C.build_grounding_context(C.extract_cited_values(draft, _B3_PKG), _B3_PKG)
+    assert gctx["mode"] == "full"
+
+
 # ── parse ────────────────────────────────────────────────────────────────────
 
 def test_parse_multi_tag_midsentence():
@@ -401,9 +452,12 @@ def test_grounding_context_cheap_when_all_clean(pkg):
     assert "package" not in g
 
 
-@pytest.mark.parametrize("bad", [C.OK_NONSCALAR, C.NOT_FOUND, C.UNKNOWN_COLLECTION,
+# B3: OK_NONSCALAR is NO LONGER in this list — a resolved list-leaf cite is now
+# cheap-eligible (carries its own value; see test_list_leaf_cite_uses_cheap_path).
+# Only genuinely-UNRESOLVABLE statuses still force the full-package fallback.
+@pytest.mark.parametrize("bad", [C.NOT_FOUND, C.UNKNOWN_COLLECTION,
                                  C.MATCH_KEY_FLAG, C.ABSENT_VIOLATION])
-def test_grounding_context_full_when_any_not_clean(pkg, bad):
+def test_grounding_context_full_when_any_unresolvable(pkg, bad):
     cited = _clean_cited(2) + [{"claim_number": "9", "tag": "[[r|-|x]]",
         "collection": "rankings", "match_key": "-", "field_path": "highest_volume",
         "status": bad, "value": None}]

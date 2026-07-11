@@ -242,6 +242,75 @@ def test_dispatch_follows_route_not_text(coord, monkeypatch):
     assert seen["operational"] == 1 and seen["analytical"] == 0
 
 
+# ── Recall route (Issue 3 #2 — package-free conversational recall) ──────────
+
+def test_dispatch_recall_zero_lane_spend(coord, monkeypatch):
+    """A `recall` classification runs the recall lane ONLY — never the analytical
+    or operational lane (no package rebuild, so no wrong-predicate re-derivation)."""
+    monkeypatch.setattr(coord, "_classify", _classify_returning("recall"))
+    seen = _spy_downstream(coord, monkeypatch)
+
+    async def fake_recall(q):
+        return "You said your gain was 11.5%."
+    monkeypatch.setattr(coord, "_run_recall", fake_recall)
+
+    result = asyncio.run(coord.route("what was that number you just mentioned?"))
+    assert result["route"] == "recall"
+    assert result["answer"] == "You said your gain was 11.5%."
+    assert seen["analytical"] == 0 and seen["operational"] == 0
+
+
+def test_run_recall_reads_history_and_returns_text(coord):
+    # _run_recall hands the model ONLY the recent turns + the question and returns
+    # the model's text — the prior assistant answer must be in the prompt.
+    coord._history = [
+        {"role": "user", "content": "how has my lat pulldown progressed?"},
+        {"role": "assistant", "content": "Your working weight rose 11.5% to a peak of 145 lbs."},
+    ]
+    captured = {}
+
+    def gen(**kw):
+        captured["text"] = kw["contents"][0].parts[0].text
+        return SimpleNamespace(candidates=[SimpleNamespace(
+            content=SimpleNamespace(parts=[SimpleNamespace(text="You mentioned 11.5% (peak 145 lbs).")]))])
+    coord._client = SimpleNamespace(models=SimpleNamespace(generate_content=gen))
+
+    out = asyncio.run(coord._run_recall("what was that number?"))
+    assert out == "You mentioned 11.5% (peak 145 lbs)."
+    assert "11.5%" in captured["text"]                    # prior assistant answer present
+    assert "what was that number?" in captured["text"]    # current question present
+
+
+def test_run_recall_empty_history_no_crash(coord):
+    coord._history = []
+    coord._client = _client_returning("Which figure did you mean?")
+    out = asyncio.run(coord._run_recall("what number?"))
+    assert out == "Which figure did you mean?"
+
+
+def test_run_recall_fail_open_on_error(coord):
+    from src.coordinator import _RECALL_FALLBACK
+    coord._history = [{"role": "assistant", "content": "145 lbs"}]
+    coord._client = _client_raising(RuntimeError("boom"))
+    out = asyncio.run(coord._run_recall("what number?"))
+    assert out == _RECALL_FALLBACK
+
+
+def test_classify_prompt_has_recall_route():
+    from src.coordinator import _CLASSIFY_SYSTEM
+    low = _CLASSIFY_SYSTEM.lower()
+    assert '"recall"' in _CLASSIFY_SYSTEM        # schema enum
+    assert "RECALL —" in _CLASSIFY_SYSTEM        # the route section
+    assert "restate" in low                       # its core verb
+    assert "choose analytical" in low             # tie-break stays analytical
+
+
+def test_classify_prompt_has_display_intent():
+    from src.coordinator import _CLASSIFY_SYSTEM
+    assert "display_intent" in _CLASSIFY_SYSTEM     # schema + param
+    assert "DISPLAY phrasing" in _CLASSIFY_SYSTEM   # its definition (lean TRUE on display phrasing)
+
+
 # ── Prompt / docstring presence for the flip ────────────────────────────────
 
 def test_classify_prompt_default_is_analytical():

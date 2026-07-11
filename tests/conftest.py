@@ -55,6 +55,15 @@ def _isolated_settings(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolated_checkpoint(tmp_path, monkeypatch):
+    # src/checkpoint.py reads CHECKPOINT_PATH at call time — env alone isolates, so
+    # no test can pollute the real data/checkpoint.json JSON slot (a fake staged
+    # "log bench 100x5" write leaked into it once before this existed).
+    monkeypatch.setenv("CHECKPOINT_PATH", str(tmp_path / "checkpoint.json"))
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _isolated_wal(tmp_path, monkeypatch):
     wal_path = str(tmp_path / "agent_writes.json")
     # In-process writes (combined_server helpers called directly by tests).

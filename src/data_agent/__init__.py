@@ -95,30 +95,35 @@ def _derive_scope_from_package(
 
 
 def _display_scope(
-    exercise_names: Optional[list],
-    muscle_groups:  Optional[list],
-    unresolved:     Optional[list],
+    exercise_names:      Optional[list],
+    muscle_groups:       Optional[list],
+    unresolved:          Optional[list],
+    exercise_categories: Optional[dict] = None,
 ) -> list:
     """
     Display targets for the package's `display_sets` (pure — no SQL, no LLM):
-    ONE per resolved scope present — each resolved exercise AND each muscle group.
+    ONE per resolved scope present — each resolved exercise, plus each muscle group
+    that is NOT merely the parent category of a resolved exercise.
 
-    No XOR, no precedence. Dedup happens at flatten time
-    (session_display.build_all_display_sets): an exercise target already
-    contained in a built category block is emitted once, category copy kept.
-    The Analysis Agent picks display-vs-analyze
-    from the QUESTION (analytical questions ignore display_sets), so building a
-    block for every present scope is always safe. This deliberately supersedes the
-    old strict XOR, which dropped display entirely when a single-exercise question
-    also carried an inferred parent-group tag (e.g. Lat Pulldown + Back).
+    Dedup at flatten time (session_display.build_all_display_sets) keeps the whole
+    CATEGORY block and folds a contained exercise into it — so a single-exercise
+    question that also carried an *inferred parent* group (e.g. Dumbbell Hammer
+    Curl + Biceps) dumps the entire day. `exercise_categories` (exercise name → its
+    category) lets us drop that inferred-parent category target: the exercise's own
+    block already covers what was asked, and the other exercises in the group were
+    not. A genuinely independent group (a Chest exercise asked alongside "Back") is
+    not any resolved exercise's parent, so it is kept; a category-only question
+    (no exercise_names) is unaffected. When the map is absent, nothing is
+    suppressed (back-compatible).
 
     Returns [("exercise", name), …, ("category", group), …]; [] → no display_sets.
     """
     ex = exercise_names or []
     mg = muscle_groups or []
     resolved_ex = [n for n in ex if n not in (unresolved or [])]
+    parent_cats = {(exercise_categories or {}).get(n) for n in resolved_ex}
     targets = [("exercise", n) for n in resolved_ex]
-    targets += [("category", g) for g in mg]
+    targets += [("category", g) for g in mg if g not in parent_cats]
     return targets
 
 
@@ -197,6 +202,7 @@ def prepare_analysis_package(
     include_phase2:    bool            = True,
     reps_floor:        Optional[int]  = None,
     cardio_lock:       Optional[dict] = None,
+    display_intent:    bool            = True,
 ) -> dict:
     """
     Wrapper over collect() for the analytical pipeline.
@@ -227,20 +233,26 @@ def prepare_analysis_package(
     if unresolved:
         trimmed["unresolved_exercise_names"] = unresolved
 
-    # Approach (b): session-display is a NORMAL package field. Build a block for
-    # EVERY resolved scope present (each exercise, each muscle group) and flatten
-    # them into one display_sets list. The Analysis Agent decides display-vs-analyze
-    # from the QUESTION — there is no routing flag, and superset display data is
-    # safe (analytical questions ignore it).
-    targets = _display_scope(exercise_names, muscle_groups, unresolved)
-    if targets:
-        from . import session_display  # local import avoids any import cycle
-        # build_all_display_sets applies the exercise-inside-category dedup:
-        # an exercise already shown inside a category block is emitted once
-        # (category copy kept); non-overlapping targets are unchanged.
-        flat = session_display.build_all_display_sets(targets)
-        if flat:
-            trimmed["display_sets"] = flat
+    # Approach (b): session-display is a NORMAL package field — but attached ONLY for
+    # DISPLAY-shaped questions (display_intent). An analytical question gets NO
+    # display_sets, so the Analysis Agent has no [DISPLAY] block to reproduce and the
+    # fidelity stage force-injects nothing (root fix for the whole-day dump). Within a
+    # display question, _display_scope still suppresses a category target that is merely
+    # the inferred parent of a resolved exercise (Fix 1 — else a single-exercise "show
+    # me" dumps the whole day).
+    if display_intent:
+        exercise_categories = {ex["name"]: ex.get("category")
+                               for ex in package.get("exercises", []) if ex.get("name")}
+        targets = _display_scope(exercise_names, muscle_groups, unresolved,
+                                 exercise_categories)
+        if targets:
+            from . import session_display  # local import avoids any import cycle
+            # build_all_display_sets applies the exercise-inside-category dedup:
+            # an exercise already shown inside a category block is emitted once
+            # (category copy kept); non-overlapping targets are unchanged.
+            flat = session_display.build_all_display_sets(targets)
+            if flat:
+                trimmed["display_sets"] = flat
 
     _report_violations(validate(trimmed), "prepare_analysis_package")
     return trimmed

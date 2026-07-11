@@ -94,6 +94,28 @@ PAIN_KEYWORDS = [
     "wrist pain", "shoulder pain", "elbow pain", "knee pain", "back pain",
 ]
 
+# Body-part locations named in a comment, so a pain count can be SYMPTOM-AWARE
+# (a "cramping behind the knee N times" claim must not silently fold in a hip-pain
+# session). Keyword scan — a comment may name several parts or none. "back" is
+# deliberately narrowed to back-pain phrasings to avoid matching "back support" /
+# "going back". Applied only to pain-flagged comments.
+PAIN_LOCATIONS = {
+    "knee":      ["knee"],
+    "hip":       ["hip"],
+    "wrist":     ["wrist"],
+    "shoulder":  ["shoulder"],
+    "elbow":     ["elbow"],
+    "back":      ["back pain", "lower back", "low back", "spine", "lumbar"],
+    "neck":      ["neck"],
+    "hamstring": ["hamstring"],
+    "calf":      ["calf", "calves", "calfs"],
+    "quad":      ["quad"],
+    "ankle":     ["ankle"],
+    "forearm":   ["forearm"],
+    "bicep":     ["bicep"],
+    "femur":     ["femur"],
+}
+
 # ── Tier 1 pre-pass: unit-token detection and warmup gate ─────────────────────
 _STANDALONE_UNIT_RE     = re.compile(r'^\s*(?:kg|kgs|pounds|lbs)\s*$', re.IGNORECASE)
 _UNIT_KG_TOKENS         = frozenset({"kg", "kgs"})
@@ -277,6 +299,14 @@ def _is_pain_comment(comment: Optional[str]) -> bool:
     if not comment: return False
     c = comment.lower()
     return any(kw in c for kw in PAIN_KEYWORDS)
+
+
+def _pain_locations(comment: Optional[str]) -> list:
+    """Body-part locations named in a comment (keyword scan). A comment may name
+    several parts or none — lets pain counts be per-symptom, not symptom-blind."""
+    if not comment: return []
+    c = comment.lower()
+    return [loc for loc, kws in PAIN_LOCATIONS.items() if any(kw in c for kw in kws)]
 
 
 def _detect_technique_variants(comment: Optional[str]) -> list:
@@ -748,6 +778,11 @@ def _build_sessions_from_rows(rows: list, ctx: dict,
             "total_distance":     round(total_distance_m, 3),
             "total_duration_seconds": total_duration_s,
             "working_sets_count": len(working_sets),
+            # ALL logged sets incl. warmups — the scalar backing a "you did N
+            # sets" claim (the display header counts warmups too). Grounding
+            # removed a TRUE "4 sets" claim by "correcting" it against
+            # working_sets_count (3) because no total-sets scalar existed.
+            "total_sets_count":   len(sets),
             "warmup_weight":      warmup_sets[0]["weight"] if warmup_sets else None,
             "warmup_weight_plates_only": True,
             # Placeholder — overwritten by the all-time PR-event post-pass in
@@ -1252,6 +1287,11 @@ def _compute_progression(sessions: list) -> dict:
         "latest_session_weight":     latest_session_weight,
         "latest_session_reps":       latest_session_reps,
         "latest_session_is_backoff": latest_session_is_backoff,
+        # Total sets incl. warmups for the latest session — the CITABLE scalar
+        # for a "you did N sets" claim (per-session fields live in the
+        # list-valued `sessions` and are not flat-addressable). `.get`: tests
+        # call _compute_progression with minimal session dicts.
+        "latest_session_total_sets": last.get("total_sets_count"),
         # ── Plateau (rep-aware new-best rule, cadence-scaled) ─────────────────
         "is_plateau":           is_plateau,
         "plateau_since":        plateau_since,
@@ -1788,15 +1828,25 @@ def _compute_technique_variants(sessions: list, unit: str) -> list:
 
 def _compute_pain_analysis(sessions: list) -> dict:
     pain_sessions = [s for s in sessions if s["has_pain_flag"]]
-    pain_occurrences = [{"date": s["date"], "set_id": st["set_id"], "comment": st["comment"]}
+    pain_occurrences = [{"date": s["date"], "set_id": st["set_id"], "comment": st["comment"],
+                         "locations": _pain_locations(st["comment"])}
                         for s in sessions for st in s["sets"] if st["is_pain_flag"]]
     failed_sets = [{"date": s["date"], "weight": st["weight"],
                     "weight_plates_only": True, "comment": st["comment"]}
                    for s in sessions for st in s["sets"] if st["is_failed_attempt"]]
+    # Per-location grouping so a "this specific pain N times" claim is symptom-aware:
+    # an occurrence naming several parts counts under each; an untagged one (e.g.
+    # "same pain", "cramp at 12") appears under none, so it can't be silently folded
+    # into a specific-symptom total.
+    pain_by_location: dict = {}
+    for occ in pain_occurrences:
+        for loc in occ["locations"]:
+            pain_by_location.setdefault(loc, []).append(occ["date"])
     return {
         "pain_session_count":    len(pain_sessions),
         "pain_session_dates":    [s["date"] for s in pain_sessions],
         "pain_occurrences":      pain_occurrences,
+        "pain_by_location":      pain_by_location,
         "failed_attempt_count":  sum(s["failed_attempts"] for s in sessions),
         "failed_attempts":       failed_sets,
     }
@@ -2747,13 +2797,17 @@ def process_data(
         if include_phase2 and phase2_triggered:
             try:
                 ex_alltime = alltime_cache.get(ex_name, [])
-                full_comments = [
-                    {k: v for k, v in r.items()}
-                    for r in sorted(
-                        (r for r in ex_alltime if r.get("comment") is not None),
-                        key=lambda r: (r["date"], r["set_id"])
-                    )
-                ]
+                full_comments = []
+                for r in sorted(
+                    (r for r in ex_alltime if r.get("comment") is not None),
+                    key=lambda r: (r["date"], r["set_id"])
+                ):
+                    entry = {k: v for k, v in r.items()}
+                    # Tag pain comments with body-part location so an all-time
+                    # "this specific pain N times" narrative can count per-symptom.
+                    if _is_pain_comment(entry.get("comment")):
+                        entry["pain_locations"] = _pain_locations(entry.get("comment"))
+                    full_comments.append(entry)
             except Exception as e:
                 logger.warning("[data_agent] full_comments fetch failed for %s: %s",
                                ex_name, e)

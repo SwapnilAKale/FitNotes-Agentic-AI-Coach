@@ -18,6 +18,7 @@ The draft goes to ground_check() before the Coordinator's coverage check.
 import asyncio
 import json
 import os
+import re
 import logging
 from typing import Optional
 
@@ -220,6 +221,9 @@ Database values are absolute truth. The agent interprets the data —
     answer the question asked.
   • pr.weight is the all-time PR. pr_period.weight is the PR within the
     query period. Use whichever is appropriate for the question.
+  • SET COUNTS: working-set counts exclude warmups. For a "you did N sets"
+    claim about the most recent session, cite
+    progression.latest_session_total_sets (total including warmups).
   • RECENCY: any "most recent session" / "last session" / "latest workout"
     claim MUST take its date from the package's labeled recency fields —
     progression.latest_session_date (strength), last_session_date (cardio
@@ -228,6 +232,11 @@ Database values are absolute truth. The agent interprets the data —
     a pain-flagged or heavily-commented session is often NOT the most
     recent one, and attaching its date to a "most recent" claim is a
     factual error even though the date itself exists in the package.
+  • Only call a session the user's "previous session" when it is the one
+    immediately before the latest. For an earlier session you surface (e.g. a
+    pain or comment from further back) whose position you have not established,
+    refer to it by its date ("an earlier session on <date>") — never imply it
+    was the session immediately before the most recent one.
 
 ════════════════════════════
 VOLUME RULES (critical)
@@ -303,6 +312,12 @@ plain English:
 Phrase it in one sentence without statistical terminology.
 The grounding check verifies every number.
 
+A sample-size or reliability statement belongs ONLY to a correlational, pattern,
+or trend claim. For a SIMPLE LOOKUP — a most-recent session, a specific record or
+PR, a date, a single logged value — do NOT add a "based on N sessions" or
+"reliable overview" caveat. Answer the fact directly; it is not a finding whose
+confidence needs qualifying.
+
 ════════════════════════════
 COMMENT DATA RULES
 ════════════════════════════
@@ -339,6 +354,20 @@ constraint that ends every session. Name it explicitly: what always
 gives out first, what always limits the next rep or the next weight.
 This is more specific and useful than describing it as a challenge
 or a pattern to watch.
+
+When you report pain, discomfort, or a form issue from the comments, name the
+exercise it was logged under. Group occurrences together ONLY when they describe
+the same symptom in the same place; never merge distinct complaints — a hip pain
+and a knee cramp, or comments from different exercises — into one recurring issue.
+If they differ in symptom, location, or exercise, report them separately rather
+than presenting them as the same pain.
+
+When you state HOW MANY times a specific symptom or body-part pain occurred, count
+ONLY the pain comments tagged with that location (the pain_locations on each
+occurrence / the pain_by_location grouping). A pain comment carrying no location tag
+is NOT evidence of that specific symptom — do not add it to the total. If you cannot
+pin an exact per-symptom count this way, enumerate the dated occurrences or say "at
+least N" rather than stating a precise number that lumps different complaints.
 
 Cite actual comment text from specific sessions with dates.
 Only quote text that literally appears in the training log.
@@ -440,6 +469,17 @@ return the result as JSON.
 
   MISQUOTE: the claim's number ≠ its cited value (or the package value) → REMOVE
   or correct it to the source value.
+
+PLACEHOLDER LINES: a line of the form ⟦D0⟧, ⟦D1⟧, … stands in for a verbatim
+training-log line that is verified by a separate step. Keep every ⟦D…⟧ line
+EXACTLY where it is — never edit, move, merge, or remove one, and never count
+its content as a claim.
+
+SET-COUNT SEMANTICS: `working_sets_count` counts WORKING sets only and excludes
+warmups. A session's total set count INCLUDING warmups is `total_sets_count`
+(per session) / `latest_session_total_sets` (progression). A claim's total-set
+number differing from `working_sets_count` is NOT a misquote — verify it
+against the total-sets field.
 
 REMOVE if EITHER:
   1. The claim is directly contradicted by a specific value in the source
@@ -693,6 +733,55 @@ async def analyze(
     return draft.strip()
 
 
+# ── Display guard (structural, pure — no LLM) ────────────────────────────────
+# Grounding must never edit the package's verbatim display_sets lines, but told
+# so in prose it still deleted a warmup line live. Structural guard: excise the
+# known lines from the draft BEFORE the grounding LLM sees it (each replaced by
+# a sentinel), reinsert verbatim after. The checker cannot edit what it never
+# receives. Sentinels use ⟦…⟧ — NOT [[…]] (strip_tags' _ANY_BRACKET_RE would
+# eat those) — and survive strip_tags' whitespace tidy. A lost sentinel is
+# non-fatal: the downstream display-fidelity stage already repairs missing
+# lines, so the worst case equals today's behavior (safe, complete fallback).
+
+def _excise_display(draft: str, display_lines: list) -> tuple[str, dict]:
+    """
+    Replace the FIRST occurrence of each display line in the draft with a
+    sentinel line ⟦D<i>⟧. Longest lines first so a line that is a substring of
+    a sibling can't partially match inside it. Lines absent from the draft get
+    no sentinel. Returns (excised_draft, {sentinel: verbatim_line}).
+    """
+    mapping: dict = {}
+    if not draft or not display_lines:
+        return draft, mapping
+    out = draft
+    # Stable sentinel numbering by original position; excise longest-first.
+    numbered = list(enumerate(display_lines))
+    for i, line in sorted(numbered, key=lambda p: -len(p[1])):
+        if line and line in out:
+            sentinel = f"⟦D{i}⟧"
+            out = out.replace(line, sentinel, 1)
+            mapping[sentinel] = line
+    return out, mapping
+
+
+def _reinsert_display(text: str, mapping: dict) -> tuple[str, bool]:
+    """
+    Substitute each sentinel back with its verbatim line. Returns
+    (restored_text, all_restored) — all_restored is False when the grounding
+    model dropped a sentinel (the display-fidelity stage repairs those lines).
+    """
+    if not mapping:
+        return text, True
+    out = text or ""
+    all_restored = True
+    for sentinel, line in mapping.items():
+        if sentinel in out:
+            out = out.replace(sentinel, line, 1)
+        else:
+            all_restored = False
+    return out, all_restored
+
+
 def _build_grounding_prompt(draft: str, grounding_context: dict) -> str:
     """
     Build the grounding user prompt from the Stage-2 grounding context
@@ -748,7 +837,12 @@ async def ground_check(
     if not draft.strip():
         return draft, []
 
-    prompt = _build_grounding_prompt(draft, grounding_context)
+    # Display guard: the grounding LLM never sees the verbatim display lines —
+    # they are excised to sentinels here and reinserted after the check.
+    guarded_draft, display_map = _excise_display(
+        draft, grounding_context.get("display_sets") or [])
+
+    prompt = _build_grounding_prompt(guarded_draft, grounding_context)
 
     response = await asyncio.to_thread(
         _get_client().models.generate_content,
@@ -777,7 +871,16 @@ async def ground_check(
                 if not line.strip().startswith("```")
             ).strip()
         result        = json.loads(cleaned_raw)
-        cleaned       = result.get("cleaned_answer", draft)
+        cleaned       = result.get("cleaned_answer", guarded_draft)
+        # Reinsert the verbatim display lines behind the sentinels. A lost
+        # sentinel is logged and left to the display-fidelity stage's repair.
+        cleaned, all_restored = _reinsert_display(cleaned, display_map)
+        if not all_restored:
+            logger.warning(
+                "[analysis_agent] display guard: grounding dropped %d sentinel(s)"
+                " — display-fidelity stage will repair",
+                sum(1 for s in display_map if s not in (result.get("cleaned_answer") or "")),
+            )
         flagged       = result.get("flagged_claims", [])
         if flagged:
             logger.info(
@@ -807,10 +910,24 @@ async def ground_check(
 # prose around the strings is fine.
 
 
+def _norm_ws(s: str) -> str:
+    """Collapse every whitespace run (incl. newlines/indents) to one space — used
+    only for containment tests, never to mutate displayed text."""
+    return re.sub(r"\s+", " ", s or "").strip()
+
+
 def display_sets_missing(answer: str, package: dict) -> list:
-    """The display strings NOT present verbatim (as substrings) in the answer."""
+    """
+    The display strings whose CONTENT is not present in the answer. Whitespace-
+    tolerant: a line reproduced with different indentation/newlines still counts as
+    present, so the fidelity fallback won't re-append a whole block over a spacing
+    diff (the live per-set-block duplication). A genuinely omitted line is still
+    flagged. The containment test normalizes whitespace only — displayed text is
+    never mutated.
+    """
     display = (package or {}).get("display_sets") or []
-    return [s for s in display if s not in (answer or "")]
+    norm_answer = _norm_ws(answer)
+    return [s for s in display if _norm_ws(s) not in norm_answer]
 
 
 def raw_display_assembly(package: dict) -> str:
@@ -820,16 +937,18 @@ def raw_display_assembly(package: dict) -> str:
 
 def append_missing_display(answer: str, package: dict) -> str:
     """
-    Non-destructive fallback: keep the generated answer and APPEND the verbatim
-    display block, guaranteeing the sets are present WITHOUT discarding analysis.
-    A fidelity-check failure means "the verbatim sets aren't all present" — the
-    safe repair is to add them, never to delete whatever analysis was written.
+    Non-destructive fallback: keep the generated answer and APPEND only the display
+    entries whose content is still missing — NOT the whole block (that re-pasted
+    already-present lines over a spacing diff and duplicated them). Repair, never
+    replace.
 
-    Empty package block → answer unchanged. Empty/blank answer → block alone.
+    Nothing missing (or no display_sets) → answer unchanged. Empty/blank answer →
+    the missing block alone (no leading blank line).
     """
-    block = raw_display_assembly(package)
-    if not block:
+    missing = display_sets_missing(answer, package)
+    if not missing:
         return answer
+    block = "\n".join(missing)
     return f"{answer.rstrip()}\n{block}" if answer and answer.strip() else block
 
 

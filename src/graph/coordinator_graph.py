@@ -56,6 +56,10 @@ async def _dispatch_operational(state: CoordinatorState, runtime: Runtime[GraphR
     return await runtime.context.coordinator._node_dispatch_operational(state)
 
 
+async def _dispatch_recall(state: CoordinatorState, runtime: Runtime[GraphRunContext]):
+    return await runtime.context.coordinator._node_recall_dispatch(state)
+
+
 def _finalize(state: CoordinatorState, runtime: Runtime[GraphRunContext]):
     return runtime.context.coordinator._node_finalize_turn(state)
 
@@ -75,6 +79,8 @@ def _route_after_classify(state: CoordinatorState) -> str:
     route = params.get("route", "analytical")
     if route == "out_of_scope":
         return "out_of_scope"
+    if route == "recall":
+        return "dispatch_recall"
     if route == "analytical":
         return "dispatch_analytical"
     return "dispatch_operational"
@@ -96,6 +102,7 @@ def _build() -> StateGraph:
     g.add_node("out_of_scope", _out_of_scope)
     g.add_node("dispatch_analytical", _dispatch_analytical)
     g.add_node("dispatch_operational", _dispatch_operational)
+    g.add_node("dispatch_recall", _dispatch_recall)
     g.add_node("finalize", _finalize)
     g.add_edge(START, "entry_boundary")
     g.add_conditional_edges(
@@ -109,6 +116,7 @@ def _build() -> StateGraph:
             "out_of_scope": "out_of_scope",
             "dispatch_analytical": "dispatch_analytical",
             "dispatch_operational": "dispatch_operational",
+            "dispatch_recall": "dispatch_recall",
         },
     )
     g.add_edge("unparseable", END)
@@ -116,6 +124,7 @@ def _build() -> StateGraph:
     # NO analytical → operational edge exists (see module docstring).
     g.add_edge("dispatch_analytical", "finalize")
     g.add_edge("dispatch_operational", "finalize")
+    g.add_edge("dispatch_recall", "finalize")
     g.add_edge("finalize", END)
     return g
 

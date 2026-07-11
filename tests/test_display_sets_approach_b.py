@@ -49,6 +49,29 @@ def test_scope_exercise_plus_group_both_blocks():
         ("exercise", "Bench Press"), ("category", "Back")]
 
 
+def test_scope_drops_inferred_parent_category():
+    # A single exercise whose parent category is ALSO present (the classifier's
+    # inferred parent) → suppress the whole-day category target so a narrow question
+    # doesn't dump the whole day; only the exercise's own block remains.
+    assert _display_scope(["Dumbbell Hammer Curl"], ["Biceps"], [],
+                          {"Dumbbell Hammer Curl": "Biceps"}) == [
+        ("exercise", "Dumbbell Hammer Curl")]
+
+
+def test_scope_keeps_independent_group():
+    # The group is NOT the exercise's parent (Bench Press is Chest, not Back) →
+    # both targets kept (a genuinely independent scope request).
+    assert _display_scope(["Bench Press"], ["Back"], [],
+                          {"Bench Press": "Chest"}) == [
+        ("exercise", "Bench Press"), ("category", "Back")]
+
+
+def test_scope_no_category_map_is_backcompat():
+    # Without the map nothing is suppressed (old behaviour) — protects direct callers.
+    assert _display_scope(["Dumbbell Hammer Curl"], ["Biceps"], []) == [
+        ("exercise", "Dumbbell Hammer Curl"), ("category", "Biceps")]
+
+
 def test_scope_neither_filter_empty():
     assert _display_scope(None, None, []) == []
     assert _display_scope([], [], []) == []
@@ -123,23 +146,67 @@ def test_package_no_display_sets_for_broad_scope():
 
 
 def test_package_display_sets_for_exercise_plus_group():
-    # End-to-end regression for the XOR-drop bug: "show me my last Lat Pulldown
-    # session" sometimes also carries muscle_groups=["Back"] from the classifier.
-    # Under the old XOR this attached NOTHING. REWRITTEN for the Sumo-triplication
-    # dedup: when the exercise appears inside the category block (Lat Pulldown is
-    # on the Back block's displayed date), the standalone copy is skipped and the
-    # exercise shows EXACTLY ONCE — inside the category block. display_sets is
-    # still attached (never dropped), and the category header is present.
+    # CORRECTED behaviour (was: keep the whole "— Back:" day + fold the exercise in).
+    # Lat Pulldown IS a Back exercise, so muscle_groups=["Back"] here is the
+    # classifier's INFERRED parent, not an independent request — suppress the
+    # whole-day category dump and show only the queried exercise. (The whole-day
+    # block is still built for a category-ONLY question; see the next test.)
     pkg = prepare_analysis_package(query_period_days=None,
                                    exercise_names=["Lat Pulldown"],
                                    muscle_groups=["Back"])
     ds = pkg.get("display_sets")
     assert isinstance(ds, list) and ds
-    assert any(s.endswith("— Back:") for s in ds)        # the category block
-    # Exercise appears exactly once, as an in-category sub-block — never also
-    # as a standalone "<date> — Lat Pulldown (" block (the duplication).
-    assert sum(1 for s in ds if s.startswith("Lat Pulldown (")) == 1
-    assert not any(" — Lat Pulldown (" in s for s in ds)
+    assert not any(s.endswith("— Back:") for s in ds)        # no whole-day dump
+    assert any(" — Lat Pulldown (" in s for s in ds)         # only the exercise's block
+
+
+def test_package_narrow_exercise_not_whole_day():
+    # Whole-day-dump regression (the live Q4 defect): a single-exercise question that
+    # also carried the inferred parent group must NOT append the whole day.
+    pkg = prepare_analysis_package(query_period_days=90,
+                                   exercise_names=["Dumbbell Hammer Curl"],
+                                   muscle_groups=["Biceps"])
+    ds = pkg.get("display_sets") or []
+    assert any(" — Dumbbell Hammer Curl (" in s for s in ds)      # its own block
+    assert not any(s.endswith("— Biceps:") for s in ds)          # no whole-day header
+    assert not any(s.startswith("Cable Curl (") for s in ds)      # siblings absent
+    assert not any(s.startswith("Seated Machine Curl") for s in ds)
+
+
+def test_package_category_only_still_whole_day():
+    # A category-ONLY question legitimately wants the whole day — must be unaffected.
+    pkg = prepare_analysis_package(query_period_days=90, muscle_groups=["Biceps"])
+    ds = pkg.get("display_sets") or []
+    assert any(s.endswith("— Biceps:") for s in ds)
+    assert any(s.startswith("Cable Curl (") for s in ds)
+
+
+# ── display_intent gate — display attached ONLY for display-shaped questions ──
+
+def test_display_intent_false_drops_all_display():
+    # Analytical question (display_intent False) → NO display_sets, for BOTH a category
+    # scope (the "same pain" whole-day dump) AND a single-exercise scope. Root fix.
+    cat = prepare_analysis_package(query_period_days=90, muscle_groups=["Biceps"],
+                                   display_intent=False)
+    assert "display_sets" not in cat
+    ex = prepare_analysis_package(query_period_days=90,
+                                  exercise_names=["Dumbbell Hammer Curl"],
+                                  display_intent=False)
+    assert "display_sets" not in ex
+
+
+def test_display_intent_true_attaches_whole_day():
+    # A display-shaped category question keeps the whole day.
+    pkg = prepare_analysis_package(query_period_days=90, muscle_groups=["Biceps"],
+                                   display_intent=True)
+    ds = pkg.get("display_sets") or []
+    assert any(s.endswith("— Biceps:") for s in ds)
+
+
+def test_display_intent_defaults_true_backcompat():
+    # No display_intent arg → default True (direct callers / older tests unchanged).
+    pkg = prepare_analysis_package(query_period_days=90, muscle_groups=["Biceps"])
+    assert pkg.get("display_sets")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -259,3 +326,46 @@ def test_enforce_no_display_sets_is_noop():
 
     out = asyncio.run(enforce_display_fidelity("anything", {}, reframe))
     assert out == "anything"
+
+
+# ── Whitespace-tolerant containment — the live Q1 per-set-block duplication ────
+
+_DROPSET_PKG = {"display_sets": [
+    "Set 1: 25.0 lbs × 11 reps",
+    "Set 3: 30.0 lbs × 3 reps\n       25.0 lbs × 9 reps",   # canonical 7-space indent
+]}
+
+
+def test_display_sets_missing_whitespace_variant_present():
+    # The drop-set reproduced with ONE space (not 7) is still present in content →
+    # not flagged missing (else the whole block gets re-appended → duplication).
+    answer = ("Your last session:\nSet 1: 25.0 lbs × 11 reps\n"
+              "Set 3: 30.0 lbs × 3 reps\n 25.0 lbs × 9 reps\nSolid work.")
+    assert display_sets_missing(answer, _DROPSET_PKG) == []
+
+
+def test_enforce_no_duplicate_on_whitespace_variant():
+    # The Q1 repro: a spacing-only diff must NOT trigger an appended second copy.
+    answer = ("Your most recent session:\nSet 1: 25.0 lbs × 11 reps\n"
+              "Set 3: 30.0 lbs × 3 reps\n 25.0 lbs × 9 reps")
+    calls = {"n": 0}
+
+    async def reframe():
+        calls["n"] += 1
+        return "unused"
+
+    out = asyncio.run(enforce_display_fidelity(answer, _DROPSET_PKG, reframe))
+    assert out == answer                                   # unchanged, no second block
+    assert calls["n"] == 0
+    assert out.count("Set 1: 25.0 lbs × 11 reps") == 1     # not duplicated
+
+
+def test_append_missing_display_only_missing_entries():
+    # Entry 1 present verbatim, entry 2 absent → append ONLY entry 2; entry 1 stays
+    # single (no whole-block re-paste).
+    answer = "Recap: Set 1: 100.0 lbs × 10 reps was your top set."
+    out = append_missing_display(answer, _PKG)
+    assert answer in out
+    assert out.count("Set 1: 100.0 lbs × 10 reps") == 1    # not re-appended
+    assert "Set 2: 110.0 lbs × 8 reps" in out              # the missing one added
+    assert display_sets_missing(out, _PKG) == []

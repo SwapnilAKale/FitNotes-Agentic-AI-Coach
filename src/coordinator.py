@@ -344,7 +344,7 @@ def _normalize_cardio_lock(raw: Optional[dict]) -> Optional[dict]:
 _CLASSIFY_SYSTEM = """
 You are a routing classifier for a fitness coaching AI.
 
-Classify each message as "analytical" or "operational". Return JSON only.
+Classify each message as "analytical", "operational", or "recall". Return JSON only.
 
 ANALYTICAL — needs trend analysis, progression tracking, or pattern detection
 across multiple sessions. Requires computing statistics over training history.
@@ -396,6 +396,17 @@ OPERATIONAL — use only for questions that require MCP tools:
   Route OPERATIONAL only for things that require MCP tools:
     Writes      — log workout, set goal, update set, delete anything
     Research    — fitness science questions, what does science say
+
+RECALL — use ONLY when the message asks you to REPEAT or RESTATE a specific NUMBER
+or FIGURE you already gave earlier in this conversation — nothing more:
+    "what was that number you just mentioned?"     "what did you say again?"
+    "remind me what that percentage was"           "repeat the figure you gave"
+  This lane only re-quotes a value from [PREVIOUS TURNS]; it never looks anything up.
+  It is NOT recall — route ANALYTICAL — if the message asks you to EXPLAIN, IDENTIFY,
+  DESCRIBE, or INVESTIGATE anything, even when it points back at a prior mention
+  ("what was the same pain that re-occurred?", "what did that plateau mean?", "which
+  exercise was that?"), or asks for ANY new stat/PR/trend/date/volume ("and my squat?",
+  "what's my bench PR"). When unsure between recall and analytical, choose analytical.
 
 OUT_OF_SCOPE — refuse politely WITHOUT any tool, search, or analysis. Decide
 this by a FITNESS-CONNECTION test, NOT a keyword blocklist:
@@ -454,6 +465,15 @@ CURRENT MESSAGE, carrying over the topic from previous turns when the
 current message is an elliptical follow-up.
 
 PARAMETER EXTRACTION (analytical route only):
+  display_intent:    true ONLY when the message wants a session or day laid out
+                     set-by-set — explicit DISPLAY phrasing: "show me my last leg day",
+                     "what did I do on Monday", "lay out / breakdown of my last chest
+                     session", "how did that session go". Lean TRUE whenever such display
+                     phrasing is present (a real display question must keep its display).
+                     false for every stat / trend / PR / plateau / pain / volume / "why" /
+                     "when" question ("how has my Lat Pulldown progressed", "what was the
+                     same pain that re-occurred", "total back volume", "when did I first
+                     reach 145"). Default false.
   exercise_names:    list of specific exercise names mentioned, or null
   muscle_groups:     muscle groups mentioned → map to exact names:
                      Back, Chest, Shoulders, Biceps, Triceps, Legs,
@@ -489,7 +509,8 @@ CUSTOM SQL (analytical route only):
 
 Return ONLY valid JSON, no preamble, no markdown fences:
 {
-  "route": "analytical" | "operational" | "out_of_scope",
+  "route": "analytical" | "operational" | "out_of_scope" | "recall",
+  "display_intent": false,
   "exercise_names": ["..."] | null,
   "muscle_groups": ["..."] | null,
   "query_period_days": 90 | null,
@@ -637,6 +658,29 @@ Return ONLY valid JSON:
   {"complete": true,  "missing": []}
   {"complete": false, "missing": ["first unanswered part", "second..."]}
 """.strip()
+
+
+# ── Recall prompt (package-free: restate a prior figure, never re-derive) ──────
+
+_RECALL_SYSTEM = """
+You are a fitness coach answering a follow-up that refers to something YOU said
+earlier in this conversation (e.g. "what was that number?", "what did you say
+again?", "remind me / repeat that").
+
+Using ONLY the [CONVERSATION] provided, restate the specific figure or fact the user
+is asking about — verbatim as you already stated it. NEVER compute, estimate, look
+up, or introduce a NEW number; your only job is to repeat what was already said.
+
+If the [CONVERSATION] does not contain a figure matching what they are asking about,
+say you are not sure which number they mean and ask them to clarify — do not guess.
+
+Reply in one or two plain sentences. No JSON, no lists.
+""".strip()
+
+_RECALL_FALLBACK = (
+    "I'm not sure which number you're referring to — could you tell me which figure "
+    "you'd like me to repeat?"
+)
 
 
 # ── Coordinator ───────────────────────────────────────────────────────────────
@@ -1064,6 +1108,16 @@ class Coordinator:
         )
         return {"answer": answer, "flagged_claims": [], "error": None}
 
+    async def _node_recall_dispatch(self, state: dict) -> dict:
+        """Node: the recall lane — restate a figure the assistant already gave,
+        answered from conversation history ONLY (no package, no analytical
+        re-derivation, no grounding). Flows through finalize so it lands in
+        history; it does NOT record for memory extraction (a re-statement of an
+        already-recorded number is noise)."""
+        answer = await self._call_with_per_minute_retry(
+            self._run_recall, state["question"])
+        return {"answer": answer, "flagged_claims": [], "error": None}
+
     def _node_finalize_turn(self, state: dict) -> dict:
         """Node: conversation-history update + the contracted return dict.
         Terminal short-circuits (filler / unparseable / out-of-scope) bypass
@@ -1424,6 +1478,7 @@ class Coordinator:
             params = json.loads(raw)
             # Ensure required keys are present (route defaults analytical — Step C flip)
             params.setdefault("route",             "analytical")
+            params.setdefault("display_intent",    False)
             params.setdefault("exercise_names",    None)
             params.setdefault("muscle_groups",     None)
             params.setdefault("query_period_days", 90)
@@ -1618,6 +1673,10 @@ class Coordinator:
             include_phase2=True,
             reps_floor=reps_floor,
             cardio_lock=cardio_lock,
+            # Display sets are attached ONLY for display-shaped questions; an analytical
+            # question gets no verbatim session/day block force-injected (root fix for
+            # the whole-day dump). Default False = no display unless the classifier said so.
+            display_intent=params.get("display_intent", False),
         )
 
         # Pop unresolved exercise names before the LLM sees the package.
@@ -1906,6 +1965,20 @@ class Coordinator:
                           if analysis_agent.display_sets_missing(base_answer, pkg)
                           else base_answer)
 
+        # ── Recency guard (deterministic, pure — no LLM) ───────────────────────
+        # A "most recent / latest / last session" date is a computed fact
+        # (progression.latest_session_date); the draft model must not override it.
+        # Prompt guidance lowers the failure rate but can't guarantee it, so this
+        # enforces the invariant: any such claim whose date isn't the exercise's
+        # true latest is rewritten in place. Only dates inside a most-recent clause
+        # are touched; ordinary date mentions are untouched.
+        answer, recency_flags = _cite.recency_guard(answer, pkg)
+        for f in recency_flags:
+            logger.warning(
+                "[coordinator] recency guard: corrected '%s' → '%s' for %s "
+                "(most-recent claim carried a non-latest session date)",
+                f.get("original"), f.get("corrected"), f.get("exercise"))
+
         # Prefix answer when requested exercises weren't found in the DB.
         # Partial resolution (some names matched) covers the matched
         # exercises; total failure falls back to the broad package.
@@ -1936,7 +2009,8 @@ class Coordinator:
         if self._agent is not None and answer:
             self._agent.record_external_exchange(question, answer)
 
-        return {"answer": answer}
+        return {"answer": answer,
+                "flagged": (state.get("flagged") or []) + recency_flags}
 
     async def _rebuild_package_for_state(self, state: dict) -> dict:
         """Rebuild the analytical package from persisted params + resolved
@@ -2238,3 +2312,46 @@ class Coordinator:
                 "[coordinator] coverage check failed: %s — returning original", e
             )
             return answer, True   # fail open: avoid false retry
+
+    async def _run_recall(self, question: str) -> str:
+        """
+        Answer a recall/meta follow-up ("what was that number you just mentioned?")
+        from conversation history ONLY — no package build, no re-derivation. The
+        model is handed just the recent turns + the question, so it cannot reach for
+        a salient package scalar (the wrong-predicate temptation is removed, not
+        merely discouraged). Returns the answer text. Fail-open → a gentle clarify.
+        """
+        history_txt = "\n".join(
+            f"{t.get('role', '?').upper()}: {t.get('content', '')}"
+            for t in self._history[-CONTEXT_WINDOW:]
+        ) or "(no earlier turns in this session)"
+        prompt = f"[CONVERSATION]\n{history_txt}\n\n[CURRENT MESSAGE]\n{question}"
+        try:
+            config = types.GenerateContentConfig(
+                system_instruction=_RECALL_SYSTEM,
+                temperature=0.0,
+                max_output_tokens=256,
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
+            )
+            response = await asyncio.to_thread(
+                self._client.models.generate_content,
+                model=COORDINATOR_MODEL,
+                contents=[types.Content(
+                    role="user",
+                    parts=[types.Part.from_text(text=prompt)],
+                )],
+                config=config,
+            )
+            raw = ""
+            _cand  = response.candidates[0] if getattr(response, "candidates", None) else None
+            _parts = (_cand.content.parts
+                      if _cand and _cand.content and _cand.content.parts else [])
+            for part in _parts:
+                if getattr(part, "text", None):
+                    raw += part.text
+            return raw.strip() or _RECALL_FALLBACK
+        except Exception as e:
+            if _is_rate_limit(e):
+                raise
+            logger.warning("[coordinator] recall failed: %s — returning clarify", e)
+            return _RECALL_FALLBACK
