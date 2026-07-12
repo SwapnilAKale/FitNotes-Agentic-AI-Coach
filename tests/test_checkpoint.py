@@ -632,3 +632,30 @@ def test_resume_with_no_slot_returns_notice(slot, coord, monkeypatch):
     assert result["route"] == "none"
     assert "no saved question" in result["answer"].lower()
     assert spy == {"classify": 0, "analytical": 0, "operational": 0}  # no LLM/work
+
+
+# ── Decomposition Stage 1: the inert requests array survives the slot ─────────
+
+def test_params_with_requests_roundtrip(slot):
+    # The classify dict is persisted verbatim; a params dict carrying the
+    # Stage-1 per-chunk requests array must round-trip deep-equal.
+    params = dict(ANALYTICAL_PARAMS)
+    params["requests"] = [
+        {"index": 0, "lane": "analytical",
+         "intent_text": "Is my Lat Pulldown progressing?",
+         "display_intent": False, "exercise_names": ["Lat Pulldown"],
+         "muscle_groups": None, "query_period_days": 90, "rep_target": None,
+         "cardio_lock": None, "needs_custom_sql": False,
+         "custom_sql_intent": None},
+        {"index": 1, "lane": "operational",
+         "intent_text": "Log bench 100 lbs x 5 today",
+         "display_intent": False, "exercise_names": None,
+         "muscle_groups": None, "query_period_days": 90, "rep_target": None,
+         "cardio_lock": None, "needs_custom_sql": False,
+         "custom_sql_intent": None},
+    ]
+    ckpt.save_checkpoint(route="analytical", question="compound q",
+                         params=params, completed_stage="package")
+    cp = ckpt.load_checkpoint()
+    assert cp is not None
+    assert cp["params"] == params

@@ -507,6 +507,38 @@ CUSTOM SQL (analytical route only):
   Custom SQL is for counts, dates, gaps, and patterns — never for
   reporting individual set weights, which the package already covers.
 
+DECOMPOSITION (the "requests" array):
+In ADDITION to all top-level fields, emit a "requests" array that partitions
+the message into its distinct requests. This is extra data only:
+
+  - The top-level fields (route, display_intent, exercise_names, muscle_groups,
+    query_period_days, rep_target, cardio_lock, needs_custom_sql,
+    custom_sql_intent) keep describing the WHOLE message exactly as specified
+    above. Do NOT change how you fill them.
+  - One entry per DISTINCT request. A request is distinct when it could be
+    answered/actioned on its own and asks for something different from its
+    siblings — e.g. an analysis question plus a logging instruction, or two
+    unrelated questions joined by "and"/"also".
+  - NEVER split a single request into artificial pieces. One question about
+    several exercises, periods, or stats is ONE request ("compare my squat and
+    bench over 3 months" → one entry with both exercise_names). Most messages
+    are a single request → the array has exactly ONE entry that mirrors the
+    top-level fields.
+  - Per entry:
+      index:       0-based position in message order.
+      lane:        classify THIS request alone, using exactly the same rules
+                   as "route" above ("analytical" | "operational" | "recall" |
+                   "out_of_scope").
+      intent_text: a self-contained restatement of this request. Resolve
+                   pronouns and elliptical references using the sibling
+                   requests and [PREVIOUS TURNS] ("is it progressing" after a
+                   squat question → "Is my squat progressing?"). Someone
+                   reading only intent_text must be able to answer it.
+      remaining fields: the same PARAMETER EXTRACTION and CUSTOM SQL rules as
+                   above, applied to this request only (analytical-lane fields
+                   take their defaults/null for operational, recall, and
+                   out_of_scope entries).
+
 Return ONLY valid JSON, no preamble, no markdown fences:
 {
   "route": "analytical" | "operational" | "out_of_scope" | "recall",
@@ -517,7 +549,22 @@ Return ONLY valid JSON, no preamble, no markdown fences:
   "rep_target": 5 | null,
   "cardio_lock": {"field": "distance"|"duration", "value": 5, "unit": "km"} | null,
   "needs_custom_sql": false,
-  "custom_sql_intent": null
+  "custom_sql_intent": null,
+  "requests": [
+    {
+      "index": 0,
+      "lane": "analytical" | "operational" | "recall" | "out_of_scope",
+      "intent_text": "self-contained restatement of this request",
+      "display_intent": false,
+      "exercise_names": ["..."] | null,
+      "muscle_groups": ["..."] | null,
+      "query_period_days": 90 | null,
+      "rep_target": 5 | null,
+      "cardio_lock": {"field": "distance"|"duration", "value": 5, "unit": "km"} | null,
+      "needs_custom_sql": false,
+      "custom_sql_intent": null
+    }
+  ]
 }
 """.strip()
 
@@ -531,6 +578,106 @@ OUT_OF_SCOPE_REFUSAL = (
     "nutrition, and fitness questions — that one's outside what I'm built for. "
     "Ask me anything about your lifts, progress, programming, or recovery."
 )
+
+
+# ── Decomposition Stage 1: the emit-inert per-chunk `requests` array ──────────
+# The classifier additionally emits params["requests"] — one entry per distinct
+# request in the message, each with its own `lane` (per-chunk route), a
+# self-contained `intent_text`, and per-chunk parameter fields. NOTHING consumes
+# it yet: Stage 2 builds the pending-decomposition slot on it, Stage 3 runs each
+# chunk through its lane and merges answers in index order. Until then the flat
+# fields stay the whole-message source of truth, so the sanitizer's contract is
+# strict: params["requests"] is either None or a FULLY valid list — a partially
+# valid array is dropped whole rather than half-trusted (Stage 2 must never
+# inherit a chunk list that silently lost entries).
+
+_VALID_LANES = {"analytical", "operational", "recall", "out_of_scope"}
+
+# Per-chunk parameter defaults — mirrors the flat setdefault block in _classify.
+_CHUNK_PARAM_DEFAULTS = {
+    "display_intent":    False,
+    "exercise_names":    None,
+    "muscle_groups":     None,
+    "query_period_days": 90,
+    "rep_target":        None,
+    "cardio_lock":       None,
+    "needs_custom_sql":  False,
+    "custom_sql_intent": None,
+}
+
+
+def _sanitize_requests(params: dict) -> None:
+    """Validate params["requests"] IN PLACE to None-or-fully-valid.
+
+    Runs inside _classify's try block, so it must never raise — an escaped
+    exception would degrade a good classification to the _parse_failed
+    default. Never touches the flat fields.
+    """
+    try:
+        reqs = params.get("requests")
+        if reqs is None:
+            params["requests"] = None
+            return
+        if not isinstance(reqs, list) or not reqs:
+            logger.warning(
+                "[coordinator] classify: malformed requests dropped "
+                "(not a non-empty list: %s)", type(reqs).__name__)
+            params["requests"] = None
+            return
+        for entry in reqs:
+            if not isinstance(entry, dict):
+                logger.warning(
+                    "[coordinator] classify: malformed requests dropped "
+                    "(non-dict entry: %s)", type(entry).__name__)
+                params["requests"] = None
+                return
+            if entry.get("lane") not in _VALID_LANES:
+                logger.warning(
+                    "[coordinator] classify: malformed requests dropped "
+                    "(invalid lane: %r)", entry.get("lane"))
+                params["requests"] = None
+                return
+            intent = entry.get("intent_text")
+            if not isinstance(intent, str) or not intent.strip():
+                logger.warning(
+                    "[coordinator] classify: malformed requests dropped "
+                    "(missing/empty intent_text)")
+                params["requests"] = None
+                return
+        for i, entry in enumerate(reqs):
+            entry["index"] = i          # list order is authoritative
+            for key, default_val in _CHUNK_PARAM_DEFAULTS.items():
+                entry.setdefault(key, default_val)
+    except Exception as e:              # pragma: no cover — backstop only
+        logger.warning("[coordinator] classify: requests sanitize error: %s", e)
+        params["requests"] = None
+
+
+def _log_requests_divergence(params: dict) -> None:
+    """Log-only observation of flat-vs-chunks disagreement (Stage-2 field
+    data). Never mutates, never raises."""
+    try:
+        reqs = params.get("requests")
+        if not reqs:
+            return
+        if len(reqs) > 1:
+            logger.info("[coordinator] classify: %d request chunk(s)", len(reqs))
+        lanes = {c.get("lane") for c in reqs}
+        if params.get("route") not in lanes:
+            logger.warning(
+                "[coordinator] decomposition divergence: flat route %r not "
+                "among chunk lanes %s", params.get("route"), sorted(lanes))
+        for field in ("exercise_names", "muscle_groups"):
+            flat = set(params.get(field) or [])
+            union = set()
+            for c in reqs:
+                union.update(c.get(field) or [])
+            if flat != union:
+                logger.warning(
+                    "[coordinator] decomposition divergence: flat %s %s != "
+                    "chunk union %s", field, sorted(flat), sorted(union))
+    except Exception as e:              # pragma: no cover — backstop only
+        logger.warning("[coordinator] classify: divergence log error: %s", e)
 
 
 # ── Stage-2 staging-verify prompt (write-verification layer) ──────────────────
@@ -984,6 +1131,10 @@ class Coordinator:
         # /log prefix (and no carry), and only then the answer gets the nudge.
         # A non-None params here makes the conditional edge skip the classify
         # node entirely — the LLM router is never spent on a real write.
+        # `requests` deliberately absent from these synthetic dicts — the
+        # Stage-1 emit-inert chunk array lives in _classify only; whether the
+        # deterministic write path synthesizes a single operational chunk is a
+        # Stage-2 decision.
         fallback_write = False
         params = None
         if log_boundary:
@@ -1426,6 +1577,7 @@ class Coordinator:
             "query_period_days":  90,
             "needs_custom_sql":   False,
             "custom_sql_intent":  None,
+            "requests":           None,
             # Marks an UNPARSEABLE/errored classify (vs. parsed-but-uncertain).
             # The caller (#5b) returns a cheap rephrase instead of running the
             # full analytical pipeline on garbage input.
@@ -1448,7 +1600,11 @@ class Coordinator:
             config = types.GenerateContentConfig(
                 system_instruction=_CLASSIFY_SYSTEM,
                 temperature=0.0,
-                max_output_tokens=256,
+                # 1024, not 256: the Stage-1 requests array adds ~90-140 output
+                # tokens per chunk, and a truncated response degrades the whole
+                # classify to the _parse_failed analytical default (which would
+                # silently no-write a write intent). ~6-chunk headroom.
+                max_output_tokens=1024,
                 thinking_config=types.ThinkingConfig(thinking_budget=0),
             )
             response = await asyncio.to_thread(
@@ -1486,6 +1642,8 @@ class Coordinator:
             params.setdefault("cardio_lock",       None)
             params.setdefault("needs_custom_sql",  False)
             params.setdefault("custom_sql_intent", None)
+            _sanitize_requests(params)          # requests → None or fully valid
+            _log_requests_divergence(params)    # log-only Stage-2 field data
             return params
 
         except Exception as e:
