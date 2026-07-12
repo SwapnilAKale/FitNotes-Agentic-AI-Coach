@@ -223,17 +223,18 @@ def test_prompt_integrity_smoke():
         assert anchor in _CLASSIFY_SYSTEM, f"new anchor missing: {anchor}"
 
 
-# ── Inertness regression ──────────────────────────────────────────────────────
+# ── Routing behavior (Stage 3 superseded the Stage-1 inertness contract) ─────
 
-def test_requests_inert_in_routing(coord, monkeypatch):
-    # A classify WITH a 2-chunk requests array routes exactly as without it:
-    # one analytical run, zero operational, and the array rides through to
-    # _run_analytical's params unchanged.
+def test_all_analytical_requests_stay_single_run(coord, monkeypatch):
+    # DELIBERATE non-decompose case: a multi-chunk array whose lanes are all
+    # analytical stays ONE analytical run (live-proven good; one pipeline is
+    # cheaper than two). The array still rides through in params.
     payload = dict(FLAT)
     payload["requests"] = [
         _chunk("analytical", "Is my Lat Pulldown progressing?",
                exercise_names=["Lat Pulldown"]),
-        _chunk("operational", "Log bench 100 lbs x 5 today"),
+        _chunk("analytical", "Show me my last Lat Pulldown session.",
+               exercise_names=["Lat Pulldown"], display_intent=True),
     ]
     coord._client = _client_returning(json.dumps(payload))
 
@@ -250,25 +251,24 @@ def test_requests_inert_in_routing(coord, monkeypatch):
         return "OP"
     monkeypatch.setattr(coord, "_run_operational", op)
 
-    result = asyncio.run(coord.route("is my lat pulldown progressing and log bench"))
+    result = asyncio.run(coord.route("lat pulldown progress and last session"))
     assert result["route"] == "analytical"
     assert seen["analytical"] == 1
-    assert seen["operational"] == 0            # chunk lanes trigger nothing
-    reqs = seen["params"]["requests"]
-    assert len(reqs) == 2
-    assert reqs[0]["intent_text"] == "Is my Lat Pulldown progressing?"
-    assert reqs[1]["lane"] == "operational"
+    assert seen["operational"] == 0
+    assert len(seen["params"]["requests"]) == 2
 
 
-def test_entry_boundary_synthetic_params_have_no_requests(coord):
-    # The deterministic /log and write-regex pre-guards synthesize params
-    # without the classifier — Stage 1 deliberately leaves `requests` absent.
+def test_entry_boundary_log_synthesizes_write_regex_defers(coord):
+    # /log boundary: still deterministic, classify-free synthetic params.
     out = coord._node_entry_boundary({"question": "/log bench 100x5"})
     assert out["params"] is not None
     assert out["params"]["route"] == "operational"
     assert "requests" not in out["params"]
+    assert not out.get("write_intent_hint")
 
+    # Regex write (Stage 3): params deferred to classify; hint armed so the
+    # distrust override can land it operational if it doesn't decompose.
     out = coord._node_entry_boundary({"question": "log my bench press 100x5"})
-    assert out["params"] is not None
-    assert out["params"]["route"] == "operational"
-    assert "requests" not in out["params"]
+    assert out["params"] is None
+    assert out["write_intent_hint"] is True
+    assert out["fallback_write"] is True

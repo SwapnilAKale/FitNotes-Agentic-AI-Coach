@@ -162,7 +162,9 @@ def test_fallback_write_carries_log_nudge(monkeypatch):
     assert result["route"] == "operational"       # regex fallback still routes the write
     assert agent.questions == ["log my bench 100x5"]
     assert result["answer"].endswith(_LOG_FALLBACK_NUDGE)
-    assert seen["classify"] == 0
+    # Stage 3: regex writes spend one classify call to discover chunks; the
+    # distrust override still lands this pure write on the operational lane.
+    assert seen["classify"] == 1
 
 
 def test_log_boundary_answer_never_carries_nudge(monkeypatch):

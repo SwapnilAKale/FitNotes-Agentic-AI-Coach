@@ -30,6 +30,9 @@ class CoordinatorState(TypedDict, total=False):
     log_boundary: bool
     trailing_note: bool
     fallback_write: bool
+    write_intent_hint: bool  # regex write pre-guard fired; classify ran only
+                             # to discover chunks (Stage-3 distrust override)
+    decomposed: bool         # answer is a Stage-3 per-chunk merge
     params: Optional[dict]   # classify output (or deterministic write params)
     route: str               # "analytical" | "operational" | terminal short-circuits
     answer: str

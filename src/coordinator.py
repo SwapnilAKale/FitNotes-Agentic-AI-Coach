@@ -602,6 +602,11 @@ def _norm_name(s: str) -> str:
 
 _VALID_LANES = {"analytical", "operational", "recall", "out_of_scope"}
 
+# Stage 3: at most this many chunks execute per turn (quota guard — each
+# analytical chunk costs a draft + grounding call; real messages rarely
+# exceed 2-3 requests).
+_DECOMP_CHUNK_CAP = 4
+
 # Per-chunk parameter defaults — mirrors the flat setdefault block in _classify.
 _CHUNK_PARAM_DEFAULTS = {
     "display_intent":    False,
@@ -1395,6 +1400,7 @@ class Coordinator:
         # deterministic write path synthesizes a single operational chunk is a
         # Stage-2 decision.
         fallback_write = False
+        write_intent_hint = False
         params = None
         if log_boundary:
             params = {
@@ -1406,24 +1412,27 @@ class Coordinator:
                 "custom_sql_intent": None,
             }
         elif _is_write_intent(question):
+            # Stage 3 (user-approved): a regex-caught write now SPENDS the
+            # classify call so a mixed analytical+write message decomposes
+            # into chunks. Write safety is preserved structurally: the write
+            # chunk still runs the operational lane with all its gates, and
+            # the conditional edge applies a DISTRUST OVERRIDE — if the
+            # classifier claims a single non-decomposable request (or fails
+            # to parse), the turn goes operational-whole exactly as before.
+            # Only the explicit /log boundary above stays classify-free.
             fallback_write = True
-            # Regex-inferred write: the flow is this single message.
+            write_intent_hint = True
+            # Regex-inferred write: the flow is this single message. The
+            # decomposed executor re-arms this per write CHUNK when it runs.
             self._log_flow_turns = [question]
-            params = {
-                "route":             "operational",
-                "exercise_names":    None,
-                "muscle_groups":     None,
-                "query_period_days": 90,
-                "needs_custom_sql":  False,
-                "custom_sql_intent": None,
-            }
 
         return {
-            "question":       question,
-            "log_boundary":   log_boundary,
-            "trailing_note":  trailing_note,
-            "fallback_write": fallback_write,
-            "params":         params,
+            "question":          question,
+            "log_boundary":      log_boundary,
+            "trailing_note":     trailing_note,
+            "fallback_write":    fallback_write,
+            "write_intent_hint": write_intent_hint,
+            "params":            params,
         }
 
     async def _node_classify(self, state: dict) -> dict:
@@ -1446,6 +1455,21 @@ class Coordinator:
                 )
                 raise _ckpt.QuotaInterrupted(e, _ckpt.msg_draft_interrupted(e))
             raise
+
+        # Stage-3 distrust override: this turn hit the write-intent regex and
+        # spent the classify call ONLY to discover chunks. If the result is
+        # not decomposable (single request, uniform lanes, or parse failure),
+        # the regex verdict wins — operational-whole, exactly the pre-Stage-3
+        # behavior. A write must never die unparseable or leak analytical.
+        if state.get("write_intent_hint"):
+            reqs = params.get("requests") or []
+            decomposable = (len(reqs) >= 2
+                            and len({c.get("lane") for c in reqs}) >= 2)
+            if params.get("_parse_failed") or not decomposable:
+                params["route"] = "operational"
+                params.pop("_parse_failed", None)
+                logger.info("[decomposition] write-hint distrust override — "
+                            "operational-whole (%d chunk(s))", len(reqs))
 
         # Parse-failure (#5b) and out_of_scope are routed by the conditional
         # edge on this node's output: unparseable input never builds a
@@ -1505,6 +1529,93 @@ class Coordinator:
             # could not complete.
         return {"answer": answer, "flagged_claims": flagged, "error": error}
 
+    async def _node_dispatch_decomposed(self, state: dict) -> dict:
+        """Node: Stage-3 per-chunk execution. Reached only when the classify
+        emitted ≥2 request chunks with MIXED lanes. Each chunk runs its own
+        lane with its self-contained intent_text; the parts merge back in
+        index order under ### headers (multi-part readability is enforced
+        HERE, by code, not by the draft prompt). Per-chunk failures follow
+        the analytical clean-fail contract — one broken part never kills its
+        siblings. A rate limit propagates whole-turn (single checkpoint
+        slot; completed parts re-run on resume — known residual).
+        """
+        params = state["params"]
+        reqs = params.get("requests") or []
+        headed_parts: list[tuple[str, str]] = []   # (header, text)
+        flagged_all: list = []
+        error: str | None = None
+        ran_write_chunk = False
+
+        for chunk in reqs[:_DECOMP_CHUNK_CAP]:
+            lane = chunk.get("lane")
+            intent = (chunk.get("intent_text") or "").strip() or state["question"]
+            head = intent if len(intent) <= 60 else intent[:57].rstrip() + "…"
+            logger.info("[decomposition] executing chunk %d/%d lane=%s",
+                        chunk.get("index", 0) + 1, len(reqs), lane)
+            if lane == "out_of_scope":
+                headed_parts.append((head, OUT_OF_SCOPE_REFUSAL))
+                continue
+            try:
+                if lane == "analytical":
+                    chunk_params = {**chunk, "route": "analytical",
+                                    "requests": None}
+                    answer, flagged = await self._run_analytical(
+                        intent, chunk_params)
+                    flagged_all.extend(flagged or [])
+                elif lane == "recall":
+                    answer = await self._call_with_per_minute_retry(
+                        self._run_recall, intent)
+                else:                              # operational
+                    is_write = _is_write_intent(intent)
+                    if is_write:
+                        # Verify Input A = this chunk only, never the whole
+                        # multi-part message.
+                        self._log_flow_turns = [intent]
+                        ran_write_chunk = True
+                    answer = await self._run_operational(
+                        intent, fallback_write=is_write)
+                headed_parts.append((head, answer))
+            except DataAgentIntegrityError as e:
+                ids_str = ", ".join(v.invariant_id for v in e.violations)
+                logger.error(
+                    "[decomposition] chunk integrity failure: %s", ids_str)
+                error = error or str(e)
+                headed_parts.append((head, (
+                    f"I cannot answer this part right now — a data "
+                    f"integrity check failed ({ids_str}).")))
+            except Exception as e:
+                if _is_rate_limit(e):
+                    raise                          # 429 → countdown, whole turn
+                if _is_transient_server_error(e):
+                    logger.warning(
+                        "[decomposition] chunk hit a transient 503: %s", e)
+                    headed_parts.append((head, _MSG_MODEL_BUSY))
+                else:
+                    logger.exception("[decomposition] chunk failed: %s", e)
+                    error = error or str(e)
+                    headed_parts.append((head, _MSG_PIPELINE_ERROR))
+
+        if len(reqs) > _DECOMP_CHUNK_CAP:
+            headed_parts.append(("", (
+                f"(I've answered the first {_DECOMP_CHUNK_CAP} parts — "
+                f"ask the remaining {len(reqs) - _DECOMP_CHUNK_CAP} again.)")))
+
+        if len(headed_parts) == 1:
+            merged = headed_parts[0][1]
+        else:
+            merged = "\n\n".join(
+                (f"### {h}\n\n{t.strip()}" if h else t.strip())
+                for h, t in headed_parts)
+        logger.info("[decomposition] merged %d part(s)", len(headed_parts))
+        out = {"answer": merged, "flagged_claims": flagged_all,
+               "error": error, "decomposed": True}
+        if ran_write_chunk:
+            # The envelope's log_flow_turns gate reads fallback_write — a
+            # write chunk found by the CLASSIFIER (regex missed the compound
+            # message) must still ship its chunk-scoped verify Input A.
+            out["fallback_write"] = True
+        return out
+
     async def _node_dispatch_operational(self, state: dict) -> dict:
         """Node: the operational lane dispatch. _run_operational resolves on
         the instance at call time (byte-identical method — it arms the /log
@@ -1549,6 +1660,9 @@ class Coordinator:
             "flagged_claims": state.get("flagged_claims") or [],
             "error":          state.get("error"),
             "log_boundary":   log_boundary,
+            # Stage-3: True when this answer is a per-chunk MERGE — the
+            # server must not let a confirmation panel swallow it.
+            "decomposed":     state.get("decomposed", False),
             # Stage-2 verify Input A: the assembled workout-portion turns of
             # this flow, present only on write-shaped turns (callers fall back
             # to the raw message when absent).

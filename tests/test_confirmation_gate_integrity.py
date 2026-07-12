@@ -344,3 +344,62 @@ def test_backed_claim_ships_even_with_loose_phrasing(monkeypatch):
         coord._run_operational("log bench 100x5", log_boundary=True))
 
     assert answer == "You're all set — workout logged!"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Stage 3: a decomposed turn's merged answer survives the panel
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_decomposed_merged_answer_survives_confirmation_panel(srv, monkeypatch):
+    """A mixed analytical+write turn stages a batch AND carries the merged
+    non-write answer. The confirmation_required payload must ship both: the
+    merged text (in `text` and prepended to the preview until the frontend
+    renders `text`) and the staged preview."""
+    merged = "### Is my squat progressing?\n\nYour squat is up 5%."
+    calls: list = []
+
+    async def route(msg):
+        srv._state["pending_confirmation"] = True
+        srv._state["confirmation_preview"] = "ARGS-BLOB"
+        srv._state["pending_execute_kind"] = "workout"
+        return {"answer": merged, "route": "analytical", "decomposed": True,
+                "flagged_claims": [], "error": None, "log_boundary": False,
+                "log_flow_turns": ["Log bench 100 lbs for 5 reps today"]}
+
+    async def call_tool(name, args):
+        calls.append((name, args))
+        if name == "read_staged_workout_slot":
+            return _SLOT_REAL
+        if name == "format_staged_workout_for_confirmation":
+            return json.dumps({"preview": _PREVIEW})
+        return json.dumps({"ok": True})
+
+    async def verify_log_staging(flow, slot_json, preview):
+        return {"verdict": "PASS", "reason": ""}
+
+    monkeypatch.setattr(srv, "coordinator", SimpleNamespace(
+        route=route, verify_log_staging=verify_log_staging))
+    monkeypatch.setattr(srv, "session", SimpleNamespace(
+        call_tool=call_tool, chat_history=[]))     # route "analytical" mirrors
+    body = _body(asyncio.run(srv._process_turn(
+        "is my squat progressing and log bench 100x5")))
+
+    assert body["type"] == "confirmation_required"
+    assert body["text"] == merged                       # for the frontend
+    assert merged in body["preview"]                    # visible NOW
+    assert _PREVIEW in body["preview"]                  # staged lines intact
+    assert body["preview"].index(merged) < body["preview"].index(_PREVIEW)
+
+
+def test_non_decomposed_panel_payload_unchanged(srv, monkeypatch):
+    """A plain single-write turn's panel is byte-identical to before Stage 3
+    (no answer prepended, empty text field)."""
+    body, calls, seen = _drive(
+        srv, monkeypatch, answer_text="Staged.",
+        slot_response=_SLOT_REAL,
+        formatter_response=json.dumps({"preview": _PREVIEW}),
+        verdict={"verdict": "PASS", "reason": ""})
+
+    assert body["type"] == "confirmation_required"
+    assert body["preview"] == _PREVIEW                  # no prepend
+    assert body["text"] == ""

@@ -148,13 +148,18 @@ def test_coaching_questions_route_analytical_not_operational(coord, monkeypatch,
 
 
 @pytest.mark.parametrize("q", IMPERATIVE_WRITES)
-def test_imperative_writes_route_operational_without_classify(coord, monkeypatch, q):
-    # The pre-guard fires BEFORE the classifier → operational, no classify call.
+def test_imperative_writes_route_operational_with_classify_spend(coord, monkeypatch, q):
+    # Stage 3 (user-approved): the regex pre-guard still decides — a pure
+    # write STILL routes operational, never analytical — but classify now
+    # runs once to discover chunks (mixed analytical+write messages
+    # decompose). Here classify fails (stubbed client) → parse-fail → the
+    # distrust override sends the turn operational-whole: the write-safety
+    # property is preserved even on classify failure.
     seen = _spy(coord, monkeypatch)
     result = asyncio.run(coord.route(q))
     assert result["route"] == "operational"
     assert seen["operational"] == 1 and seen["analytical"] == 0
-    assert seen["classify"] == 0
+    assert seen["classify"] == 1            # the approved Stage-3 spend
 
 
 # ══════════════════════════════════════════════════════════════════════════════

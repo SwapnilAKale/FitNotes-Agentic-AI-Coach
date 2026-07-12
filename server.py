@@ -756,10 +756,19 @@ async def _process_turn(message: str) -> JSONResponse:
                         print(f"[server] staged checkpoint save failed: {exc}",
                               file=sys.stderr)
             if not ghost_suppressed:
+                # Stage-3: a decomposed turn's merged answer (the non-write
+                # parts) must not be swallowed by the panel. `text` carries it
+                # for the frontend; until the frontend renders it, prepend it
+                # to the preview so it is visible NOW (deferred bucket 8b).
+                answer_text = (result.get("answer") or "") \
+                    if result.get("decomposed") else ""
+                if answer_text:
+                    preview = f"{answer_text}\n\n{'─' * 24}\n\n{preview}"
                 return JSONResponse(content={
                     "type": "confirmation_required",
                     "preview": preview,
                     "preview_source": preview_source,
+                    "text": answer_text,
                 })
             # Ghost suppressed: fall through to the normal answer return —
             # the agent's refusal/clarification ask is the turn's real output.

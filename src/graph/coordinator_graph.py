@@ -60,6 +60,10 @@ async def _dispatch_recall(state: CoordinatorState, runtime: Runtime[GraphRunCon
     return await runtime.context.coordinator._node_recall_dispatch(state)
 
 
+async def _dispatch_decomposed(state: CoordinatorState, runtime: Runtime[GraphRunContext]):
+    return await runtime.context.coordinator._node_dispatch_decomposed(state)
+
+
 def _finalize(state: CoordinatorState, runtime: Runtime[GraphRunContext]):
     return runtime.context.coordinator._node_finalize_turn(state)
 
@@ -82,6 +86,12 @@ def _route_after_classify(state: CoordinatorState) -> str:
     params = state.get("params") or {}
     if params.get("_parse_failed"):
         return "unparseable"
+    # Stage 3: a multi-chunk message with MIXED lanes executes per-chunk and
+    # merges in index order. All-analytical multi-chunk deliberately stays a
+    # single run (live-proven good, and one pipeline is cheaper than two).
+    reqs = params.get("requests") or []
+    if len(reqs) >= 2 and len({c.get("lane") for c in reqs}) >= 2:
+        return "dispatch_decomposed"
     route = params.get("route", "analytical")
     if route == "out_of_scope":
         return "out_of_scope"
@@ -109,6 +119,7 @@ def _build() -> StateGraph:
     g.add_node("dispatch_analytical", _dispatch_analytical)
     g.add_node("dispatch_operational", _dispatch_operational)
     g.add_node("dispatch_recall", _dispatch_recall)
+    g.add_node("dispatch_decomposed", _dispatch_decomposed)
     g.add_node("finalize", _finalize)
     g.add_edge(START, "entry_boundary")
     g.add_conditional_edges(
@@ -124,6 +135,7 @@ def _build() -> StateGraph:
             "dispatch_analytical": "dispatch_analytical",
             "dispatch_operational": "dispatch_operational",
             "dispatch_recall": "dispatch_recall",
+            "dispatch_decomposed": "dispatch_decomposed",
         },
     )
     g.add_edge("unparseable", END)
@@ -132,6 +144,7 @@ def _build() -> StateGraph:
     g.add_edge("dispatch_analytical", "finalize")
     g.add_edge("dispatch_operational", "finalize")
     g.add_edge("dispatch_recall", "finalize")
+    g.add_edge("dispatch_decomposed", "finalize")
     g.add_edge("finalize", END)
     return g
 
