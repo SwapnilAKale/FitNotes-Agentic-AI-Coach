@@ -31,10 +31,12 @@ operational hand-rolled-SQL path is the riskier read surface.
 """
 
 import asyncio
+import copy
 import json
 import logging
 import os
 import re
+from datetime import datetime
 from typing import Optional
 
 from google import genai
@@ -591,6 +593,13 @@ OUT_OF_SCOPE_REFUSAL = (
 # valid array is dropped whole rather than half-trusted (Stage 2 must never
 # inherit a chunk list that silently lost entries).
 
+def _norm_name(s: str) -> str:
+    """Exercise-name normalization for deterministic matching: lowercase,
+    strip, collapse internal whitespace (same discipline as the resolver's
+    Tier-0 space-normalized compare)."""
+    return re.sub(r"\s+", " ", (s or "").strip().lower())
+
+
 _VALID_LANES = {"analytical", "operational", "recall", "out_of_scope"}
 
 # Per-chunk parameter defaults — mirrors the flat setdefault block in _classify.
@@ -851,6 +860,16 @@ class Coordinator:
         # In-memory, per session. Lives exactly the immediate next turn (+1 turn
         # only if the user attempts an answer that needs one clarification).
         self._pending_followup: dict | None = None
+        # Decomposition Stage 2: cross-turn pending-disambiguation slot.
+        # In-memory, per session (like _pending_followup). Armed when the
+        # analytical lane exits on a disambiguation ask; consumed by a
+        # deterministic candidate reply (no LLM). Lifecycle: survives ONE
+        # non-answer message (reminder appended), dropped on the second;
+        # 48h staleness; one clarify re-ask for a multi-candidate reply.
+        # Shape: {"question", "params" (deep copy incl. requests), "name",
+        #         "candidates", "created" iso, "strikes", "reminded",
+        #         "clarified"}.
+        self._pending_decomposition: dict | None = None
         # /log follow-up carry: set when a /log-boundary turn ends WITHOUT a
         # complete staged batch (the agent asked a logging clarification — date,
         # name disambiguation, ambiguous sets/reps, any of them). The immediate
@@ -885,6 +904,18 @@ class Coordinator:
         agent.answer), so an unanswered aside never enters extraction/grounding
         history.
         """
+        # ── PRE: decomposition slot (before the demographic follow-up —
+        # candidate matching is strict/deterministic, so a date/height reply
+        # falls through to the followup PRE untouched). decomp_before is the
+        # POST reminder's arm-this-turn guard: never remind on the arming
+        # turn, and never about a chain re-arm (different dict object).
+        decomp_before = self._pending_decomposition
+        if self._pending_decomposition is not None:
+            resumed = await self._consume_pending_decomposition(question)
+            if resumed is not None:
+                return resumed
+            # expired / struck / dropped — handled internally; fall through.
+
         # ── PRE: consume or drop a pending follow-up (before checkpoint logic).
         # A bare follow-up answer ("2003-06-18") is never a continue/discard
         # intent, so handling it here can't collide with the checkpoint block.
@@ -917,6 +948,28 @@ class Coordinator:
         if (result.get("route") in ("analytical", "operational")
                 and result.get("answer")):
             self._append_followup_if_relevant(question, result)
+
+        # ── POST: one-line pending-decomposition reminder (remind-once).
+        # Identity check: the slot must be the SAME object seen at entry —
+        # a slot armed or re-armed THIS turn never gets a reminder. Appended
+        # after _route_with_checkpoint recorded history, so the line never
+        # enters extraction/grounding history (same invariant as the
+        # demographic follow-up above). Strike accounting (PRE) stays
+        # authoritative; this line is courtesy only.
+        if (decomp_before is not None
+                and self._pending_decomposition is decomp_before
+                and not decomp_before["reminded"]
+                and result.get("route") in ("analytical", "operational")
+                and result.get("answer")):
+            q = decomp_before["question"]
+            trunc = q[:80] + ("…" if len(q) > 80 else "")
+            result["answer"] = result["answer"].rstrip() + (
+                f"\n\n(Still pending: your earlier question \"{trunc}\" — "
+                f"tell me which **{decomp_before['name']}** you meant and "
+                f"I'll answer it.)")
+            decomp_before["reminded"] = True
+            logger.info("[decomposition] reminder appended (strike %d)",
+                        decomp_before["strikes"])
         return result
 
     # ── Stage B: demographic follow-up helpers ─────────────────────────────────
@@ -965,6 +1018,205 @@ class Coordinator:
 
     def _followup_response(self, text: str, route: str) -> dict:
         return {"answer": text, "route": route, "flagged_claims": [], "error": None}
+
+    # ── Decomposition Stage 2: pending-disambiguation slot helpers ─────────────
+
+    async def _consume_pending_decomposition(self, question: str) -> dict | None:
+        """
+        Interpret the user's reply against the pending disambiguation.
+        Returns the turn's response dict (the RESUMED answer, or a clarify
+        re-ask) when the reply was consumed, or None when it wasn't — the
+        slot's lifecycle (expiry / strikes / drop) is handled internally and
+        the caller routes the message normally.
+        """
+        slot = self._pending_decomposition
+        # 1. Staleness — same rule + constant as the interrupted-question
+        # checkpoint (48h); a corrupt timestamp counts as stale.
+        try:
+            age_h = (datetime.now()
+                     - datetime.fromisoformat(slot["created"])
+                     ).total_seconds() / 3600
+        except Exception:
+            age_h = _ckpt.MAX_AGE_HOURS + 1
+        if age_h > _ckpt.MAX_AGE_HOURS:
+            logger.info("[decomposition] discarded stale slot (%.0fh old)", age_h)
+            self._pending_decomposition = None
+            return None
+
+        kind, value, source = self._match_disambiguation_reply(
+            question, slot["candidates"], slot["name"])
+
+        # Insistence relent (user ruling): repeating the SAME out-of-context
+        # name after the push-back is a deliberate scope switch — accept it.
+        if (kind == "out_of_context"
+                and slot.get("rejected_override") == value):
+            logger.info("[decomposition] override accepted on insistence: %r",
+                        value)
+            kind, source = "match", "override-insisted"
+
+        if kind == "match":
+            logger.info("[decomposition] consumed: %r -> %r (%s)",
+                        question, value, source)
+            patched = slot["params"]        # the slot's own deep copy
+            self._patch_resolved_name(patched, slot["name"], value)
+            # Clear BEFORE re-entry: a chain (second ambiguity) re-arms
+            # fresh, and a 429 mid-resume leaves the stage checkpoint
+            # holding the patched params — "continue" recovers through the
+            # normal checkpoint path, which the slot must not shadow.
+            self._pending_decomposition = None
+            return await self._resume_decomposition(slot["question"], patched)
+
+        if kind == "out_of_context":
+            if slot.get("rejected_override") is not None:
+                # A DIFFERENT out-of-context name after a push-back — one
+                # push-back total, never a loop: treat as a non-answer.
+                kind = "miss"
+            else:
+                # Stern push-back: hold ground, restate the ask (engagement,
+                # NOT a strike — mirrors the clarify-once precedent).
+                slot["rejected_override"] = value
+                q = slot["question"]
+                trunc = q[:80] + ("…" if len(q) > 80 else "")
+                opts = "\n".join(f"- {c}" for c in slot["candidates"][:5])
+                logger.info("[decomposition] push-back: %r is not a %r",
+                            value, slot["name"])
+                return self._followup_response(
+                    f"You asked about **{slot['name']}** — **{value}** isn't "
+                    f"one. To answer your original question (\"{trunc}\") I "
+                    f"need one of these:\n\n{opts}\n\nIf you've changed your "
+                    f"mind and want **{value}** instead, just say it again "
+                    f"and I'll switch.",
+                    "decomposition_pushback")
+
+        if kind == "ambiguous" and not slot["clarified"]:
+            # Engagement, not ignoring: one clarify re-ask, no strike
+            # (mirrors _consume_pending_followup's clarify-once).
+            slot["clarified"] = True
+            opts = " or ".join(f"**{c}**" for c in value[:5])
+            logger.info("[decomposition] clarify re-ask (%d still match)",
+                        len(value))
+            return self._followup_response(
+                f"I still can't tell which one — did you mean {opts}?",
+                "decomposition_clarify")
+
+        # miss (or a second ambiguous attempt after the clarify)
+        slot["strikes"] += 1
+        if slot["strikes"] >= 2:
+            logger.info("[decomposition] dropped after %d strikes: %r",
+                        slot["strikes"], slot["question"][:60])
+            self._pending_decomposition = None
+        else:
+            logger.info("[decomposition] strike %d — slot survives",
+                        slot["strikes"])
+        return None
+
+    def _match_disambiguation_reply(self, reply: str, candidates: list,
+                                    ambiguous_name: str | None = None) -> tuple:
+        """
+        Deterministic reply→candidate matching — zero LLM calls.
+        Returns ("match", exact_db_name, source) | ("ambiguous", subset, None)
+        | ("out_of_context", exact_db_name, None) | ("miss", None, None).
+        Tiers: normalized equality → unique substring (both directions) →
+        resolver fallback, gated to NAME-SHAPED replies only (the hijack
+        guard: a full-sentence new question must never be swallowed). A
+        resolver match outside the candidate list is accepted as an override
+        ONLY when it stays in the original context — it contains the
+        ambiguous term ("Barbell Squat" for "squat") or shares a muscle
+        group (Category) with the candidates; otherwise it is out_of_context
+        and the caller pushes back (user ruling 2026-07-12: a clarification
+        answer must not teleport out of the question's context).
+        """
+        r = _norm_name(reply)
+        r = re.sub(r"[.!?,]+$", "", r).strip()
+        for prefix in ("i meant ", "i mean ", "it's ", "it is ", "the "):
+            if r.startswith(prefix):
+                r = r[len(prefix):].strip()
+                break
+        if not r:
+            return ("miss", None, None)
+
+        norm_c = {c: _norm_name(c) for c in candidates}
+        for c, nc in norm_c.items():                     # tier 1: exact
+            if r == nc:
+                return ("match", c, "exact")
+        hits = [c for c, nc in norm_c.items()            # tier 2: substring
+                if r in nc or nc in r]
+        if len(hits) == 1:
+            return ("match", hits[0], "substring")
+        if len(hits) >= 2:
+            return ("ambiguous", hits, None)
+
+        # tier 3: resolver fallback — name-shaped replies only.
+        if ("?" in reply or len(r.split()) > 5
+                or _is_write_intent(reply)
+                or _ckpt.is_continue_intent(reply)
+                or _filler_reply(reply) is not None):
+            return ("miss", None, None)
+        from src.shared.resolver import resolve_exercise_name
+        db_path = os.environ.get(
+            "FITNOTES_DB_PATH",
+            os.path.join(os.path.dirname(__file__), "..",
+                         "data", "FitNotes_Backup.fitnotes"))
+        try:
+            result = resolve_exercise_name(r, db_path, permissive=True)
+        except Exception as e:
+            logger.warning("[decomposition] resolver fallback failed: %s", e)
+            return ("miss", None, None)
+        match = result.get("match")
+        if match:
+            if match in candidates:
+                return ("match", match, "resolver")
+            # Containment gate: an off-list override must stay in context.
+            if ambiguous_name and _norm_name(ambiguous_name) in _norm_name(match):
+                return ("match", match, "override")        # term containment
+            from src.shared.resolver import exercise_categories
+            cats = exercise_categories([match] + list(candidates), db_path)
+            cand_groups = {cats[c] for c in candidates if c in cats}
+            if match in cats and cats[match] in cand_groups:
+                return ("match", match, "override")        # same muscle group
+            return ("out_of_context", match, None)
+        return ("miss", None, None)
+
+    @staticmethod
+    def _patch_resolved_name(params: dict, old: str, new: str) -> None:
+        """Swap the ambiguous name for the resolved exact DB name, in the
+        flat exercise_names AND every requests chunk (normalized compare).
+        The requests array stays otherwise untouched — inert until Stage 3."""
+        old_n = _norm_name(old)
+
+        def swap(lst):
+            if not lst:
+                return lst
+            return [new if _norm_name(x) == old_n else x for x in lst]
+
+        params["exercise_names"] = swap(params.get("exercise_names"))
+        for chunk in (params.get("requests") or []):
+            chunk["exercise_names"] = swap(chunk.get("exercise_names"))
+
+    async def _resume_decomposition(self, question: str, params: dict) -> dict:
+        """
+        Re-run the original question with pre-seeded params: the graph's
+        entry pass-through + route-aware dispatch skip every pre-guard AND
+        the classify call (net −1 LLM call vs a re-classify). The whole turn
+        machinery (dispatch, finalize, history, record_external_exchange)
+        runs normally. A chain ambiguity re-arms the slot via
+        _run_analytical's arm seam.
+        """
+        from src.graph.coordinator_graph import get_coordinator_graph
+        from src.graph.persistence import cleanup_turn, new_turn_id, turn_config
+        from src.graph.state import GraphRunContext, RunCache
+
+        turn_id = new_turn_id()
+        state = await get_coordinator_graph().ainvoke(
+            {"question": question, "log_carry": False, "flow_turns": [],
+             "params": params},
+            turn_config(turn_id),
+            context=GraphRunContext(coordinator=self, cache=RunCache()),
+        )
+        cleanup_turn(turn_id)
+        result = state["result"]
+        result.setdefault("resolved_question", question)
+        return result
 
     async def _route_with_checkpoint(self, question: str,
                                      log_carry: bool = False,
@@ -1079,6 +1331,13 @@ class Coordinator:
         """Node: the deterministic pre-LLM guards — /log boundary, carry
         consume, filler short-circuit, write-intent regex — evaluated BEFORE
         the classify router (the conditional edge reads this node's output)."""
+        # Pre-seeded params = a decomposition resume: the classify already
+        # happened on the original turn. Skip EVERY pre-guard — in particular
+        # the write-intent regex must never re-inspect a question whose lane
+        # is already decided ("did I log squats..." must not hijack to
+        # operational on resume).
+        if state.get("params") is not None:
+            return {"params": state["params"]}
         question   = state["question"]
         log_carry  = state.get("log_carry", False)
         flow_turns = state.get("flow_turns")
@@ -1727,6 +1986,28 @@ class Coordinator:
         )
         cleanup_turn(turn_id)
         if state.get("early_answer") is not None:
+            # Stage 2: arm the pending-decomposition slot on a disambiguation
+            # ask. Single seam covers fresh dispatch AND _resume. A chain
+            # (second ambiguity on the resumed run) re-arms with the
+            # already-patched params. Deep copy: the slot must never alias
+            # graph-checkpointed state.
+            if state.get("disambiguation"):
+                d = state["disambiguation"]
+                self._pending_decomposition = {
+                    "question":   question,
+                    "params":     copy.deepcopy(params),
+                    "name":       d["name"],
+                    "candidates": list(d["candidates"]),
+                    "created":    datetime.now().isoformat(),
+                    "strikes":    0,
+                    "reminded":   False,
+                    "clarified":  False,
+                    "rejected_override": None,
+                }
+                logger.info(
+                    "[decomposition] armed: name=%r, %d candidate(s), %d chunk(s)",
+                    d["name"], len(d["candidates"]),
+                    len(params.get("requests") or []) or 1)
             return state["early_answer"], []
         return state["answer"], state.get("flagged", [])
 
@@ -1787,13 +2068,19 @@ class Coordinator:
                     resolved.append(candidates[0])
                 elif len(candidates) >= 2:
                     # Genuine ambiguity: surface candidates so the user can clarify
-                    # rather than silently guessing the first one.
+                    # rather than silently guessing the first one. The structured
+                    # payload lets _run_analytical arm the pending-decomposition
+                    # slot (full candidate list, not just the shown 5).
                     names_list = "\n".join(f"- {c}" for c in candidates[:5])
-                    return {"early_answer": (
-                        f"I found multiple exercises matching **{name}**. "
-                        f"Which one did you mean?\n\n{names_list}\n\n"
-                        f"Please let me know and I'll answer your question."
-                    )}
+                    return {
+                        "early_answer": (
+                            f"I found multiple exercises matching **{name}**. "
+                            f"Which one did you mean?\n\n{names_list}\n\n"
+                            f"Please let me know and I'll answer your question."
+                        ),
+                        "disambiguation": {"name": name,
+                                           "candidates": list(candidates)},
+                    }
                 else:
                     # No match — keep original so the package reports it as unresolved
                     resolved.append(name)

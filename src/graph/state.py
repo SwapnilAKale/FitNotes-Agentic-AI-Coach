@@ -58,6 +58,9 @@ class AnalyticalState(TypedDict, total=False):
     resume_completed_stage: Optional[str]   # from the checkpoint slot
     resume_draft: Optional[str]
     early_answer: Optional[str]             # disambiguation short-circuit
+    disambiguation: Optional[dict]          # resolve_scope's ask payload
+                                            # {"name", "candidates"} — small,
+                                            # JSON-safe (Stage-2 slot arming)
 
 
 class OperationalState(TypedDict, total=False):

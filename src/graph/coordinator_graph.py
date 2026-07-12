@@ -67,8 +67,14 @@ def _finalize(state: CoordinatorState, runtime: Runtime[GraphRunContext]):
 def _route_after_entry(state: CoordinatorState) -> str:
     if state.get("result") is not None:          # filler short-circuit
         return END
-    if state.get("params") is not None:          # /log boundary or write-intent
-        return "dispatch_operational"            # pre-guard: classify never runs
+    params = state.get("params")
+    if params is not None:                       # pre-guard or decomposition resume
+        # Dispatch by the params' own route: classify never runs. The /log and
+        # write-intent synthetic dicts all carry "operational" (unchanged
+        # behavior); a pre-seeded analytical resume dispatches analytical.
+        if params.get("route") == "analytical":
+            return "dispatch_analytical"
+        return "dispatch_operational"
     return "classify"
 
 
@@ -107,7 +113,8 @@ def _build() -> StateGraph:
     g.add_edge(START, "entry_boundary")
     g.add_conditional_edges(
         "entry_boundary", _route_after_entry,
-        {END: END, "dispatch_operational": "dispatch_operational", "classify": "classify"},
+        {END: END, "dispatch_operational": "dispatch_operational",
+         "dispatch_analytical": "dispatch_analytical", "classify": "classify"},
     )
     g.add_conditional_edges(
         "classify", _route_after_classify,

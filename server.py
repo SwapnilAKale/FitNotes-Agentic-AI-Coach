@@ -5,6 +5,7 @@ import asyncio
 import datetime
 import hashlib
 import json
+import logging
 import os
 import re
 import sys
@@ -34,6 +35,19 @@ from src import settings, wal
 
 DB_PATH = os.environ.get("FITNOTES_DB_PATH", "./data/FitNotes_Backup.fitnotes")
 FRONTEND_SERVER = Path(__file__).parent / "frontend" / "server.py"
+
+# Coordinator telemetry visibility: nothing configures Python logging here,
+# so only WARNING+ escapes via logging.lastResort — which silently dropped
+# the INFO-level [decomposition] lifecycle lines during live checks. Scoped
+# fix: give ONLY the coordinator logger an INFO handler; the root logger is
+# untouched, so third-party INFO noise stays suppressed. Idempotent across
+# --reload re-imports.
+_coord_logger = logging.getLogger("src.coordinator")
+_coord_logger.setLevel(logging.INFO)
+if not _coord_logger.handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+    _coord_logger.addHandler(_h)
 
 agent_ready: bool = False
 

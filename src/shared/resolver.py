@@ -75,6 +75,31 @@ def _logged_counts(conn: sqlite3.Connection, names: list) -> dict:
     return {r["name"]: r["sets"] for r in rows}
 
 
+def exercise_categories(names: list, db_path: str) -> dict:
+    """Muscle-group (Category) name per exact exercise name, in one read-only
+    query. Exercises with no/NULL category are absent from the dict. Never
+    raises — callers use this for a containment CHECK (the decomposition
+    override gate), where an empty dict must degrade to "unknown", not crash."""
+    if not names:
+        return {}
+    try:
+        conn = _connect(db_path)
+        try:
+            placeholders = ",".join("?" * len(names))
+            rows = conn.execute(
+                f"""SELECT e.name AS name, c.name AS category
+                    FROM exercise e
+                    JOIN Category c ON c._id = e.category_id
+                    WHERE e.name IN ({placeholders})""",
+                tuple(names),
+            ).fetchall()
+            return {r["name"]: r["category"] for r in rows}
+        finally:
+            conn.close()
+    except Exception:
+        return {}
+
+
 def _order_by_data(query: str, candidates: list, counts: dict) -> list:
     """Order the ask-list data-first: (logged_count desc, name-ratio desc) so the
     exercise the user actually trains leads the disambiguation prompt."""
