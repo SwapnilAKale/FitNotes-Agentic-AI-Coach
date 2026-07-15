@@ -59,10 +59,12 @@ class FakeAgent:
     """AgentSession stand-in: records the question _run_operational forwards and
     returns a scripted answer() dict incl. the staging_reached_confirm signal."""
 
-    def __init__(self, answer_text="Staged.", staging_reached_confirm=True):
+    def __init__(self, answer_text="Staged.", staging_reached_confirm=True,
+                 staged_this_turn=False):
         self.questions: list[str] = []
         self.answer_text = answer_text
         self.staging_reached_confirm = staging_reached_confirm
+        self.staged_this_turn = staged_this_turn
 
     async def answer(self, question):
         self.questions.append(question)
@@ -72,6 +74,7 @@ class FakeAgent:
             "tool_calls_made": 1,
             "error": None,
             "staging_reached_confirm": self.staging_reached_confirm,
+            "staged_this_turn": self.staged_this_turn,
         }
 
 
@@ -131,6 +134,42 @@ def test_input_a_multi_turn_carry_assembles_in_order(monkeypatch):
     r2 = asyncio.run(coord.route("27 June"))
     assert r2["log_boundary"] is True
     assert r2["log_flow_turns"] == ["deadlift 3 sets of 5 at 200 lbs", "27 June"]
+
+
+def test_carry_not_armed_on_staged_turn(monkeypatch):
+    """#13: under Fix 5 the agent never calls execute for a workout — the
+    SERVER does, after /confirm — so staging_reached_confirm is structurally
+    False on EVERY successful staged write. staged_this_turn is the direct
+    signal that the panel takes over: the carry must stay down. (This exact
+    result shape wrongly armed the carry before the fix.)"""
+    agent = FakeAgent(staging_reached_confirm=False, staged_this_turn=True)
+    coord = _make_coord(monkeypatch, agent)
+
+    asyncio.run(coord._run_operational("bench 100x5 today", log_boundary=True))
+
+    assert coord._pending_log_carry is False
+
+
+def test_carry_not_armed_on_agent_driven_execute(monkeypatch):
+    """Sibling flows (goal/set edits) where the agent itself reaches the
+    execute gate keep the original signal — carry stays down."""
+    agent = FakeAgent(staging_reached_confirm=True, staged_this_turn=False)
+    coord = _make_coord(monkeypatch, agent)
+
+    asyncio.run(coord._run_operational("bench 100x5 today", log_boundary=True))
+
+    assert coord._pending_log_carry is False
+
+
+def test_carry_armed_only_on_clarification_turn(monkeypatch):
+    """Nothing staged, gate never reached ⇒ the turn ended in a logging
+    clarification — the carry arms so the next reply joins the flow."""
+    agent = FakeAgent(staging_reached_confirm=False, staged_this_turn=False)
+    coord = _make_coord(monkeypatch, agent)
+
+    asyncio.run(coord._run_operational("bench today", log_boundary=True))
+
+    assert coord._pending_log_carry is True
 
 
 def test_input_a_fallback_write_is_the_single_message(monkeypatch):
@@ -384,6 +423,8 @@ def test_server_fail_suppresses_panel_and_discards_immediately(srv, monkeypatch)
     records = [a for n, a in calls if n == "record_workout_verify"]
     assert records == [{"verdict": "FAIL", "reason": "second exercise missing"}]
     assert "execute_staged_workout" not in names
+    # #13 defense in depth: a FAILed flow leaves no carry behind.
+    assert srv.coordinator._pending_log_carry is False
 
 
 def test_server_post_fail_stray_confirm_cannot_reach_execute(srv, monkeypatch):

@@ -70,7 +70,8 @@ def srv(monkeypatch):
     server_mod._state.update({"pending_confirmation": False,
                               "allow_execute": False, "staging_preview": "",
                               "confirmation_preview": "",
-                              "pending_execute_kind": None})
+                              "pending_execute_kind": None,
+                              "decomposed_answer": ""})
     return server_mod
 
 
@@ -347,22 +348,26 @@ def test_backed_claim_ships_even_with_loose_phrasing(monkeypatch):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Stage 3: a decomposed turn's merged answer survives the panel
+# Stage 3 (#12): panel shows staging only; /confirm delivers the merged answer
+# in the CHAT together with the write outcome
 # ══════════════════════════════════════════════════════════════════════════════
 
-def test_decomposed_merged_answer_survives_confirmation_panel(srv, monkeypatch):
-    """A mixed analytical+write turn stages a batch AND carries the merged
-    non-write answer. The confirmation_required payload must ship both: the
-    merged text (in `text` and prepended to the preview until the frontend
-    renders `text`) and the staged preview."""
-    merged = "### Is my squat progressing?\n\nYour squat is up 5%."
+_MERGED = "### Is my squat progressing?\n\nYour squat is up 5%."
+
+
+def _decomposed_turn(srv, monkeypatch, *, execute_response=None):
+    """Drive one decomposed mixed turn to the confirm panel. The stubs stay
+    installed so the test can follow up with srv.confirm(). Returns the panel
+    body and the call_tool log."""
     calls: list = []
+    if execute_response is None:
+        execute_response = {"success": True, "message": "written"}
 
     async def route(msg):
         srv._state["pending_confirmation"] = True
         srv._state["confirmation_preview"] = "ARGS-BLOB"
         srv._state["pending_execute_kind"] = "workout"
-        return {"answer": merged, "route": "analytical", "decomposed": True,
+        return {"answer": _MERGED, "route": "analytical", "decomposed": True,
                 "flagged_claims": [], "error": None, "log_boundary": False,
                 "log_flow_turns": ["Log bench 100 lbs for 5 reps today"]}
 
@@ -372,28 +377,76 @@ def test_decomposed_merged_answer_survives_confirmation_panel(srv, monkeypatch):
             return _SLOT_REAL
         if name == "format_staged_workout_for_confirmation":
             return json.dumps({"preview": _PREVIEW})
+        if name == "execute_staged_workout":
+            return json.dumps(execute_response)
         return json.dumps({"ok": True})
 
     async def verify_log_staging(flow, slot_json, preview):
         return {"verdict": "PASS", "reason": ""}
 
+    async def answer(message):
+        return {"answer": f"AGENT({message})", "error": None}
+
     monkeypatch.setattr(srv, "coordinator", SimpleNamespace(
-        route=route, verify_log_staging=verify_log_staging))
+        route=route, verify_log_staging=verify_log_staging,
+        _pending_log_carry=True))          # #13: /confirm must clear this
     monkeypatch.setattr(srv, "session", SimpleNamespace(
-        call_tool=call_tool, chat_history=[]))     # route "analytical" mirrors
+        call_tool=call_tool, chat_history=[], answer=answer))
     body = _body(asyncio.run(srv._process_turn(
         "is my squat progressing and log bench 100x5")))
+    return body, calls
+
+
+def test_decomposed_panel_shows_staging_only_and_stashes_answer(srv, monkeypatch):
+    body, _ = _decomposed_turn(srv, monkeypatch)
 
     assert body["type"] == "confirmation_required"
-    assert body["text"] == merged                       # for the frontend
-    assert merged in body["preview"]                    # visible NOW
-    assert _PREVIEW in body["preview"]                  # staged lines intact
-    assert body["preview"].index(merged) < body["preview"].index(_PREVIEW)
+    assert body["preview"] == _PREVIEW                  # staged batch ONLY
+    assert _MERGED not in body["preview"]
+    assert "text" not in body                           # no dead payload field
+    assert srv._state["decomposed_answer"] == _MERGED   # stashed for /confirm
+
+
+def test_confirm_delivers_merged_answer_before_write_outcome(srv, monkeypatch):
+    _decomposed_turn(srv, monkeypatch)
+
+    body = _body(asyncio.run(srv.confirm(srv.ConfirmRequest(confirmed=True))))
+
+    assert body["type"] == "answer"
+    assert body["text"].startswith(_MERGED)             # analytical half first
+    assert "✅" in body["text"]
+    assert body["text"].index(_MERGED) < body["text"].index("✅")
+    assert srv._state["decomposed_answer"] == ""        # consumed, never re-shipped
+    assert srv.coordinator._pending_log_carry is False  # #13 defensive clear
+
+
+def test_cancel_delivers_merged_answer_with_cancel_text(srv, monkeypatch):
+    _decomposed_turn(srv, monkeypatch)
+
+    body = _body(asyncio.run(srv.confirm(srv.ConfirmRequest(confirmed=False))))
+
+    assert body["type"] == "answer"
+    assert body["text"].startswith(_MERGED)
+    assert "AGENT(Cancel that)" in body["text"]
+    assert srv._state["decomposed_answer"] == ""
+    assert srv.coordinator._pending_log_carry is False  # #13 defensive clear
+
+
+def test_confirm_execute_failure_still_delivers_merged_answer(srv, monkeypatch):
+    _decomposed_turn(srv, monkeypatch,
+                     execute_response={"success": False, "message": "db locked"})
+
+    body = _body(asyncio.run(srv.confirm(srv.ConfirmRequest(confirmed=True))))
+
+    assert body["type"] == "error"
+    assert body["text"].startswith(_MERGED)             # not lost on a failed write
+    assert "❌" in body["text"]
+    assert srv._state["decomposed_answer"] == ""
 
 
 def test_non_decomposed_panel_payload_unchanged(srv, monkeypatch):
     """A plain single-write turn's panel is byte-identical to before Stage 3
-    (no answer prepended, empty text field)."""
+    (no prepend, no text field, nothing stashed)."""
     body, calls, seen = _drive(
         srv, monkeypatch, answer_text="Staged.",
         slot_response=_SLOT_REAL,
@@ -402,4 +455,5 @@ def test_non_decomposed_panel_payload_unchanged(srv, monkeypatch):
 
     assert body["type"] == "confirmation_required"
     assert body["preview"] == _PREVIEW                  # no prepend
-    assert body["text"] == ""
+    assert "text" not in body
+    assert srv._state["decomposed_answer"] == ""

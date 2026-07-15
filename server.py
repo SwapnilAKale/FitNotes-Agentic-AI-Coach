@@ -327,6 +327,10 @@ _state: dict = {
     "pending_execute_kind": None,
     "pending_upload_path": None,
     "pending_upload_contents": None,
+    # Stage-3 #12: a decomposed turn's merged non-write answer, stashed while
+    # the confirm panel is up. /confirm delivers it in the CHAT (prepended to
+    # the write outcome) — the panel itself shows only the staged batch.
+    "decomposed_answer": "",
 }
 
 session: AgentSession | None = None
@@ -567,6 +571,9 @@ async def _process_turn(message: str) -> JSONResponse:
         _state["allow_execute"] = False
         _state["staging_preview"] = ""
         _state["pending_execute_kind"] = None
+        # A fresh turn always starts clean — an abandoned panel's stashed
+        # answer must never leak into an unrelated later confirm.
+        _state["decomposed_answer"] = ""
         # Clear-on-entry: wipe any staged batch left by a prior turn (reload, abandoned,
         # or cancelled) BEFORE this turn stages anything. _staged_writes lives in the MCP
         # subprocess, so the server clears it deterministically via call_tool. This MUST
@@ -715,6 +722,10 @@ async def _process_turn(message: str) -> JSONResponse:
                         print(f"[server] staging verify FAIL cleanup failed: {exc}",
                               file=sys.stderr)
                     _ckpt.clear_staged_checkpoint()
+                    # #13 defense in depth: a FAILed flow is over — a leftover
+                    # carry must not consume the user's next message.
+                    if coordinator is not None:
+                        coordinator._pending_log_carry = False
                     print(f"[server] staging verify FAIL: {verdict.get('reason')}",
                           file=sys.stderr)
                     return JSONResponse(content={
@@ -756,19 +767,17 @@ async def _process_turn(message: str) -> JSONResponse:
                         print(f"[server] staged checkpoint save failed: {exc}",
                               file=sys.stderr)
             if not ghost_suppressed:
-                # Stage-3: a decomposed turn's merged answer (the non-write
-                # parts) must not be swallowed by the panel. `text` carries it
-                # for the frontend; until the frontend renders it, prepend it
-                # to the preview so it is visible NOW (deferred bucket 8b).
-                answer_text = (result.get("answer") or "") \
-                    if result.get("decomposed") else ""
-                if answer_text:
-                    preview = f"{answer_text}\n\n{'─' * 24}\n\n{preview}"
+                # Stage-3 #12: the panel is a one-time popup that gates the
+                # write — it shows ONLY the staged batch. A decomposed turn's
+                # merged non-write answer is stashed here and delivered in
+                # the CHAT by /confirm, together with the write outcome, so
+                # it survives the panel's dismissal.
+                if result.get("decomposed"):
+                    _state["decomposed_answer"] = result.get("answer") or ""
                 return JSONResponse(content={
                     "type": "confirmation_required",
                     "preview": preview,
                     "preview_source": preview_source,
-                    "text": answer_text,
                 })
             # Ghost suppressed: fall through to the normal answer return —
             # the agent's refusal/clarification ask is the turn's real output.
@@ -800,6 +809,17 @@ async def resume():
     # The "Resume" button calls this. Reuse the Coordinator's continue-intent
     # path: load the slot → _resume, or the nothing-to-resume notice if empty.
     return await _process_turn("continue")
+
+
+def _with_decomposed_answer(outcome_text: str) -> str:
+    """Stage-3 #12: /confirm's chat reply = the stashed merged answer (the
+    decomposed turn's non-write parts) + the write outcome. Clears the stash
+    in every outcome branch so it can never ride into a later confirm."""
+    stashed = _state["decomposed_answer"]
+    _state["decomposed_answer"] = ""
+    if stashed:
+        return f"{stashed}\n\n{outcome_text}"
+    return outcome_text
 
 
 @app.post("/confirm")
@@ -841,6 +861,9 @@ async def confirm(body: ConfirmRequest):
             # only a staged_slot checkpoint is cleared, never an unrelated
             # interrupted-question slot.
             _ckpt.clear_staged_checkpoint()
+            # #13 defense in depth: cancel ends the flow — no carry survives.
+            if coordinator is not None:
+                coordinator._pending_log_carry = False
         # Fix 5: a confirmed WORKOUT batch is executed by the SERVER, not the agent
         # — call_tool mirrors the deterministic discard calls above. The tool runs
         # atomic write-and-verify (rollback on mismatch), so its result IS the
@@ -858,13 +881,19 @@ async def confirm(body: ConfirmRequest):
                 # a double write. This is the keep-until-confirm lifecycle's
                 # closing clear.
                 _ckpt.clear_staged_checkpoint()
+                # #13 defense in depth: the write landed — flow over, no carry.
+                if coordinator is not None:
+                    coordinator._pending_log_carry = False
                 return JSONResponse(content={
                     "type": "answer",
-                    "text": f"✅ {outcome.get('message', 'Workout saved and verified.')}",
+                    "text": _with_decomposed_answer(
+                        f"✅ {outcome.get('message', 'Workout saved and verified.')}"),
                 })
+            # Execute failure: the analytical half must not be lost either.
             return JSONResponse(content={
                 "type": "error",
-                "text": f"❌ {outcome.get('message') or outcome.get('error') or 'Workout write failed — nothing was saved.'}",
+                "text": _with_decomposed_answer(
+                    f"❌ {outcome.get('message') or outcome.get('error') or 'Workout write failed — nothing was saved.'}"),
             })
         # Sibling staged flows (goal / set edits) keep the agent-driven execute:
         # allow_execute unblocks their execute_* tools and the agent is re-prompted.
@@ -881,7 +910,12 @@ async def confirm(body: ConfirmRequest):
             _state["allow_execute"] = False
         if result.get("error") and result["error"] != "max_iterations_reached":
             return JSONResponse(content={"type": "error", "text": result["error"]})
-        return JSONResponse(content={"type": "answer", "text": result.get("answer", "")})
+        # Cancelled workouts and sibling staged flows exit here — the stashed
+        # decomposed answer still belongs in the chat with the outcome text.
+        return JSONResponse(content={
+            "type": "answer",
+            "text": _with_decomposed_answer(result.get("answer", "")),
+        })
 
 
 async def _reinitialize_session():

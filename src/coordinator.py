@@ -2648,12 +2648,16 @@ class Coordinator:
             note is its only acknowledgment (never routed, never decomposed).
           - fallback_write: the write was inferred by regex, not /log — append
             the suggestive nudge (fallback turns only, never /log turns).
-        Carry set-site: a boundary turn whose staged batch never reached the
-        confirmation gate (agent.answer's staging_reached_confirm is False)
-        ended in a logging clarification — arm the single-turn carry so the
-        user's next reply joins the /log flow. Staging-complete ⇒ gate reached
-        ⇒ flag stays down; cancel only exists at the confirm panel, which only
-        exists when the batch was complete ⇒ flag already down.
+        Carry set-site: a boundary turn that staged NOTHING and never reached
+        the execute gate ended in a logging clarification — arm the
+        single-turn carry so the user's next reply joins the /log flow.
+        Anything staged (staged_this_turn) ⇒ the confirm panel takes over the
+        flow ⇒ flag stays down. staging_reached_confirm stays in the OR for
+        the sibling agent-driven-execute flows (goal/set edits); it is
+        structurally always False for workouts under Fix 5 (the SERVER calls
+        execute after /confirm, never the agent), which is why it could
+        never be the sole signal (#13: carry mis-armed on every successful
+        staged write).
         """
         if self._agent is None:
             return (
@@ -2721,7 +2725,9 @@ class Coordinator:
             # a turn that ends pending a logging clarification must carry the
             # originating flow-turn text into the next reply, or the stage-2
             # verify diffs the staged batch against the bare reply ("Today").
-            self._pending_log_carry = not result.get("staging_reached_confirm", False)
+            self._pending_log_carry = not (
+                result.get("staging_reached_confirm", False)
+                or result.get("staged_this_turn", False))
         if trailing_note:
             answer = answer.rstrip() + "\n\n" + _LOG_TRAILING_NOTE
         if fallback_write:
