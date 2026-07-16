@@ -1186,7 +1186,15 @@ class Coordinator:
     def _patch_resolved_name(params: dict, old: str, new: str) -> None:
         """Swap the ambiguous name for the resolved exact DB name, in the
         flat exercise_names AND every requests chunk (normalized compare).
-        The requests array stays otherwise untouched — inert until Stage 3."""
+
+        Two channels, because the two lanes read the name differently: the
+        analytical lane resolves from params.exercise_names (patched via the
+        list swap), but the operational (write) lane resolves the name from
+        the chunk's natural-language intent_text inside the agent — so the
+        exact name must be substituted THERE too, or the write agent re-asks
+        "which one?" on resume. The text substitution is case-insensitive and
+        applies to every chunk's intent_text (rewriting an analytical chunk's
+        question to the exact name is correct and harmless)."""
         old_n = _norm_name(old)
 
         def swap(lst):
@@ -1197,6 +1205,71 @@ class Coordinator:
         params["exercise_names"] = swap(params.get("exercise_names"))
         for chunk in (params.get("requests") or []):
             chunk["exercise_names"] = swap(chunk.get("exercise_names"))
+            it = chunk.get("intent_text")
+            if it and old:
+                chunk["intent_text"] = re.sub(
+                    re.escape(old), new, it, flags=re.IGNORECASE)
+
+    def _disambiguation_payload(self) -> dict | None:
+        """Structured groups for the current pending-disambiguation slot, or
+        None. The single source the server reads to raise the disambiguation
+        panel: {"groups": [{"name", "candidates"}, ...]} in ask order. Only the
+        display fields (name + candidate list) cross the wire; the full params
+        and lifecycle stay server-side in the slot."""
+        slot = self._pending_decomposition
+        if not slot or not slot.get("groups"):
+            return None
+        return {"groups": [{"name": g["name"],
+                            "candidates": list(g["candidates"])}
+                           for g in slot["groups"]]}
+
+    def _collect_decomposition_ambiguities(self, reqs: list) -> list:
+        """Pre-dispatch name resolution across ALL chunks. Resolve every
+        chunk's exercise_names via the shared resolver — permissive (data-first
+        auto-pick) for read lanes, STRICT for the operational (write) lane (a
+        wrong write is unrecoverable — the locked auto-pick-removal rule). Any
+        name that resolves cleanly is patched into the chunk in place (so the
+        chunk dispatches with the exact name); any that stays ambiguous becomes
+        a group {name, candidates, lane}, in chunk/index order, deduped by
+        normalized name (the same term in two chunks asks once)."""
+        from src.shared.resolver import resolve_exercise_name
+        db_path = self._db_path()
+        groups: list = []
+        seen: set = set()
+        for chunk in reqs:
+            lane = chunk.get("lane")
+            permissive = lane != "operational"
+            for name in list(chunk.get("exercise_names") or []):
+                try:
+                    result = resolve_exercise_name(name, db_path,
+                                                   permissive=permissive)
+                except Exception as e:
+                    logger.warning(
+                        "[decomposition] pre-resolve failed for %r: %s", name, e)
+                    continue
+                match = result.get("match")
+                candidates = result.get("candidates") or []
+                if match:
+                    # Clean single match — bind it into the chunk now (both
+                    # channels) so no lane re-asks downstream.
+                    self._patch_resolved_name({"requests": [chunk]}, name, match)
+                elif candidates:
+                    key = _norm_name(name)
+                    if key not in seen:
+                        seen.add(key)
+                        groups.append({"name": name,
+                                       "candidates": list(candidates),
+                                       "lane": lane})
+                # 0 candidates → not found: leave as-is (a genuinely new write
+                # exercise, or a name the package will report unresolved).
+        return groups
+
+    @staticmethod
+    def _db_path() -> str:
+        return os.environ.get(
+            "FITNOTES_DB_PATH",
+            os.path.join(os.path.dirname(__file__), "..",
+                         "data", "FitNotes_Backup.fitnotes"))
 
     async def _resume_decomposition(self, question: str, params: dict) -> dict:
         """
@@ -1222,6 +1295,90 @@ class Coordinator:
         result = state["result"]
         result.setdefault("resolved_question", question)
         return result
+
+    async def resolve_disambiguation(self, selections: list) -> dict | None:
+        """
+        Structured (panel) resolution of the pending-disambiguation slot — the
+        PRIMARY path, distinct from the prose _consume_pending_decomposition
+        (kept as a typed-reply fallback). `selections` is the panel's answer,
+        one entry per group: {"name", "choice", "other_text"?}. A `choice` that
+        is a listed candidate is exact; a `choice` of "__other__" re-resolves
+        `other_text` through the resolver at the group's own permissiveness
+        (STRICT for a write group — never auto-pick). Every cleanly-resolved
+        name is patched into the FULL turn params (both channels); groups that
+        stay unresolved (an ambiguous / not-found "Other") re-arm and the panel
+        re-prompts JUST them. When nothing is left unresolved the whole turn
+        resumes and runs to completion. Returns the turn's result dict, or None
+        when there is no live slot (caller ships a "nothing to resolve" notice).
+        """
+        slot = self._pending_decomposition
+        if slot is None:
+            return None
+        from src.shared.resolver import resolve_exercise_name
+        db_path = self._db_path()
+        params = slot["params"]
+        by_name = {s.get("name"): s for s in (selections or [])}
+        remaining: list = []
+        for g in slot["groups"]:
+            sel = by_name.get(g["name"]) or {}
+            choice = (sel.get("choice") or "").strip()
+            chosen: str | None = None
+            if choice and choice != "__other__" and choice in g["candidates"]:
+                chosen = choice                       # exact candidate pick
+            elif choice == "__other__":
+                other = (sel.get("other_text") or "").strip()
+                if other:
+                    permissive = g.get("lane") != "operational"
+                    try:
+                        res = resolve_exercise_name(other, db_path,
+                                                    permissive=permissive)
+                    except Exception as e:
+                        logger.warning(
+                            "[decomposition] Other re-resolve failed: %s", e)
+                        res = {}
+                    if res.get("match"):
+                        chosen = res["match"]
+                    elif res.get("candidates"):
+                        # Still ambiguous — re-prompt this group with the NEW
+                        # candidates for the term the user typed.
+                        remaining.append({"name": other,
+                                          "candidates": list(res["candidates"]),
+                                          "lane": g.get("lane")})
+                        continue
+                    else:
+                        # Not found — keep the original group so the panel can
+                        # re-ask (the user can pick a listed candidate instead).
+                        remaining.append(g)
+                        continue
+            if chosen:
+                self._patch_resolved_name(params, g["name"], chosen)
+                logger.info("[decomposition] panel resolved %r -> %r",
+                            g["name"], chosen)
+            else:
+                remaining.append(g)                   # no answer given → keep
+        if remaining:
+            slot["groups"] = remaining
+            slot["name"] = remaining[0]["name"]
+            slot["candidates"] = list(remaining[0]["candidates"])
+            logger.info("[decomposition] panel re-prompt: %d group(s) left",
+                        len(remaining))
+            return {
+                "answer": "", "route": "analytical", "flagged_claims": [],
+                "error": None, "disambiguation": self._disambiguation_payload(),
+            }
+        # All resolved → resume the whole turn with exact names bound in.
+        question = slot["question"]
+        self._pending_decomposition = None
+        logger.info("[decomposition] panel complete — resuming whole turn")
+        return await self._resume_decomposition(question, params)
+
+    def cancel_disambiguation(self) -> bool:
+        """Panel Cancel: drop the pending slot and the /log carry. Returns True
+        if a slot was actually cleared (caller tailors the chat notice)."""
+        had = self._pending_decomposition is not None
+        self._pending_decomposition = None
+        self._pending_log_carry = False
+        return had
 
     async def _route_with_checkpoint(self, question: str,
                                      log_carry: bool = False,
@@ -1541,6 +1698,51 @@ class Coordinator:
         """
         params = state["params"]
         reqs = params.get("requests") or []
+
+        # ── Pre-resolution gate (name disambiguation BEFORE any chunk runs).
+        # A write chunk's name ambiguity is otherwise agent-internal and
+        # invisible here, and an analytical chunk arming mid-loop loses the
+        # sibling write. Resolve every name up front: clean names bind into
+        # their chunks in place; any that stay ambiguous arm ONE slot holding
+        # the FULL turn (requests intact) + all groups, and the whole turn is
+        # held until the panel resolves them. Nothing executes, so no write is
+        # staged-then-lost and the /log carry is never reached.
+        # Guard: only arm when no slot is already live (never clobber a slot
+        # mid-resolution). On a RESUME re-entry the slot was cleared by
+        # resolve_disambiguation and the names are now exact, so this pass
+        # re-resolves them cleanly (Tier-1) and finds nothing ambiguous — a
+        # cheap idempotent no-op that falls through to normal dispatch.
+        if self._pending_decomposition is None:
+            groups = self._collect_decomposition_ambiguities(reqs)
+            if groups:
+                self._pending_decomposition = {
+                    "question":   state["question"],
+                    "params":     copy.deepcopy(params),
+                    "groups":     groups,
+                    # Back-compat single-name fields (first group) so the prose
+                    # _consume_pending_decomposition fallback still works for a
+                    # typed reply; the panel/structured path reads `groups`.
+                    "name":       groups[0]["name"],
+                    "candidates": list(groups[0]["candidates"]),
+                    "created":    datetime.now().isoformat(),
+                    "strikes":    0,
+                    "reminded":   False,
+                    "clarified":  False,
+                    "rejected_override": None,
+                }
+                logger.info(
+                    "[decomposition] pre-resolve armed: %d group(s) %r",
+                    len(groups), [g["name"] for g in groups])
+                opts = "\n\n".join(
+                    f"**{g['name']}** — did you mean:\n"
+                    + "\n".join(f"- {c}" for c in g["candidates"][:5])
+                    for g in groups)
+                return {
+                    "answer": ("A couple of exercises need clarifying before "
+                               "I can continue:\n\n" + opts),
+                    "flagged_claims": [], "error": None, "decomposed": True,
+                }
+
         headed_parts: list[tuple[str, str]] = []   # (header, text)
         flagged_all: list = []
         error: str | None = None
@@ -1607,6 +1809,12 @@ class Coordinator:
                 (f"### {h}\n\n{t.strip()}" if h else t.strip())
                 for h, t in headed_parts)
         logger.info("[decomposition] merged %d part(s)", len(headed_parts))
+        # A5 (defense in depth): a decomposed turn's continuation is owned by
+        # the disambiguation slot, never the /log carry. A write chunk that
+        # staged cleanly already leaves the carry down (#13), but a chunk that
+        # stalled for any other reason must NOT arm a cross-turn carry that
+        # would hijack the user's next message — force it down here.
+        self._pending_log_carry = False
         out = {"answer": merged, "flagged_claims": flagged_all,
                "error": error, "decomposed": True}
         if ran_write_chunk:
@@ -1663,6 +1871,11 @@ class Coordinator:
             # Stage-3: True when this answer is a per-chunk MERGE — the
             # server must not let a confirmation panel swallow it.
             "decomposed":     state.get("decomposed", False),
+            # Structured disambiguation: when this turn armed the pending slot
+            # (name ambiguity, single or decomposed), surface the candidate
+            # groups so the server can raise the disambiguation panel instead
+            # of shipping the fallback prose. None on every non-ambiguous turn.
+            "disambiguation": self._disambiguation_payload(),
             # Stage-2 verify Input A: the assembled workout-portion turns of
             # this flow, present only on write-shaped turns (callers fall back
             # to the raw message when absent).
@@ -2112,6 +2325,12 @@ class Coordinator:
                     "params":     copy.deepcopy(params),
                     "name":       d["name"],
                     "candidates": list(d["candidates"]),
+                    # groups: the structured/panel representation. A single
+                    # analytical ambiguity is a 1-entry list, so the same
+                    # panel + resolve_disambiguation path serves it.
+                    "groups":     [{"name": d["name"],
+                                    "candidates": list(d["candidates"]),
+                                    "lane": "analytical"}],
                     "created":    datetime.now().isoformat(),
                     "strikes":    0,
                     "reminded":   False,

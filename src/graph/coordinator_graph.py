@@ -73,6 +73,14 @@ def _route_after_entry(state: CoordinatorState) -> str:
         return END
     params = state.get("params")
     if params is not None:                       # pre-guard or decomposition resume
+        # A disambiguation-resume carries the FULL turn (requests intact). If it
+        # is still a mixed-lane multi-chunk turn, it must re-enter the decomposed
+        # dispatch — dispatching by the flat `route` alone would silently
+        # collapse it to one lane and drop the sibling chunk(s). Same test as
+        # _route_after_classify.
+        reqs = params.get("requests") or []
+        if len(reqs) >= 2 and len({c.get("lane") for c in reqs}) >= 2:
+            return "dispatch_decomposed"
         # Dispatch by the params' own route: classify never runs. The /log and
         # write-intent synthetic dicts all carry "operational" (unchanged
         # behavior); a pre-seeded analytical resume dispatches analytical.
@@ -125,7 +133,10 @@ def _build() -> StateGraph:
     g.add_conditional_edges(
         "entry_boundary", _route_after_entry,
         {END: END, "dispatch_operational": "dispatch_operational",
-         "dispatch_analytical": "dispatch_analytical", "classify": "classify"},
+         "dispatch_analytical": "dispatch_analytical",
+         # A disambiguation-resume carries the full mixed-lane turn and must be
+         # able to re-enter the decomposed dispatch (not collapse to one lane).
+         "dispatch_decomposed": "dispatch_decomposed", "classify": "classify"},
     )
     g.add_conditional_edges(
         "classify", _route_after_classify,

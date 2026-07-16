@@ -96,9 +96,12 @@ def _spy_lanes(coord, monkeypatch):
     return calls
 
 
+# Exact, unambiguous name so the pre-resolution gate passes straight through
+# to per-chunk dispatch (these tests exercise dispatch mechanics, not name
+# disambiguation — that has its own tests in test_decompose_disambig.py).
 MIXED = [
-    _chunk("analytical", "Is my squat progressing?",
-           exercise_names=["squat"]),
+    _chunk("analytical", "Is my Lat Pulldown progressing?",
+           exercise_names=["Lat Pulldown"]),
     _chunk("operational", "Log bench 100 lbs for 5 reps today"),
 ]
 
@@ -114,16 +117,16 @@ def test_mixed_lanes_dispatch_decomposed_in_order(coord, monkeypatch):
 
     assert [c[0] for c in calls] == ["analytical", "operational"]
     # each lane received its OWN self-contained intent_text
-    assert calls[0][1] == "Is my squat progressing?"
+    assert calls[0][1] == "Is my Lat Pulldown progressing?"
     assert calls[1][1] == "Log bench 100 lbs for 5 reps today"
     # the analytical chunk ran with flat-shaped chunk params, requests=None
     chunk_params = calls[0][2]
     assert chunk_params["route"] == "analytical"
     assert chunk_params["requests"] is None
-    assert chunk_params["exercise_names"] == ["squat"]
+    assert chunk_params["exercise_names"] == ["Lat Pulldown"]
     # merged in ask-order under headers
     a = result["answer"]
-    assert "### Is my squat progressing?" in a
+    assert "### Is my Lat Pulldown progressing?" in a
     assert "### Log bench 100 lbs for 5 reps today" in a
     assert a.index("AN(") < a.index("OP(")
     assert result["decomposed"] is True
@@ -239,37 +242,32 @@ def test_chunk_integrity_failure_spares_siblings(coord, monkeypatch):
     assert a.index("B9") < a.index("RC-OK")                # order kept
 
 
-def test_ambiguous_chunk_asks_and_arms_chunk_scoped_slot(coord, monkeypatch):
+def test_ambiguous_name_arms_full_turn_slot_before_any_chunk_runs(coord, monkeypatch):
+    # Pre-resolution: an ambiguous exercise name (real DB: "squat" → 5 variants)
+    # arms ONE full-turn slot and NO chunk executes — the whole turn is held
+    # until the panel resolves the name (so a sibling write is never lost).
     coord._client = _client_returning(_payload([
         _chunk("analytical", "Is my squat progressing?",
                exercise_names=["squat"]),
         _chunk("recall", "What was that figure?"),
     ]))
-
-    # real arm seam: _run_analytical returns early_answer + disambiguation
-    async def an(q, p, resume=None):
-        # simulate what the real _run_analytical does on ambiguity
-        coord._pending_decomposition = {
-            "question": q, "params": p, "name": "squat",
-            "candidates": ["Sumo Squats", "Dumbbell Squats"],
-            "created": "2026-07-12T00:00:00", "strikes": 0,
-            "reminded": False, "clarified": False,
-            "rejected_override": None,
-        }
-        return ("I found multiple exercises matching **squat**. "
-                "Which one did you mean?"), []
-    monkeypatch.setattr(coord, "_run_analytical", an)
-
-    async def rc(q):
-        return "RC-OK"
-    monkeypatch.setattr(coord, "_run_recall", rc)
+    calls = _spy_lanes(coord, monkeypatch)
 
     result = asyncio.run(coord.route("squat progress and that figure"))
-    assert "which one did you mean" in result["answer"].lower()
-    assert "RC-OK" in result["answer"]
-    # slot is CHUNK-scoped: its question is the chunk's intent_text
+
+    # nothing dispatched — the gate short-circuited before the chunk loop
+    assert calls == []
+    # full-turn slot: question is the ORIGINAL message, not a chunk intent,
+    # and params keep the whole requests array (resumable to both chunks)
     slot = coord._pending_decomposition
-    assert slot["question"] == "Is my squat progressing?"
+    assert slot["question"] == "squat progress and that figure"
+    assert len(slot["params"]["requests"]) == 2
+    assert len(slot["groups"]) == 1
+    assert slot["groups"][0]["name"] == "squat"
+    assert "Sumo Squats" in slot["groups"][0]["candidates"]
+    # structured payload surfaced for the server to raise the panel
+    assert result["disambiguation"]["groups"][0]["name"] == "squat"
+    assert "clarifying" in result["answer"].lower()
 
 
 def test_chunk_cap_notice(coord, monkeypatch):

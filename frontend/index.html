@@ -242,6 +242,21 @@
     </div>
   </div>
 
+  <!-- Disambiguation panel (hidden by default) — structured "which exercise did you mean?".
+       Rendered by renderDisambiguation(): one group per ambiguous name, candidate options +
+       an "Other" free-text. Survives reloads (server-memory slot, re-fetched on load);
+       only Continue (Submit) or Cancel (or a server stop) dismisses it. -->
+  <div id="disambig-bar" class="hidden flex-shrink-0 flex flex-col max-h-[70vh] border-t border-sky-800 bg-sky-950/40 px-4 py-3">
+    <div class="max-w-2xl mx-auto w-full flex flex-col min-h-0">
+      <p class="text-sm text-sky-200 mb-3 font-medium flex-shrink-0">A couple of exercises need clarifying</p>
+      <div id="disambig-groups" class="text-sm flex-1 min-h-0 overflow-y-auto pr-1 space-y-4" style="scrollbar-width: thin;"></div>
+      <div class="flex gap-2 flex-shrink-0 pt-3">
+        <button id="disambig-submit" class="px-4 py-1.5 bg-sky-700 hover:bg-sky-600 text-white text-sm rounded-lg">Continue</button>
+        <button id="disambig-cancel" class="px-4 py-1.5 bg-slate-600 hover:bg-slate-500 text-white text-sm rounded-lg">Cancel</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Settings modal (hidden by default) — extensible home for app controls.
        Two panes: a section nav on the left, the active section's controls on the right.
        Add a future control by appending a #settings-nav button + a matching .settings-pane. -->
@@ -647,6 +662,12 @@ async function waitForReady() {
     addWelcomeMessage();
   }
   setBusy(false);
+  // Reload persistence: if a disambiguation slot is still live server-side
+  // (page reload, not a server stop), re-render its panel over the chatbox.
+  try {
+    const pd = await fetch(`${API}/pending-disambiguation`).then(r => r.json());
+    if (pd.groups) renderDisambiguation(pd.groups);
+  } catch { /* no backend / no pending — stay in chat */ }
 }
 
 // ── Send message ──────────────────────────────────────────────────────────────
@@ -680,6 +701,8 @@ async function sendMessage(forcedText) {
       renderConfirmPreview(data.preview);
       document.getElementById('confirm-bar').classList.remove('hidden');
       setBusy(false);
+    } else if (data.type === 'disambiguation_required') {
+      renderDisambiguation(data.groups);   // renderDisambiguation locks input
     } else if (data.type === 'not_ready') {
       addMsg('error', 'Still initializing — please wait a moment.');
       setBusy(false);
@@ -728,6 +751,105 @@ async function sendConfirm(confirmed) {
     removeThinking();
     addMsg('error', 'Could not reach the server.');
   }
+  setBusy(false);
+}
+
+// ── Disambiguation panel ──────────────────────────────────────────────────────
+let disambigGroups = [];   // [{name, candidates}] currently shown
+
+function _disambigRadio(gi, value, label, checked) {
+  const row = document.createElement('label');
+  row.className = 'flex items-center gap-2 cursor-pointer text-gray-200 text-sm';
+  const input = document.createElement('input');
+  input.type = 'radio';
+  input.name = `disambig-${gi}`;
+  input.value = value;
+  input.checked = checked;
+  const span = document.createElement('span');
+  span.textContent = label;
+  row.appendChild(input); row.appendChild(span);
+  return row;
+}
+
+function renderDisambiguation(groups) {
+  disambigGroups = groups || [];
+  const box = document.getElementById('disambig-groups');
+  box.innerHTML = '';
+  disambigGroups.forEach((g, gi) => {
+    const wrap = document.createElement('div');
+    const title = document.createElement('div');
+    title.className = 'text-sky-100 font-medium mb-1.5';
+    title.textContent = `“${g.name}” — which one did you mean?`;
+    wrap.appendChild(title);
+    const opts = document.createElement('div');
+    opts.className = 'space-y-1';
+    (g.candidates || []).forEach((c, ci) =>
+      opts.appendChild(_disambigRadio(gi, c, c, ci === 0)));
+    opts.appendChild(_disambigRadio(gi, '__other__', 'Other…', false));
+    const other = document.createElement('input');
+    other.type = 'text';
+    other.id = `disambig-other-${gi}`;
+    other.placeholder = 'Type a different exercise name';
+    other.className = 'mt-1 ml-6 w-[calc(100%-1.5rem)] bg-slate-800 border border-slate-600 rounded px-2 py-1 text-sm text-white';
+    // Typing in Other selects its radio (so the pick is unambiguous).
+    other.addEventListener('input', () => {
+      const r = document.querySelector(`input[name="disambig-${gi}"][value="__other__"]`);
+      if (r) r.checked = true;
+    });
+    opts.appendChild(other);
+    wrap.appendChild(opts);
+    box.appendChild(wrap);
+  });
+  document.getElementById('confirm-bar').classList.add('hidden');
+  document.getElementById('disambig-bar').classList.remove('hidden');
+  setBusy(true);   // the panel takes over — lock the chat input while it's up
+}
+
+function _collectSelections() {
+  return disambigGroups.map((g, gi) => {
+    const checked = document.querySelector(`input[name="disambig-${gi}"]:checked`);
+    const other = document.getElementById(`disambig-other-${gi}`);
+    return { name: g.name, choice: checked ? checked.value : '',
+             other_text: other ? other.value.trim() : '' };
+  });
+}
+
+async function submitDisambiguation() {
+  const selections = _collectSelections();
+  document.getElementById('disambig-bar').classList.add('hidden');
+  setBusy(true);
+  addThinking();
+  try {
+    const res = await fetch(`${API}/disambiguate`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ selections })
+    });
+    const data = await res.json();
+    removeThinking();
+    if (data.type === 'disambiguation_required') {
+      renderDisambiguation(data.groups);          // re-prompt (Other still ambiguous)
+    } else if (data.type === 'confirmation_required') {
+      renderConfirmPreview(data.preview);
+      document.getElementById('confirm-bar').classList.remove('hidden');
+      setBusy(false);
+    } else if (data.type === 'error') {
+      addMsg('error', esc(data.text || 'Error.')); setBusy(false);
+    } else {
+      addMsg('agent', esc(data.text || '')); setBusy(false);
+    }
+  } catch {
+    removeThinking();
+    addMsg('error', 'Could not reach the server.'); setBusy(false);
+  }
+}
+
+async function cancelDisambiguation() {
+  document.getElementById('disambig-bar').classList.add('hidden');
+  try {
+    const data = await fetch(`${API}/disambiguate/cancel`, {method: 'POST'})
+      .then(r => r.json());
+    addMsg('agent', esc(data.text || 'Okay — set aside.'));
+  } catch { addMsg('error', 'Could not reach the server.'); }
   setBusy(false);
 }
 
@@ -990,6 +1112,10 @@ document.getElementById('send-btn').addEventListener('click', () => sendMessage(
 // ── Confirm buttons ───────────────────────────────────────────────────────────
 document.getElementById('confirm-yes').addEventListener('click', () => sendConfirm(true));
 document.getElementById('confirm-no').addEventListener('click', () => sendConfirm(false));
+
+// ── Disambiguation buttons ────────────────────────────────────────────────────
+document.getElementById('disambig-submit').addEventListener('click', submitDisambiguation);
+document.getElementById('disambig-cancel').addEventListener('click', cancelDisambiguation);
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
 waitForReady();

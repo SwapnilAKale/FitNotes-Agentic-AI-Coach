@@ -442,6 +442,16 @@ class ConfirmRequest(BaseModel):
     confirmed: bool
 
 
+class DisambiguateSelection(BaseModel):
+    name: str                       # the ambiguous term the group asked about
+    choice: str                     # a listed candidate, or "__other__"
+    other_text: str | None = None   # free-text when choice == "__other__"
+
+
+class DisambiguateRequest(BaseModel):
+    selections: list[DisambiguateSelection]
+
+
 class SettingsRequest(BaseModel):
     wal_replay_enabled: bool
 
@@ -537,12 +547,17 @@ async def checkpoint_status():
     })
 
 
-async def _process_turn(message: str) -> JSONResponse:
+async def _process_turn(message: str = "", *,
+                        disambiguate_selections: list | None = None) -> JSONResponse:
     """
-    Shared turn handler for /chat and /resume — same guards, locking, history
-    recording, and response shape. /resume passes a continue-intent message so
-    the Coordinator runs its checkpoint-resume path (or the nothing-to-resume
-    notice) without duplicating that logic here.
+    Shared turn handler for /chat, /resume, and /disambiguate — same guards,
+    locking, history recording, and response shape. /resume passes a
+    continue-intent message so the Coordinator runs its checkpoint-resume path.
+    /disambiguate passes `disambiguate_selections` (the panel's structured
+    answer): the head resolves the pending slot + resumes the whole turn INSTEAD
+    of routing a fresh message, then shares the exact same write-path tail
+    (verify → confirm panel → #12 merged-answer stash) — one seam, never a
+    second divergent copy of the panel logic.
     """
     # A chat turn can reach an execute_* MCP tool and write the DB file that
     # upload+replay is mid-way through replacing. Reject with a clear message
@@ -565,35 +580,62 @@ async def _process_turn(message: str) -> JSONResponse:
             content={"error": "Agent is busy, please wait"},
         )
     async with agent_lock:
-        if DEBUG:
-            print(f"\n[DEBUG] Question: {message}")
-        _state["pending_confirmation"] = False
-        _state["allow_execute"] = False
-        _state["staging_preview"] = ""
-        _state["pending_execute_kind"] = None
-        # A fresh turn always starts clean — an abandoned panel's stashed
-        # answer must never leak into an unrelated later confirm.
-        _state["decomposed_answer"] = ""
-        # Clear-on-entry: wipe any staged batch left by a prior turn (reload, abandoned,
-        # or cancelled) BEFORE this turn stages anything. _staged_writes lives in the MCP
-        # subprocess, so the server clears it deterministically via call_tool. This MUST
-        # complete before coordinator.route runs (it fires once, before any log_workout of
-        # this turn, so the turn's own batch is never wiped). Defensive: a transient MCP
-        # failure must not 500 the turn.
-        try:
-            await session.call_tool("discard_staged_writes", {})
-        except Exception as exc:
-            print(f"[server] discard_staged_writes (turn-start) failed: {exc}", file=sys.stderr)
-        try:
-            result = await coordinator.route(message)
+        if disambiguate_selections is not None:
+            # /disambiguate: resolve the pending slot with the panel's picks and
+            # resume the WHOLE turn (pre-seeded params, exact names bound in).
+            # No turn-start discard/state-reset — the resume stages fresh and
+            # arms the confirm panel via _confirmation_handler, exactly like a
+            # normal write turn; wiping here would destroy that batch.
+            try:
+                result = await coordinator.resolve_disambiguation(
+                    disambiguate_selections)
+            except Exception as exc:
+                return _error_response(exc)
+            if result is None:
+                return JSONResponse(content={
+                    "type": "answer",
+                    "text": "There's nothing to clarify right now."})
+            # Reuse `message` for the tail's history/checkpoint fallbacks.
+            message = result.get("resolved_question") or ""
+        else:
             if DEBUG:
-                print(f"[DEBUG] Result: {json.dumps({k: v for k, v in result.items() if k != 'flagged_claims'}, indent=2)}")
-        except Exception as exc:
-            if DEBUG:
-                import traceback
-                print(f"[DEBUG] Exception in turn:")
-                traceback.print_exc()
-            return _error_response(exc)
+                print(f"\n[DEBUG] Question: {message}")
+            _state["pending_confirmation"] = False
+            _state["allow_execute"] = False
+            _state["staging_preview"] = ""
+            _state["pending_execute_kind"] = None
+            # A fresh turn always starts clean — an abandoned panel's stashed
+            # answer must never leak into an unrelated later confirm.
+            _state["decomposed_answer"] = ""
+            # Clear-on-entry: wipe any staged batch left by a prior turn (reload, abandoned,
+            # or cancelled) BEFORE this turn stages anything. _staged_writes lives in the MCP
+            # subprocess, so the server clears it deterministically via call_tool. This MUST
+            # complete before coordinator.route runs (it fires once, before any log_workout of
+            # this turn, so the turn's own batch is never wiped). Defensive: a transient MCP
+            # failure must not 500 the turn.
+            try:
+                await session.call_tool("discard_staged_writes", {})
+            except Exception as exc:
+                print(f"[server] discard_staged_writes (turn-start) failed: {exc}", file=sys.stderr)
+            try:
+                result = await coordinator.route(message)
+                if DEBUG:
+                    print(f"[DEBUG] Result: {json.dumps({k: v for k, v in result.items() if k != 'flagged_claims'}, indent=2)}")
+            except Exception as exc:
+                if DEBUG:
+                    import traceback
+                    print(f"[DEBUG] Exception in turn:")
+                    traceback.print_exc()
+                return _error_response(exc)
+        # Structured disambiguation: this turn armed the pending slot (an
+        # ambiguous exercise name, single or decomposed). Nothing staged — raise
+        # the panel instead of shipping the fallback prose. Precedes the confirm
+        # panel (which needs a staged batch that doesn't exist here).
+        if result.get("disambiguation"):
+            return JSONResponse(content={
+                "type": "disambiguation_required",
+                "groups": result["disambiguation"]["groups"],
+            })
         # Analytical turns bypass session.answer(), so they are not recorded in
         # session.chat_history automatically.  Mirror the same shape agent.py writes.
         if result.get("route") == "analytical" and session is not None:
@@ -809,6 +851,38 @@ async def resume():
     # The "Resume" button calls this. Reuse the Coordinator's continue-intent
     # path: load the slot → _resume, or the nothing-to-resume notice if empty.
     return await _process_turn("continue")
+
+
+@app.post("/disambiguate")
+async def disambiguate(body: DisambiguateRequest):
+    # The disambiguation panel's Submit. Resolve the pending slot with the
+    # user's structured picks and resume the whole turn — shares _process_turn's
+    # write-path tail, so a resolved write lands on the same confirm panel.
+    return await _process_turn(
+        disambiguate_selections=[s.model_dump() for s in body.selections])
+
+
+@app.post("/disambiguate/cancel")
+async def disambiguate_cancel():
+    # The panel's Cancel: drop the pending slot + the /log carry, return to chat.
+    if coordinator is None:
+        return JSONResponse(status_code=503,
+                            content={"type": "not_ready",
+                                     "text": "Still initializing."})
+    coordinator.cancel_disambiguation()
+    return JSONResponse(content={
+        "type": "answer",
+        "text": "Okay — I've set that aside. What would you like to do?"})
+
+
+@app.get("/pending-disambiguation")
+async def pending_disambiguation():
+    # Reload persistence: the frontend calls this on load to re-render the panel
+    # if a slot is still live (server-memory state survives a page reload; a
+    # server stop wipes it → null → chatbox). Read-only, no lock needed.
+    payload = (coordinator._disambiguation_payload()
+               if coordinator is not None else None)
+    return JSONResponse(content={"groups": payload["groups"] if payload else None})
 
 
 def _with_decomposed_answer(outcome_text: str) -> str:
