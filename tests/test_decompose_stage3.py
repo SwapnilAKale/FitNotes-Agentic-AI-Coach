@@ -192,6 +192,51 @@ def test_write_chunk_rearms_flow_turns_and_fallback(coord, monkeypatch):
     assert result["log_flow_turns"] == ["Log bench 100 lbs for 5 reps today"]
 
 
+def test_nonwrite_merge_excludes_staged_write_part(coord, monkeypatch):
+    # #19: the write chunk's part is staging-time text ("staged, needs
+    # confirmation"). `answer` (full) carries both parts; the separate
+    # `decomposed_nonwrite_answer` — what the panel stash / CLI finalize
+    # prepend to the "✅ logged" line — carries the analytical part ONLY, so a
+    # committed write is never re-described as unsaved.
+    coord._client = _client_returning(_payload(MIXED))
+    staged_text = "I've staged your workout — it isn't saved yet, please confirm."
+
+    async def an(q, p, resume=None):
+        return "Your Lat Pulldown is up 5%.", []
+    monkeypatch.setattr(coord, "_run_analytical", an)
+
+    async def op(q, **kw):
+        return staged_text
+    monkeypatch.setattr(coord, "_run_operational", op)
+
+    result = asyncio.run(coord.route(
+        "is my lat pulldown progressing and log bench 100 lbs for 5 reps"))
+
+    # full answer keeps both (used only on the no-panel path)
+    assert "Your Lat Pulldown is up 5%." in result["answer"]
+    assert staged_text in result["answer"]
+    # write-excluded merge: analytical kept, staging text gone
+    nonwrite = result["decomposed_nonwrite_answer"]
+    assert "Your Lat Pulldown is up 5%." in nonwrite
+    assert staged_text not in nonwrite
+    assert "isn't saved yet" not in nonwrite
+    assert "staged" not in nonwrite.lower()
+
+
+def test_nonwrite_merge_equals_answer_when_no_write_chunk(coord, monkeypatch):
+    # Mirror negative: a decomposed turn with NO write chunk excludes nothing —
+    # the write-excluded merge is identical to the full answer.
+    coord._client = _client_returning(_payload([
+        _chunk("analytical", "Is my squat progressing?"),
+        _chunk("recall", "What was that number?"),
+    ]))
+    _spy_lanes(coord, monkeypatch)
+
+    result = asyncio.run(coord.route("squat and that number"))
+
+    assert result["decomposed_nonwrite_answer"] == result["answer"]
+
+
 def test_write_safety_distrust_override_single_chunk(coord, monkeypatch):
     # Regex fires; classifier claims ONE analytical request → operational-whole.
     single = [_chunk("analytical", "Log-ish looking but classifier disagrees")]

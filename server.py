@@ -814,8 +814,14 @@ async def _process_turn(message: str = "", *,
                 # merged non-write answer is stashed here and delivered in
                 # the CHAT by /confirm, together with the write outcome, so
                 # it survives the panel's dismissal.
+                # #19: stash the WRITE-EXCLUDED merge — the write chunk's
+                # section is staging-time text that /confirm's "✅ logged" line
+                # supersedes; prepending it verbatim would tell the user their
+                # committed write "isn't saved yet". Falls back to "" (never the
+                # full `answer`) so stale staging text can't reach the reply.
                 if result.get("decomposed"):
-                    _state["decomposed_answer"] = result.get("answer") or ""
+                    _state["decomposed_answer"] = (
+                        result.get("decomposed_nonwrite_answer") or "")
                 return JSONResponse(content={
                     "type": "confirmation_required",
                     "preview": preview,

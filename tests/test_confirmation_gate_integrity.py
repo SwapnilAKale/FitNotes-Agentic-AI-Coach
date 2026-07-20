@@ -352,7 +352,15 @@ def test_backed_claim_ships_even_with_loose_phrasing(monkeypatch):
 # in the CHAT together with the write outcome
 # ══════════════════════════════════════════════════════════════════════════════
 
-_MERGED = "### Is my squat progressing?\n\nYour squat is up 5%."
+# A decomposed mixed turn's full answer carries BOTH the analytical part and
+# the write chunk's staging-time text; the write-excluded merge (#19) carries
+# the analytical part only. The panel stash / post-confirm prepend must use the
+# latter so a committed write is never re-described as "not saved yet".
+_ANALYSIS = "### Is my squat progressing?\n\nYour squat is up 5%."
+_STAGING = ("### Log bench 100 lbs for 5 reps\n\n"
+            "⚠️ That isn't saved yet — it's staged and needs your confirmation.")
+_MERGED = f"{_ANALYSIS}\n\n{_STAGING}"      # full answer (used on the no-panel path)
+_NONWRITE = _ANALYSIS                        # write-excluded (stash + prepend)
 
 
 def _decomposed_turn(srv, monkeypatch, *, execute_response=None):
@@ -367,7 +375,8 @@ def _decomposed_turn(srv, monkeypatch, *, execute_response=None):
         srv._state["pending_confirmation"] = True
         srv._state["confirmation_preview"] = "ARGS-BLOB"
         srv._state["pending_execute_kind"] = "workout"
-        return {"answer": _MERGED, "route": "analytical", "decomposed": True,
+        return {"answer": _MERGED, "decomposed_nonwrite_answer": _NONWRITE,
+                "route": "analytical", "decomposed": True,
                 "flagged_claims": [], "error": None, "log_boundary": False,
                 "log_flow_turns": ["Log bench 100 lbs for 5 reps today"]}
 
@@ -402,9 +411,11 @@ def test_decomposed_panel_shows_staging_only_and_stashes_answer(srv, monkeypatch
 
     assert body["type"] == "confirmation_required"
     assert body["preview"] == _PREVIEW                  # staged batch ONLY
-    assert _MERGED not in body["preview"]
+    assert _NONWRITE not in body["preview"]
     assert "text" not in body                           # no dead payload field
-    assert srv._state["decomposed_answer"] == _MERGED   # stashed for /confirm
+    # #19: the stash holds the WRITE-EXCLUDED merge, never the staging text.
+    assert srv._state["decomposed_answer"] == _NONWRITE
+    assert "isn't saved yet" not in srv._state["decomposed_answer"]
 
 
 def test_confirm_delivers_merged_answer_before_write_outcome(srv, monkeypatch):
@@ -413,9 +424,13 @@ def test_confirm_delivers_merged_answer_before_write_outcome(srv, monkeypatch):
     body = _body(asyncio.run(srv.confirm(srv.ConfirmRequest(confirmed=True))))
 
     assert body["type"] == "answer"
-    assert body["text"].startswith(_MERGED)             # analytical half first
+    assert body["text"].startswith(_NONWRITE)           # analytical half first
     assert "✅" in body["text"]
-    assert body["text"].index(_MERGED) < body["text"].index("✅")
+    assert body["text"].index(_NONWRITE) < body["text"].index("✅")
+    # #19 core: the committed write is described ONLY by the ✅ line — the stale
+    # staging text never reaches the post-confirm reply.
+    assert "isn't saved yet" not in body["text"]
+    assert "staged" not in body["text"].lower()
     assert srv._state["decomposed_answer"] == ""        # consumed, never re-shipped
     assert srv.coordinator._pending_log_carry is False  # #13 defensive clear
 
@@ -426,8 +441,9 @@ def test_cancel_delivers_merged_answer_with_cancel_text(srv, monkeypatch):
     body = _body(asyncio.run(srv.confirm(srv.ConfirmRequest(confirmed=False))))
 
     assert body["type"] == "answer"
-    assert body["text"].startswith(_MERGED)
+    assert body["text"].startswith(_NONWRITE)
     assert "AGENT(Cancel that)" in body["text"]
+    assert "isn't saved yet" not in body["text"]        # stale staging text gone
     assert srv._state["decomposed_answer"] == ""
     assert srv.coordinator._pending_log_carry is False  # #13 defensive clear
 
@@ -439,7 +455,7 @@ def test_confirm_execute_failure_still_delivers_merged_answer(srv, monkeypatch):
     body = _body(asyncio.run(srv.confirm(srv.ConfirmRequest(confirmed=True))))
 
     assert body["type"] == "error"
-    assert body["text"].startswith(_MERGED)             # not lost on a failed write
+    assert body["text"].startswith(_NONWRITE)           # not lost on a failed write
     assert "❌" in body["text"]
     assert srv._state["decomposed_answer"] == ""
 

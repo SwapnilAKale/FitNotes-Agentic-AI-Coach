@@ -33,6 +33,10 @@ class CoordinatorState(TypedDict, total=False):
     write_intent_hint: bool  # regex write pre-guard fired; classify ran only
                              # to discover chunks (Stage-3 distrust override)
     decomposed: bool         # answer is a Stage-3 per-chunk merge
+    decomposed_nonwrite_answer: Optional[str]  # the merge with staged-write
+                             # parts excluded (#19); panel stash + CLI finalize
+                             # use it so a committed write isn't re-described
+                             # with its stale staging text
     params: Optional[dict]   # classify output (or deterministic write params)
     route: str               # "analytical" | "operational" | terminal short-circuits
     answer: str

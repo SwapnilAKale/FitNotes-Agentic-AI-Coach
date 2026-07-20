@@ -281,7 +281,16 @@ async def main() -> None:
                     result = await coordinator.route(question)
                     if result.get("route"):
                         print(f"\x1b[2m[route: {result['route']}]\x1b[0m")
-                    print(f"\n{result['answer']}\n")
+                    # #19: a decomposed turn about to finalize a staged workout
+                    # must print the WRITE-EXCLUDED merge — the write chunk's
+                    # part is staging-time text that the "✅ logged" line below
+                    # supersedes. Same seam as the web panel stash. Non-decomposed
+                    # and non-staged turns print result['answer'] as before.
+                    display_answer = result["answer"]
+                    if turn_state["staged_workout"] and result.get("decomposed"):
+                        display_answer = result.get("decomposed_nonwrite_answer") or ""
+                    if display_answer:
+                        print(f"\n{display_answer}\n")
                     # Fix 5: caller-driven commit. Every staged exercise was
                     # already approved through the gate above, so the CLI (never
                     # the agent) runs the stage-2 verify then the atomic

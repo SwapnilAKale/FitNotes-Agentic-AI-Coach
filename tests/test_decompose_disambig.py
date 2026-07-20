@@ -240,14 +240,17 @@ _PREVIEW = "Flat Dumbbell Bench Press — 2026-07-16\n  100 lbs × 5 reps"
 
 def test_disambiguate_endpoint_resolves_write_to_confirmation(srv, monkeypatch):
     """/disambiguate shares _process_turn's tail: a resolved write chunk lands
-    on the confirm panel, with the merged answer stashed (#12)."""
-    merged = "### Is my squat progressing?\n\nUp 4%."
+    on the confirm panel, with the write-EXCLUDED merge stashed (#12/#19) — the
+    staging text never rides into the post-confirm reply."""
+    nonwrite = "### Is my squat progressing?\n\nUp 4%."
+    merged = nonwrite + "\n\n### Log bench\n\n⚠️ That isn't saved yet, please confirm."
 
     async def resolve_disambiguation(selections):
         srv._state["pending_confirmation"] = True
         srv._state["confirmation_preview"] = "ARGS"
         srv._state["pending_execute_kind"] = "workout"
-        return {"answer": merged, "route": "analytical", "decomposed": True,
+        return {"answer": merged, "decomposed_nonwrite_answer": nonwrite,
+                "route": "analytical", "decomposed": True,
                 "flagged_claims": [], "error": None,
                 "log_flow_turns": ["Log Flat Dumbbell Bench Press 100 lbs x5"],
                 "resolved_question": "compound"}
@@ -276,7 +279,9 @@ def test_disambiguate_endpoint_resolves_write_to_confirmation(srv, monkeypatch):
 
     assert body["type"] == "confirmation_required"
     assert body["preview"] == _PREVIEW
-    assert srv._state["decomposed_answer"] == merged      # #12 stash for /confirm
+    # #19: the stash holds the write-excluded merge, not the staging text.
+    assert srv._state["decomposed_answer"] == nonwrite
+    assert "isn't saved yet" not in srv._state["decomposed_answer"]
 
 
 def test_disambiguate_endpoint_reprompts_when_unresolved(srv, monkeypatch):

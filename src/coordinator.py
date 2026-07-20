@@ -1744,6 +1744,13 @@ class Coordinator:
                 }
 
         headed_parts: list[tuple[str, str]] = []   # (header, text)
+        # Parallel to headed_parts: True marks a STAGED-WRITE part, whose text
+        # is staging-time ("staged, needs confirmation" / MSG_STAGED_NOT_SAVED).
+        # After /confirm that text is stale — the "✅ logged" line supersedes it
+        # — so it is excluded from the write-excluded merge the panel stash and
+        # the CLI finalize path use (#19). Membership is the code path that ran
+        # the chunk, never a regex on the prose.
+        write_flags: list[bool] = []
         flagged_all: list = []
         error: str | None = None
         ran_write_chunk = False
@@ -1756,7 +1763,9 @@ class Coordinator:
                         chunk.get("index", 0) + 1, len(reqs), lane)
             if lane == "out_of_scope":
                 headed_parts.append((head, OUT_OF_SCOPE_REFUSAL))
+                write_flags.append(False)
                 continue
+            part_is_write = False
             try:
                 if lane == "analytical":
                     chunk_params = {**chunk, "route": "analytical",
@@ -1768,15 +1777,16 @@ class Coordinator:
                     answer = await self._call_with_per_minute_retry(
                         self._run_recall, intent)
                 else:                              # operational
-                    is_write = _is_write_intent(intent)
-                    if is_write:
+                    part_is_write = _is_write_intent(intent)
+                    if part_is_write:
                         # Verify Input A = this chunk only, never the whole
                         # multi-part message.
                         self._log_flow_turns = [intent]
                         ran_write_chunk = True
                     answer = await self._run_operational(
-                        intent, fallback_write=is_write)
+                        intent, fallback_write=part_is_write)
                 headed_parts.append((head, answer))
+                write_flags.append(part_is_write)
             except DataAgentIntegrityError as e:
                 ids_str = ", ".join(v.invariant_id for v in e.violations)
                 logger.error(
@@ -1785,6 +1795,7 @@ class Coordinator:
                 headed_parts.append((head, (
                     f"I cannot answer this part right now — a data "
                     f"integrity check failed ({ids_str}).")))
+                write_flags.append(False)          # a failed part staged nothing
             except Exception as e:
                 if _is_rate_limit(e):
                     raise                          # 429 → countdown, whole turn
@@ -1796,18 +1807,29 @@ class Coordinator:
                     logger.exception("[decomposition] chunk failed: %s", e)
                     error = error or str(e)
                     headed_parts.append((head, _MSG_PIPELINE_ERROR))
+                write_flags.append(False)          # a failed part staged nothing
 
         if len(reqs) > _DECOMP_CHUNK_CAP:
             headed_parts.append(("", (
                 f"(I've answered the first {_DECOMP_CHUNK_CAP} parts — "
                 f"ask the remaining {len(reqs) - _DECOMP_CHUNK_CAP} again.)")))
+            write_flags.append(False)
 
-        if len(headed_parts) == 1:
-            merged = headed_parts[0][1]
-        else:
-            merged = "\n\n".join(
+        def _merge(parts: list[tuple[str, str]]) -> str:
+            # Single-part turns drop the header (existing convention); multi-part
+            # turns carry "### <header>" per part.
+            if len(parts) == 1:
+                return parts[0][1]
+            return "\n\n".join(
                 (f"### {h}\n\n{t.strip()}" if h else t.strip())
-                for h, t in headed_parts)
+                for h, t in parts)
+
+        merged = _merge(headed_parts)
+        # Write-excluded merge (#19): the analytical/recall/refusal parts only.
+        # Used by the confirm-panel stash and the CLI staged-finalize path so a
+        # committed write is never re-described with its stale staging text.
+        nonwrite_parts = [p for p, w in zip(headed_parts, write_flags) if not w]
+        merged_nonwrite = _merge(nonwrite_parts) if nonwrite_parts else ""
         logger.info("[decomposition] merged %d part(s)", len(headed_parts))
         # A5 (defense in depth): a decomposed turn's continuation is owned by
         # the disambiguation slot, never the /log carry. A write chunk that
@@ -1816,7 +1838,8 @@ class Coordinator:
         # would hijack the user's next message — force it down here.
         self._pending_log_carry = False
         out = {"answer": merged, "flagged_claims": flagged_all,
-               "error": error, "decomposed": True}
+               "error": error, "decomposed": True,
+               "decomposed_nonwrite_answer": merged_nonwrite}
         if ran_write_chunk:
             # The envelope's log_flow_turns gate reads fallback_write — a
             # write chunk found by the CLASSIFIER (regex missed the compound
@@ -1871,6 +1894,11 @@ class Coordinator:
             # Stage-3: True when this answer is a per-chunk MERGE — the
             # server must not let a confirmation panel swallow it.
             "decomposed":     state.get("decomposed", False),
+            # #19: the same merge with staged-write parts excluded. The panel
+            # stash and CLI finalize prepend THIS (not `answer`) to the write
+            # outcome so a committed write is never re-described as "staged".
+            "decomposed_nonwrite_answer":
+                state.get("decomposed_nonwrite_answer"),
             # Structured disambiguation: when this turn armed the pending slot
             # (name ambiguity, single or decomposed), surface the candidate
             # groups so the server can raise the disambiguation panel instead
