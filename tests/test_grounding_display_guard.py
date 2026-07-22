@@ -56,6 +56,18 @@ def sumo_ex(sumo_pkg):
     return next(e for e in sumo_pkg["exercises"] if e["name"] == "Sumo Squats")
 
 
+@pytest.fixture(scope="module")
+def broad_session_pkg():
+    # Session-level package across ALL exercises. The no-warmup edge is tested
+    # here rather than against Sumo Squats alone: Sumo opens every session with a
+    # 0-lb warmup set, so as the rolling window advanced it lost all no-warmup
+    # sessions and the old single-exercise precondition went empty (a false red).
+    # Across 45 exercises the window reliably holds hundreds of no-warmup
+    # sessions. 90d keeps session-level aggregation (365d+ rolls up to monthly and
+    # exposes no per-session detail).
+    return prepare_analysis_package(query_period_days=90, include_phase2=True)
+
+
 def test_total_sets_count_present_and_survives_trim(sumo_ex):
     # Every session carries the scalar; the trim removed the raw `sets` array.
     for s in sumo_ex["sessions"]:
@@ -70,11 +82,22 @@ def test_warmup_session_total_exceeds_working(sumo_ex):
     assert s["total_sets_count"] == 4
 
 
-def test_no_warmup_session_counts_equal(sumo_ex):
+def test_no_warmup_session_counts_equal(broad_session_pkg):
     # Edge in the other direction: a session with no warmup detected has
-    # total == working.
-    no_warm = [s for s in sumo_ex["sessions"] if s.get("warmup_weight") is None]
-    assert no_warm, "expected at least one no-warmup session in the period"
+    # total == working. Scanned across ALL exercises so the edge is reliably
+    # present regardless of any single exercise's warmup pattern (see the
+    # broad_session_pkg fixture note — Sumo-only went empty as the window moved).
+    # A broad package trims older sessions to a lighter shape that drops the
+    # count scalars (only the narrow sumo package keeps them on every session —
+    # see test_total_sets_count_present_and_survives_trim); scope the invariant
+    # to the no-warmup sessions that still expose the scalar.
+    no_warm = [
+        s
+        for ex in broad_session_pkg["exercises"]
+        for s in ex["sessions"]
+        if s.get("warmup_weight") is None and "total_sets_count" in s
+    ]
+    assert no_warm, "expected at least one no-warmup session carrying the count scalar"
     for s in no_warm:
         assert s["total_sets_count"] == s["working_sets_count"]
 
