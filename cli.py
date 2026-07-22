@@ -10,6 +10,9 @@ load_dotenv()
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from src.stdio_utf8 import force_utf8_stdio
+force_utf8_stdio()
+
 from src.agent import AgentSession
 from src.coordinator import Coordinator, MSG_VERIFY_RESTATE, format_verify_fail_message
 
