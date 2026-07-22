@@ -163,6 +163,18 @@ def _is_write_intent(message: str) -> bool:
     return bool(_WRITE_IMPERATIVE_RE.search(message))
 
 
+# Strips a single leading markdown header line ("### …") from a chunk answer.
+# In a multi-part decomposed merge the merge itself is the sole header authority
+# (it prepends a canonical "### <intent>" per part); when the model also opens
+# its answer with its own "### …" the two stack into a duplicate header. Remove
+# exactly the first header line so the merge's canonical header stands alone.
+_LEADING_MD_HEADER_RE = re.compile(r"^\s*#{1,6}[ \t]+[^\n]*(?:\r?\n)+")
+
+
+def _strip_leading_md_header(text: str) -> str:
+    return _LEADING_MD_HEADER_RE.sub("", text, count=1) if text else text
+
+
 # ── /log deterministic write boundary ─────────────────────────────────────────
 # A user-typed "/log" prefix is a TRUSTED write boundary: no inference, no
 # regex guessing. The write-intent regex above stays as the graceful-degradation
@@ -1768,8 +1780,14 @@ class Coordinator:
             part_is_write = False
             try:
                 if lane == "analytical":
+                    # A decomposed chunk is self-contained (intent_text is a full
+                    # restatement), so it must NOT inherit shared conversation
+                    # history — prior turns naming a different exercise made the
+                    # draft volunteer an unsolicited "I lack that data" disclaimer
+                    # about a sibling chunk's subject (#27). recall is exempt (it
+                    # answers FROM history) — only analytical suppresses it.
                     chunk_params = {**chunk, "route": "analytical",
-                                    "requests": None}
+                                    "requests": None, "suppress_history": True}
                     answer, flagged = await self._run_analytical(
                         intent, chunk_params)
                     flagged_all.extend(flagged or [])
@@ -1820,8 +1838,11 @@ class Coordinator:
             # turns carry "### <header>" per part.
             if len(parts) == 1:
                 return parts[0][1]
+            # Multi-part: the merge owns the "### <intent>" header, so drop any
+            # header the model opened its own answer with (else it doubles).
             return "\n\n".join(
-                (f"### {h}\n\n{t.strip()}" if h else t.strip())
+                (f"### {h}\n\n{_strip_leading_md_header(t).strip()}"
+                 if h else t.strip())
                 for h, t in parts)
 
         merged = _merge(headed_parts)
@@ -2497,7 +2518,13 @@ class Coordinator:
             if exercise_names else None
         ) or None
 
-        conversation_context = self._history[-CONTEXT_WINDOW:] or None
+        # Decomposed analytical chunks opt out of shared conversation history
+        # (#27): their intent_text is self-contained, and inherited history let
+        # the draft editorialize about a sibling chunk's exercise.
+        conversation_context = (
+            None if params.get("suppress_history")
+            else (self._history[-CONTEXT_WINDOW:] or None)
+        )
 
         # Prepend package scope note so the Analysis Agent knows
         # it is working with a filtered subset, not the full database.

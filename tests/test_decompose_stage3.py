@@ -325,3 +325,60 @@ def test_chunk_cap_notice(coord, monkeypatch):
 
     assert len(calls) == _DECOMP_CHUNK_CAP                 # 5th never ran
     assert f"first {_DECOMP_CHUNK_CAP} parts" in result["answer"]
+
+
+# ═══ Duplicate-header strip + #27 history suppression ════════════════════════
+
+def test_merge_strips_duplicate_model_header(coord, monkeypatch):
+    # The analysis agent sometimes opens its answer with its OWN "### <question>"
+    # header; the multi-part merge adds a canonical one too, so the two stacked
+    # into a duplicate. The model's leading header must be stripped — exactly one
+    # survives — while a header-less sibling part still gets its single header.
+    coord._client = _client_returning(_payload(MIXED))
+
+    async def an(q, p, resume=None):
+        return f"### {q}\n\nProgressing well.", []      # model emits its own header
+    monkeypatch.setattr(coord, "_run_analytical", an)
+
+    async def op(q, **kw):
+        return "Staged."                                # no leading header
+    monkeypatch.setattr(coord, "_run_operational", op)
+
+    a = asyncio.run(coord.route("is my lat pulldown progressing and log bench"))["answer"]
+
+    assert a.count("### Is my Lat Pulldown progressing?") == 1     # deduped
+    assert "Progressing well." in a
+    # negative direction: over-stripping must not eat a header-less part's header
+    assert a.count("### Log bench 100 lbs for 5 reps today") == 1
+
+
+def test_decomposed_analytical_chunk_suppresses_history(coord, monkeypatch):
+    # #27: a self-contained decomposed analytical chunk must opt out of shared
+    # conversation history so the draft can't editorialize about a sibling
+    # chunk's exercise. Only the analytical lane sets the flag.
+    coord._client = _client_returning(_payload(MIXED))
+    calls = _spy_lanes(coord, monkeypatch)
+
+    asyncio.run(coord.route("is my lat pulldown progressing and log bench"))
+
+    analytical_params = calls[0][2]
+    assert analytical_params["suppress_history"] is True
+    # the operational lane never carries it (recall answers FROM history and is
+    # exempt by construction — only the analytical branch sets the flag)
+    op_kwargs = calls[1][2]
+    assert "suppress_history" not in op_kwargs
+
+
+def test_strip_leading_md_header():
+    from src.coordinator import _strip_leading_md_header
+    assert _strip_leading_md_header("### Title\n\nBody") == "Body"
+    assert _strip_leading_md_header("## H2\nBody") == "Body"
+    assert _strip_leading_md_header("###### H6\nBody") == "Body"
+    # header-less text is untouched
+    assert _strip_leading_md_header("Body only") == "Body only"
+    # a '#' that isn't a leading header line is NOT stripped
+    assert _strip_leading_md_header("Text with # hash\nmore") == "Text with # hash\nmore"
+    # '###' with no following space is not a markdown header
+    assert _strip_leading_md_header("###NoSpace\nBody") == "###NoSpace\nBody"
+    # only the FIRST header line is removed
+    assert _strip_leading_md_header("### One\n### Two\nBody") == "### Two\nBody"

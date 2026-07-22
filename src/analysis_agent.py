@@ -577,7 +577,13 @@ def _fmt_memories(memories: Optional[list]) -> str:
 def _fmt_conversation(conversation_context: Optional[list]) -> str:
     if not conversation_context:
         return "[CONVERSATION CONTEXT]\nFirst message in session.\n"
-    lines = ["[CONVERSATION CONTEXT]"]
+    lines = [
+        "[CONVERSATION CONTEXT] — background continuity ONLY. Answer strictly the "
+        "current [QUESTION] using the [WORKOUT PACKAGE]. Do NOT comment on, "
+        "analyze, or note missing/absent data for any exercise that appears only "
+        "here and not in the current QUESTION; a prior logging action is not a "
+        "request to analyze that exercise.",
+    ]
     for turn in conversation_context:
         lines.append(f"{turn.get('role','?').upper()}: {turn.get('content','')}")
     return "\n".join(lines)
