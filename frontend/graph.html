@@ -1,0 +1,1168 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Muscle Ontology — Plate I</title>
+<style>
+  :root{
+    --carmine:#B33A4E; --brass:#B0803C; --verdigris:#3E7C74;
+    --limit:#5C7E9E;
+    --ground:#EEEBE1; --panel:#E4E0D4; --panel-2:#DAD5C7;
+    --line:#C2BCAA; --line-soft:#D3CEBE;
+    --fg:#1E252C; --fg-2:#4B5762; --fg-3:#78838D;
+    --accent:var(--carmine); --assist:var(--brass); --hold:var(--limit);
+    --scene:#EEEBE1; --node:#4B5762; --anat:#B6AF9C; --body:#9AA3AA;
+    --shadow:0 1px 2px rgba(20,26,33,.10),0 8px 24px -12px rgba(20,26,33,.28);
+    --r:3px;
+  }
+  :root[data-theme="dark"]{
+    --limit:#6E8AA6;
+    --ground:#101519; --panel:#171E24; --panel-2:#1F272E;
+    --line:#2C363F; --line-soft:#222B33;
+    --fg:#E6E3DA; --fg-2:#A3AEB8; --fg-3:#6F7C87;
+    --accent:#D2596D; --assist:#C99A4A; --hold:#7E9CBA;
+    --scene:#0C1114; --node:#8A97A2; --anat:#39454F; --body:#5A6873;
+    --shadow:0 1px 2px rgba(0,0,0,.5),0 10px 30px -12px rgba(0,0,0,.7);
+  }
+
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{
+    background:var(--ground); color:var(--fg); overflow:hidden;
+    font:15px/1.55 ui-sans-serif,"Segoe UI",system-ui,-apple-system,Roboto,sans-serif;
+    -webkit-font-smoothing:antialiased; display:flex; flex-direction:column;
+  }
+  .serif{font-family:Georgia,"Iowan Old Style","Times New Roman",serif}
+  .mono{font-family:ui-monospace,"Cascadia Mono",Consolas,"DejaVu Sans Mono",monospace;
+        font-variant-numeric:tabular-nums}
+  .eyebrow{font-size:10px;letter-spacing:.16em;text-transform:uppercase;
+           color:var(--fg-3);font-weight:600}
+
+  header{
+    flex:0 0 auto; display:flex; align-items:center; gap:14px; flex-wrap:wrap;
+    padding:11px 16px; border-bottom:1px solid var(--line); background:var(--panel);
+  }
+  header h1{margin:0;font-family:Georgia,serif;font-weight:400;font-size:19px;
+            letter-spacing:-.015em;white-space:nowrap}
+  header h1 em{font-style:italic;color:var(--accent)}
+  a.back{color:var(--fg-3);text-decoration:none;font-size:12.5px;white-space:nowrap}
+  a.back:hover{color:var(--fg)}
+  .spacer{flex:1 1 auto}
+  .stat{display:flex;gap:5px;align-items:baseline}
+  .stat b{font-family:ui-monospace,Consolas,monospace;font-variant-numeric:tabular-nums;
+          font-size:13.5px;font-weight:600}
+  .stat span{font-size:9.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--fg-3)}
+  .stat-row{display:flex;gap:13px;align-items:baseline;flex-wrap:wrap}
+
+  .modes{display:flex;border:1px solid var(--line);border-radius:var(--r);overflow:hidden}
+  .modes button{appearance:none;border:0;background:transparent;color:var(--fg-2);font:inherit;
+    font-size:12px;letter-spacing:.06em;text-transform:uppercase;padding:6px 13px;cursor:pointer}
+  .modes button+button{border-left:1px solid var(--line)}
+  .modes button[aria-pressed="true"]{background:var(--accent);color:#fff}
+  .iconbtn{appearance:none;font:inherit;font-size:12px;color:var(--fg-2);cursor:pointer;
+    border:1px solid var(--line);border-radius:var(--r);padding:6px 10px;background:transparent;
+    white-space:nowrap}
+  .iconbtn:hover{border-color:var(--fg-3);color:var(--fg)}
+  .iconbtn[aria-pressed="true"]{background:var(--fg);color:var(--ground);border-color:var(--fg)}
+  .seg{display:inline-flex;border:1px solid var(--line);border-radius:var(--r);overflow:hidden}
+  .seg button{appearance:none;border:0;background:transparent;color:var(--fg-2);font:inherit;
+    font-size:11.5px;padding:6px 11px;cursor:pointer;white-space:nowrap}
+  .seg button+button{border-left:1px solid var(--line)}
+  .seg button[aria-pressed="true"]{background:var(--accent);color:#fff}
+  button:focus-visible,a:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+
+  main{flex:1 1 auto;display:flex;min-height:0;min-width:0;position:relative}
+  #stage{flex:1 1 auto;position:relative;min-width:0;overflow:hidden;background:var(--scene)}
+  /* The canvas must be laid out by CSS; its width/height ATTRIBUTES are the
+     backing-store size (CSS px × devicePixelRatio) and must never drive layout. */
+  #stage canvas{display:block;width:100%;height:100%}
+  #labels{position:absolute;inset:0;pointer-events:none;overflow:hidden}
+  .lbl{position:absolute;transform:translate(-50%,-100%);white-space:nowrap;
+    font-family:Georgia,serif;font-size:12.5px;color:var(--fg);
+    text-shadow:0 0 4px var(--scene),0 0 4px var(--scene),0 0 9px var(--scene);
+    transition:opacity .15s ease}
+  .lbl.ex{font-family:ui-sans-serif,"Segoe UI",sans-serif;font-size:11px;color:var(--fg-2)}
+  .lbl.region{font-size:14px;letter-spacing:.01em}
+
+  .overlay{position:absolute}
+  .legend{left:14px;bottom:14px;display:flex;flex-direction:column;gap:6px;pointer-events:none;
+    background:color-mix(in srgb,var(--panel) 88%,transparent);
+    border:1px solid var(--line);border-radius:var(--r);padding:10px 12px;backdrop-filter:blur(6px)}
+  .legend .row{display:flex;align-items:center;gap:8px;font-size:11.5px;color:var(--fg-2)}
+  .swatch{width:18px;border-top:2px solid;flex:0 0 auto}
+  .dot{width:9px;height:9px;border-radius:50%;flex:0 0 auto}
+  .hint{right:14px;bottom:14px;font-size:11px;color:var(--fg-3);text-align:right;
+        pointer-events:none;line-height:1.7}
+  .hint kbd{margin:0 1px}
+  .toolbar{left:14px;top:14px;display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+
+  #tip{position:absolute;z-index:5;pointer-events:none;opacity:0;
+    transform:translate(-50%,-100%) translateY(-14px);
+    background:var(--panel);border:1px solid var(--line);border-radius:var(--r);
+    padding:7px 10px;box-shadow:var(--shadow);max-width:240px;transition:opacity .12s ease}
+  #tip.on{opacity:1}
+  #tip .t{font-family:Georgia,serif;font-size:14px;line-height:1.3}
+  #tip .s{font-size:11px;color:var(--fg-3);margin-top:2px}
+
+  aside{flex:0 0 348px;border-left:1px solid var(--line);background:var(--panel);
+        display:flex;flex-direction:column;min-height:0}
+  body[data-rail="off"] aside{display:none}
+  .rail-scroll{overflow-y:auto;overscroll-behavior:contain;padding:16px 18px 22px;flex:1 1 auto}
+  .rail-empty{color:var(--fg-3);font-size:13.5px;line-height:1.65}
+  .rail-empty p{margin:0 0 11px}
+  h2.rail-title{margin:2px 0 3px;font-family:Georgia,serif;font-weight:400;font-size:21px;
+                line-height:1.2;text-wrap:balance}
+  .path{font-size:11.5px;color:var(--fg-3);margin-bottom:13px}
+  .path b{color:var(--fg-2);font-weight:500}
+  .kv{display:grid;grid-template-columns:auto 1fr;gap:5px 14px;margin:0 0 14px;font-size:12.5px}
+  .kv dt{color:var(--fg-3);font-size:10px;letter-spacing:.13em;text-transform:uppercase;
+         align-self:center}
+  .kv dd{margin:0}
+  .sec{margin-top:16px}
+  .sec>.eyebrow{display:block;margin-bottom:7px;padding-bottom:5px;
+                border-bottom:1px solid var(--line-soft)}
+  .note{font-size:11.5px;color:var(--fg-3);margin:-2px 0 8px;line-height:1.5}
+  ul.list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:1px}
+  ul.list li{display:flex;align-items:center;gap:9px;padding:6px 8px;margin:0 -8px;
+             border-radius:var(--r);font-size:13px}
+  ul.list li.go{cursor:pointer}
+  ul.list li.go:hover{background:var(--panel-2)}
+  ul.list li .nm{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;
+                 white-space:nowrap}
+  ul.list li .ct{font-family:ui-monospace,Consolas,monospace;font-variant-numeric:tabular-nums;
+                 font-size:11.5px;color:var(--fg-3)}
+  li.cut .nm{text-decoration:line-through;color:var(--fg-3)}
+  .via{font-size:10px;color:var(--fg-3);letter-spacing:.04em}
+  .role{flex:0 0 auto;width:6px;height:6px;border-radius:50%}
+  .role.primary{background:var(--accent)} .role.secondary{background:var(--assist)}
+  .role.limiting{background:var(--hold)}
+  .chip{display:inline-flex;align-items:center;font-size:9.5px;font-weight:700;
+        letter-spacing:.1em;text-transform:uppercase;padding:2px 6px;border-radius:2px;
+        border:1px solid currentColor}
+  .chip.primary{color:var(--accent)} .chip.secondary{color:var(--assist)}
+  .chip.limiting{color:var(--hold)}
+  .chip.cut{color:var(--fg-3)}
+  .src{font-size:11.5px;line-height:1.5;color:var(--fg-2);border-left:2px solid var(--line);
+       padding:1px 0 1px 10px;margin:2px 0 8px}
+  .mini{appearance:none;border:0;background:transparent;font:inherit;font-size:11px;
+        color:var(--fg-3);text-decoration:underline;cursor:pointer;padding:0}
+  .mini:hover{color:var(--fg)}
+  .filters{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px}
+  .filters button{appearance:none;font:inherit;font-size:11.5px;padding:4px 10px;cursor:pointer;
+    border:1px solid var(--line);background:transparent;color:var(--fg-2);border-radius:var(--r)}
+  .filters button[aria-pressed="true"]{background:var(--fg);color:var(--ground);border-color:var(--fg)}
+
+  .console{flex:0 0 auto;border-top:1px solid var(--line);background:var(--panel);
+           padding:13px 18px 15px;display:none}
+  body[data-mode="audit"] .console{display:block}
+  .console-head{display:flex;align-items:center;gap:11px;flex-wrap:wrap;margin-bottom:8px}
+  .progress{flex:1 1 110px;height:3px;background:var(--line-soft);border-radius:2px;
+            overflow:hidden;min-width:80px}
+  .progress i{display:block;height:100%;background:var(--verdigris);width:0;transition:width .25s}
+  .verdict{font-family:Georgia,serif;font-size:17px;line-height:1.35;margin:0 0 5px;
+           text-wrap:balance}
+  .verdict .m{color:var(--accent)}
+  .criterion{font-size:12.5px;color:var(--fg-2);margin:0 0 11px}
+  .actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  button.act{appearance:none;font:inherit;font-size:13px;padding:7px 15px;cursor:pointer;
+    border-radius:var(--r);border:1px solid var(--line);background:var(--panel-2);color:var(--fg)}
+  button.act:hover{border-color:var(--fg-3)}
+  button.act.keep{border-color:var(--verdigris);color:var(--verdigris)}
+  button.act.cut{border-color:var(--accent);color:var(--accent)}
+  button.act.hold{border-color:var(--hold);color:var(--hold)}
+  button.act.hold.on{background:var(--hold);color:#fff;border-color:var(--hold)}
+  button.act.ghost{background:transparent;color:var(--fg-3)}
+  button.act[disabled]{opacity:.35;cursor:default}
+  button.act.keep.on{background:var(--verdigris);color:#fff;border-color:var(--verdigris)}
+  button.act.cut.on{background:var(--accent);color:#fff;border-color:var(--accent)}
+  kbd{font-family:ui-monospace,Consolas,monospace;font-size:11px;border:1px solid var(--line);
+      border-bottom-width:2px;border-radius:3px;padding:0 4px;color:var(--fg-3)}
+  .saved{font-size:11.5px;color:var(--verdigris);opacity:0;transition:opacity .3s}
+  .saved.on{opacity:1}
+  textarea{width:100%;min-height:110px;font-family:ui-monospace,Consolas,monospace;font-size:12px;
+    background:var(--ground);color:var(--fg);border:1px solid var(--line);
+    border-radius:var(--r);padding:9px 10px;resize:vertical}
+  .loading{position:absolute;inset:0;display:grid;place-items:center;color:var(--fg-3);
+           font-family:Georgia,serif;font-size:15px}
+
+  @media (max-width:900px){
+    main{flex-direction:column}
+    aside{flex:0 0 46%;border-left:0;border-top:1px solid var(--line)}
+    .legend{display:none}
+  }
+  @media (prefers-reduced-motion:reduce){*{transition-duration:.01ms !important}}
+</style>
+<script type="importmap">
+{"imports":{"three":"/vendor/three.module.js"}}
+</script>
+</head>
+<body data-mode="explore" data-rail="on">
+
+<header>
+  <h1 class="serif">Muscle Ontology <em>— Plate I</em></h1>
+  <a class="back" href="/">← back to coach</a>
+  <div class="modes" role="group" aria-label="Mode">
+    <button id="mExplore" aria-pressed="true">Explore</button>
+    <button id="mAudit" aria-pressed="false">Audit</button>
+  </div>
+  <div class="spacer"></div>
+  <div class="stat-row">
+    <div class="stat"><b id="sMus">—</b><span>muscles</span></div>
+    <div class="stat"><b id="sEx">—</b><span>exercises</span></div>
+    <div class="stat"><b id="sLink">—</b><span>edges</span></div>
+    <div class="stat"><b id="sCut">0</b><span>cut</span></div>
+  </div>
+  <button class="iconbtn" id="rail-toggle" title="Expand the graph to full width">⇔ Wide</button>
+  <button class="iconbtn" id="theme" title="Light / dark">◐</button>
+</header>
+
+<main>
+  <div id="stage">
+    <div id="labels"></div>
+    <div id="tip"></div>
+    <div class="loading" id="loading">reading the plate…</div>
+    <div class="overlay toolbar">
+      <button class="iconbtn" id="btnReset" title="Clear selection and refit (Esc)">Reset view</button>
+      <button class="iconbtn" id="btnAll" aria-pressed="false"
+              title="Draw every exercise and edge at once">Show all exercises</button>
+      <span class="seg" role="group" aria-label="Selection depth">
+        <button data-level="1" title="Click selects the whole region">Region</button>
+        <button data-level="2" title="Click selects the named muscle">Muscle</button>
+        <button data-level="3" title="Click selects the individual head">Head</button>
+      </span>
+      <button class="iconbtn" id="btnBody" aria-pressed="true" title="Toggle the body outline">Body</button>
+    </div>
+    <div class="overlay legend">
+      <div class="row"><span class="swatch" style="border-color:var(--accent)"></span>primary — the lift targets it</div>
+      <div class="row"><span class="swatch" style="border-color:var(--assist)"></span>secondary — it assists</div>
+      <div class="row"><span class="swatch" style="border-color:var(--hold)"></span>limiting — it only holds the load</div>
+      <div class="row"><span class="swatch" style="border-color:var(--anat)"></span>part of — anatomy</div>
+      <div class="row"><span class="dot" style="background:var(--node)"></span>muscle
+        <span style="width:8px"></span><span class="dot" style="background:var(--accent)"></span>exercise</div>
+    </div>
+    <div class="overlay hint">
+      drag to move · <kbd>right-drag</kbd> to rotate<br>
+      pinch or <kbd>ctrl</kbd>+scroll to zoom · scroll to pan
+    </div>
+  </div>
+  <aside>
+    <div class="rail-scroll" id="rail"></div>
+    <div class="console" id="console"></div>
+  </aside>
+</main>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from '/vendor/OrbitControls.js';
+
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+/* ── persisted UI state ────────────────────────────────────────────── */
+const UI_KEY = 'muscle-ontology-ui-v1';
+const DEC_KEY = 'muscle-ontology-review-v1';
+const UI = Object.assign({
+  mode:'explore', filter:'all', theme:null, sel:null, rail:'on',
+  showAll:false, showBody:true, cam:null, auditIdx:0, level:2,
+}, (() => { try { return JSON.parse(localStorage.getItem(UI_KEY) || '{}'); }
+            catch { return {}; } })());
+let uiTimer = null;
+function saveUI(){
+  clearTimeout(uiTimer);
+  uiTimer = setTimeout(() => {
+    UI.cam = { p: camera.position.toArray(), t: controls.target.toArray() };
+    try { localStorage.setItem(UI_KEY, JSON.stringify(UI)); } catch {}
+  }, 200);
+}
+
+/* ── data ──────────────────────────────────────────────────────────── */
+let DATA = null;
+const M = new Map(), X = new Map();
+const byMuscle = new Map(), byExercise = new Map(), kidsOf = new Map();
+let QUEUE = [], decisions = {};
+const KEY = l => l.ex + '>' + l.m;
+
+/* ── three ─────────────────────────────────────────────────────────── */
+const stage = $('#stage');
+const renderer = new THREE.WebGLRenderer({ antialias:true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+stage.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(42, 1, 0.1, 400);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true; controls.dampingFactor = .08;
+controls.minDistance = 2; controls.maxDistance = 90;
+controls.enableZoom = false;                     // wheel handled below
+
+/* Canvas conventions people already know (Figma / CAD):
+     left-drag  = move the model            right-drag = rotate
+     pinch or ctrl+scroll = zoom            plain scroll = pan
+   Rotating on left-drag made it impossible to look at the top or bottom of the
+   body without flinging it around, which was the complaint. */
+controls.mouseButtons = { LEFT: THREE.MOUSE.PAN, MIDDLE: THREE.MOUSE.DOLLY,
+                          RIGHT: THREE.MOUSE.ROTATE };
+controls.touches = { ONE: THREE.TOUCH.PAN, TWO: THREE.TOUCH.DOLLY_ROTATE };
+renderer.domElement.addEventListener('contextmenu', e => e.preventDefault());
+
+scene.add(new THREE.AmbientLight(0xffffff, 1.15));
+const key = new THREE.DirectionalLight(0xffffff, 2.0); key.position.set(4, 7, 6);
+const rim = new THREE.DirectionalLight(0xffffff, .75); rim.position.set(-5, 1, -6);
+scene.add(key, rim);
+
+const S = 6.4;                       // figure is 0..1 tall; scale to world
+const GROUP = new THREE.Group(); scene.add(GROUP);
+GROUP.scale.setScalar(S);
+GROUP.position.y = -0.5 * S;         // centre the figure on the origin
+const bodyGroup = new THREE.Group(); GROUP.add(bodyGroup);
+const muscleGroup = new THREE.Group(); GROUP.add(muscleGroup);
+
+let C = {};
+function readTheme(){
+  const s = getComputedStyle(document.documentElement);
+  const g = n => new THREE.Color(s.getPropertyValue(n).trim());
+  C = { accent:g('--accent'), assist:g('--assist'), node:g('--node'), anat:g('--anat'),
+        scene:g('--scene'), fg3:g('--fg-3'), body:g('--body'), hold:g('--hold'),
+        verdigris:g('--verdigris') };
+  scene.background = C.scene;
+  if (DATA && volMeshes.size){ paintNodes(); rebuildEdges(); }
+}
+
+function resize(){
+  const r = stage.getBoundingClientRect();
+  if (!r.width || !r.height) return;
+  // updateStyle defaults to TRUE - the canvas must be sized in CSS pixels or the
+  // backing store (CSS px x DPR) becomes the layout size and blows out the page.
+  renderer.setSize(r.width, r.height);
+  camera.aspect = r.width / r.height; camera.updateProjectionMatrix();
+}
+new ResizeObserver(resize).observe(stage);
+
+/* wheel: pan by default, zoom on pinch / ctrl */
+const _pan = new THREE.Vector3();
+function panScreen(dx, dy){
+  const el = renderer.domElement;
+  const dist = camera.position.distanceTo(controls.target)
+             * Math.tan(camera.fov / 2 * Math.PI / 180);
+  const px = new THREE.Vector3().setFromMatrixColumn(camera.matrix, 0);
+  const py = new THREE.Vector3().setFromMatrixColumn(camera.matrix, 1);
+  _pan.copy(px).multiplyScalar(-2 * dx * dist / el.clientHeight)
+      .add(py.multiplyScalar(2 * dy * dist / el.clientHeight));
+  camera.position.add(_pan); controls.target.add(_pan);
+}
+renderer.domElement.addEventListener('wheel', e => {
+  e.preventDefault();
+  if (e.ctrlKey){                                  // trackpad pinch lands here too
+    const k = Math.exp(e.deltaY * 0.0022);
+    const off = camera.position.clone().sub(controls.target);
+    const d = THREE.MathUtils.clamp(off.length() * k, controls.minDistance,
+                                    controls.maxDistance);
+    camera.position.copy(controls.target).add(off.setLength(d));
+  } else {
+    panScreen(-e.deltaX, e.deltaY);
+  }
+  saveUI();
+}, { passive:false });
+
+/* ---- geometry kernel -------------------------------------------------
+   A chain of rings {c:[x,y,z], rx, rz} lofted into a closed tube. The SAME
+   primitive builds the base form and every muscle belly - one shape language,
+   and scripts/preview_body.py reads the identical data, so what I check in the
+   terminal is what renders here. */
+const _X = new THREE.Vector3(1, 0, 0);
+function chainGeometry(rings, seg, radial){
+  seg = seg || 12; radial = radial || 14;
+  const pts = [];
+  for (let i = 0; i < rings.length - 1; i++){
+    const a = rings[i], b = rings[i + 1];
+    for (let s = 0; s < seg; s++){
+      const t = s / seg, ts = t * t * (3 - 2 * t);   // smoothstep -> rounded bellies
+      pts.push({ c: new THREE.Vector3(
+                   a.c[0] + (b.c[0] - a.c[0]) * t,
+                   a.c[1] + (b.c[1] - a.c[1]) * t,
+                   a.c[2] + (b.c[2] - a.c[2]) * t),
+                 rx: a.rx + (b.rx - a.rx) * ts,
+                 rz: a.rz + (b.rz - a.rz) * ts });
+    }
+  }
+  const last = rings[rings.length - 1];
+  pts.push({ c: new THREE.Vector3(last.c[0], last.c[1], last.c[2]),
+             rx: last.rx, rz: last.rz });
+
+  const pos = [], idx = [], N = radial;
+  for (let i = 0; i < pts.length; i++){
+    const prev = pts[Math.max(0, i - 1)].c;
+    const next = pts[Math.min(pts.length - 1, i + 1)].c;
+    const tan = next.clone().sub(prev);
+    if (tan.lengthSq() < 1e-12) tan.set(0, 1, 0);
+    tan.normalize();
+    // World X projected onto the ring plane keeps rx meaning "width" everywhere,
+    // including the foot, whose chain runs forward rather than up.
+    const ax = _X.clone().sub(tan.clone().multiplyScalar(_X.dot(tan)));
+    if (ax.lengthSq() < 1e-8) ax.set(0, 0, 1);
+    ax.normalize();
+    const az = new THREE.Vector3().crossVectors(tan, ax).normalize();
+    for (let j = 0; j < N; j++){
+      const th = j / N * Math.PI * 2;
+      const v = pts[i].c.clone()
+        .addScaledVector(ax, Math.cos(th) * pts[i].rx)
+        .addScaledVector(az, Math.sin(th) * pts[i].rz);
+      pos.push(v.x, v.y, v.z);
+    }
+  }
+  for (let i = 0; i < pts.length - 1; i++)
+    for (let j = 0; j < N; j++){
+      const a = i * N + j, b = i * N + (j + 1) % N;
+      const c = (i + 1) * N + j, d = (i + 1) * N + (j + 1) % N;
+      idx.push(a, c, b, b, c, d);
+    }
+  // caps, so a muscle belly is a closed solid rather than an open sleeve
+  const capA = pos.length / 3;
+  pos.push(pts[0].c.x, pts[0].c.y, pts[0].c.z);
+  for (let j = 0; j < N; j++) idx.push(capA, (j + 1) % N, j);
+  const capB = pos.length / 3, base = (pts.length - 1) * N;
+  const lastC = pts[pts.length - 1].c;
+  pos.push(lastC.x, lastC.y, lastC.z);
+  for (let j = 0; j < N; j++) idx.push(capB, base + j, base + (j + 1) % N);
+
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setIndex(idx); g.computeVertexNormals(); g.computeBoundingSphere();
+  return g;
+}
+
+function mirrorRings(rings){
+  return rings.map(r => ({ c: [-r.c[0], r.c[1], r.c[2]], rx: r.rx, rz: r.rz }));
+}
+
+/* ---- build ---------------------------------------------------------- */
+let xMesh, edgeLines, cutLines;
+const volMeshes = new Map();     // volume name -> [meshes] (right + mirrored left)
+const volOfMesh = new Map();     // mesh -> volume name
+const leafOfVolume = new Map();  // volume name -> muscle id
+const baseMeshes = [];
+const mPos = new Map(), xPos = new Map(), mOrder = [], xOrder = [];
+const dummy = new THREE.Object3D();
+const xRadius = e => .012 + Math.log10(1 + e.sets) * .011;
+
+function buildFigure(){
+  const parts = (DATA.figure && DATA.figure.parts) || [];
+  for (const part of parts){
+    const isMuscle = part.layer === 'muscle';
+    const chains = part.mirror ? [part.rings, mirrorRings(part.rings)] : [part.rings];
+    for (const rings of chains){
+      const geo = chainGeometry(rings);
+      if (!isMuscle){
+        const mat = new THREE.MeshStandardMaterial({
+          color: C.body, transparent:true, opacity:.18, roughness:.85,
+          depthWrite:false, side:THREE.DoubleSide });
+        const mesh = new THREE.Mesh(geo, mat);
+        bodyGroup.add(mesh); baseMeshes.push(mesh);
+        continue;
+      }
+      const mat = new THREE.MeshStandardMaterial({
+        color: C.node, transparent:true, opacity:.55, roughness:.5, metalness:.05 });
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.userData.volume = part.name;
+      muscleGroup.add(mesh);
+      if (!volMeshes.has(part.name)) volMeshes.set(part.name, []);
+      volMeshes.get(part.name).push(mesh);
+      volOfMesh.set(mesh, part.name);
+    }
+  }
+}
+
+function build(){
+  for (const m of DATA.muscles){
+    M.set(m.id, m);
+    mPos.set(m.id, new THREE.Vector3(m.x, m.y, m.z));
+    mOrder.push(m);
+    if (m.parent){ if (!kidsOf.has(m.parent)) kidsOf.set(m.parent, []);
+                   kidsOf.get(m.parent).push(m); }
+  }
+  // a LEAF owns its volume; second pass so kidsOf is complete
+  for (const m of DATA.muscles)
+    if (!kidsOf.has(m.id)) for (const v of m.volumes) leafOfVolume.set(v, m.id);
+
+  DATA.exercises.forEach(e => X.set(e.id, e));
+  DATA.links.forEach(l => {
+    l.key = KEY(l);
+    if (!byMuscle.has(l.m)) byMuscle.set(l.m, []);
+    if (!byExercise.has(l.ex)) byExercise.set(l.ex, []);
+    byMuscle.get(l.m).push(l); byExercise.get(l.ex).push(l);
+  });
+
+  buildFigure();
+
+  /* Exercises orbit outside the figure, on the side of the muscles they load. */
+  const GOLDEN = 2.399963;
+  DATA.exercises.forEach((e, i) => {
+    const ls = byExercise.get(e.id) || [];
+    const prim = ls.filter(l => l.role === 'primary');
+    const anchors = (prim.length ? prim : ls).map(l => mPos.get(l.m)).filter(Boolean);
+    const c = new THREE.Vector3();
+    if (anchors.length){ anchors.forEach(p => c.add(p)); c.divideScalar(anchors.length); }
+    else { c.set(0, -0.16, 0); xPos.set(e.id, c); xOrder.push(e); return; }
+    const radial = new THREE.Vector3(c.x, 0, c.z);
+    if (radial.lengthSq() < 1e-5) radial.set(0, 0, 1);
+    radial.normalize();
+    const a = i * GOLDEN;
+    c.addScaledVector(radial, 0.26 + 0.055 * (i % 3));
+    c.y += Math.sin(a) * 0.055;
+    c.addScaledVector(new THREE.Vector3(-radial.z, 0, radial.x), Math.cos(a) * 0.10);
+    xPos.set(e.id, c); xOrder.push(e);
+  });
+
+  xMesh = new THREE.InstancedMesh(new THREE.IcosahedronGeometry(1, 1),
+    new THREE.MeshStandardMaterial({ roughness:.4, metalness:.1,
+                                     transparent:true, opacity:1 }), xOrder.length);
+  GROUP.add(xMesh);
+  xOrder.forEach((e, i) => {
+    dummy.position.copy(xPos.get(e.id)); dummy.scale.setScalar(xRadius(e));
+    dummy.updateMatrix(); xMesh.setMatrixAt(i, dummy.matrix);
+  });
+  xMesh.instanceMatrix.needsUpdate = true;
+
+  edgeLines = new THREE.LineSegments(new THREE.BufferGeometry(),
+    new THREE.LineBasicMaterial({ vertexColors:true, transparent:true, opacity:.66 }));
+  cutLines = new THREE.LineSegments(new THREE.BufferGeometry(),
+    new THREE.LineBasicMaterial({ vertexColors:true, transparent:true, opacity:.12 }));
+  GROUP.add(edgeLines, cutLines);
+
+  buildLabels();
+}
+
+function curve(a, b, out){
+  const mid = a.clone().add(b).multiplyScalar(.5).multiplyScalar(1.10);
+  const pts = new THREE.QuadraticBezierCurve3(a, mid, b).getPoints(9);
+  for (let i = 0; i < pts.length - 1; i++)
+    out.push(pts[i].x,pts[i].y,pts[i].z, pts[i+1].x,pts[i+1].y,pts[i+1].z);
+  return pts.length - 1;
+}
+
+/* ---- selection depth: Region (1) / Muscle (2) / Head (3) -------------
+   A click resolves UP to the chosen level; a node already shallower stays put,
+   so Head + lats gives Lats because nothing deeper exists there. Every node is
+   reachable at some level - three audit edges hang off sub-heads and would
+   otherwise be unreviewable. */
+function resolveDepth(mid){
+  let cur = M.get(mid);
+  while (cur && cur.depth > UI.level && cur.parent) cur = M.get(cur.parent);
+  return cur ? cur.id : mid;
+}
+/* The volumes a node occupies - its own, or the union of its subtree. */
+function volumesOf(mid){
+  const m = M.get(mid);
+  return m ? m.volumes : [];
+}
+function shares(aId, bId){
+  const a = volumesOf(aId);
+  return volumesOf(bId).some(v => a.indexOf(v) !== -1);
+}
+
+function edgeShown(l){
+  if (mode === 'audit') return QUEUE.indexOf(l) !== -1;
+  if (sel) return sel.kind === 'muscle' ? shares(sel.id, l.m) : l.ex === sel.id;
+  if (!UI.showAll) return false;
+  if (UI.filter === 'primary')   return l.role === 'primary';
+  if (UI.filter === 'secondary') return l.role === 'secondary';
+  if (UI.filter === 'cut')       return decisions[l.key] === 'cut';
+  return true;
+}
+function exShown(e){
+  if (!sel) return true;
+  if (sel.kind === 'exercise') return sel.id === e.id;
+  return (byExercise.get(e.id) || []).some(l => shares(sel.id, l.m));
+}
+
+function rebuildEdges(){
+  const P = [], CO = [], PC = [], CC = [];
+  for (const l of DATA.links){
+    if (!edgeShown(l)) continue;
+    const a = xPos.get(l.ex), b = mPos.get(l.m);
+    if (!a || !b) continue;
+    const isCut = decisions[l.key] === 'cut';
+    const c = isCut ? C.fg3
+      : l.role === 'primary' ? C.accent
+      : l.role === 'limiting' ? C.hold : C.assist;
+    const tgt = isCut ? PC : P, tc = isCut ? CC : CO;
+    const segs = curve(a, b, tgt);
+    for (let i = 0; i < segs * 2; i++) tc.push(c.r, c.g, c.b);
+  }
+  const set = (obj, pos, cols) => {
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    g.setAttribute('color', new THREE.Float32BufferAttribute(cols, 3));
+    obj.geometry.dispose(); obj.geometry = g;
+  };
+  set(edgeLines, P, CO); set(cutLines, PC, CC);
+}
+
+/* ---- emphasis -------------------------------------------------------
+   Hover PREVIEWS what a click would select, at the current depth: the target's
+   volumes go solid and everything else recedes, so you can see what will open
+   before committing. Selection then locks that emphasis in. */
+function paintNodes(){
+  if (!volMeshes.size) return;
+  const selVols = (sel && sel.kind === 'muscle') ? volumesOf(sel.id) : null;
+  const hovVols = (hover && hover.kind === 'muscle')
+    ? volumesOf(resolveDepth(hover.id)) : null;
+  const focus = hovVols || selVols;
+
+  volMeshes.forEach((meshes, name) => {
+    const on = !focus || focus.indexOf(name) !== -1;
+    const isSel = selVols && selVols.indexOf(name) !== -1;
+    for (const mesh of meshes){
+      mesh.material.opacity = focus ? (on ? 0.97 : 0.08) : 0.55;
+      mesh.material.color = (focus && on)
+        ? (isSel ? C.accent : C.verdigris) : C.node;
+    }
+  });
+  for (const mesh of baseMeshes){
+    mesh.material.color = C.body;
+    mesh.material.opacity = focus ? 0.08 : 0.18;
+  }
+
+  if (!xMesh) return;
+  xOrder.forEach((e, i) => {
+    const ls = byExercise.get(e.id) || [];
+    const allCut = ls.length && ls.every(l => decisions[l.key] === 'cut');
+    const on = exShown(e);
+    const loud = sel ? on : (UI.showAll || mode === 'audit');
+    let c = allCut ? C.fg3 : (e.sets > 0 ? C.accent : C.fg3);
+    if (!loud) c = c.clone().lerp(C.scene, .80);
+    else if (!on) c = c.clone().lerp(C.scene, .86);
+    xMesh.setColorAt(i, c);
+  });
+  if (xMesh.instanceColor) xMesh.instanceColor.needsUpdate = true;
+}
+
+/* ---- labels ---------------------------------------------------------- */
+const labelHost = $('#labels'), labelEls = new Map();
+function buildLabels(){
+  for (const m of DATA.muscles){
+    const d = document.createElement('div');
+    d.className = 'lbl' + (m.parent ? '' : ' region'); d.textContent = m.name;
+    labelHost.appendChild(d); labelEls.set('m' + m.id, d);
+  }
+  for (const e of DATA.exercises){
+    const d = document.createElement('div');
+    d.className = 'lbl ex'; d.textContent = e.name; d.style.opacity = 0;
+    labelHost.appendChild(d); labelEls.set('x' + e.id, d);
+  }
+}
+const v3 = new THREE.Vector3();
+function placeLabels(){
+  const w = renderer.domElement.clientWidth, h = renderer.domElement.clientHeight;
+  const placed = [];
+  const put = (el, p, lift, text) => {
+    v3.copy(p).multiplyScalar(S); v3.y += GROUP.position.y + lift;
+    v3.project(camera);
+    if (v3.z > 1){ el.style.opacity = 0; return; }
+    const x = (v3.x + 1) / 2 * w, y = (-v3.y + 1) / 2 * h;
+    const bw = text.length * 6.4 + 8, bh = 16;
+    const box = { x: x - bw/2, y: y - bh, w: bw, h: bh };
+    for (const q of placed)
+      if (box.x < q.x + q.w && box.x + box.w > q.x &&
+          box.y < q.y + q.h && box.y + box.h > q.y){ el.style.opacity = 0; return; }
+    placed.push(box);
+    el.style.transform = 'translate(' + x.toFixed(1) + 'px,' + y.toFixed(1)
+                       + 'px) translate(-50%,-100%)';
+    el.style.opacity = 1;
+  };
+  const items = [];
+  for (const m of mOrder){
+    const isSel = sel && sel.kind === 'muscle' && sel.id === m.id;
+    const isHov = hover && hover.kind === 'muscle' && resolveDepth(hover.id) === m.id;
+    if (!(m.depth === UI.level || isSel || isHov)){
+      labelEls.get('m' + m.id).style.opacity = 0; continue;
+    }
+    items.push({ el: labelEls.get('m'+m.id), p: mPos.get(m.id), lift: 0.30,
+                 prio: isSel || isHov ? 0 : 1, t: m.name });
+  }
+  for (const e of xOrder){
+    const show = (sel && sel.kind === 'exercise' && sel.id === e.id)
+      || (hover && hover.kind === 'exercise' && hover.id === e.id)
+      || (sel && sel.kind === 'muscle'
+          && (byExercise.get(e.id)||[]).some(l => shares(sel.id, l.m)))
+      || (mode === 'audit' && QUEUE.some(l => l.ex === e.id && !decisions[l.key]));
+    if (!show){ labelEls.get('x' + e.id).style.opacity = 0; continue; }
+    items.push({ el: labelEls.get('x'+e.id), p: xPos.get(e.id),
+                 lift: xRadius(e) + 0.02, prio: 0, t: e.name });
+  }
+  items.sort((a,b) => a.prio - b.prio);
+  for (const it of items) put(it.el, it.p, it.lift, it.t);
+}
+
+/* ---- camera framing --------------------------------------------------- */
+function fitView(){
+  const box = new THREE.Box3().setFromObject(GROUP);
+  const c = box.getCenter(new THREE.Vector3());
+  const size = box.getSize(new THREE.Vector3());
+  const fitH = size.y / (2 * Math.tan(camera.fov * Math.PI / 360));
+  const fitW = size.x / camera.aspect / (2 * Math.tan(camera.fov * Math.PI / 360));
+  const dist = 1.10 * Math.max(fitH, fitW, size.z);
+  controls.target.copy(c);
+  camera.position.set(c.x + dist * .34, c.y + dist * .06, c.z + dist * .93);
+  camera.updateProjectionMatrix(); controls.update(); saveUI();
+}
+
+/* ---- picking ---------------------------------------------------------- */
+const ray = new THREE.Raycaster(), ptr = new THREE.Vector2();
+let hover = null, downAt = null, sel = null, mode = UI.mode;
+renderer.domElement.addEventListener('pointerdown', e => {
+  if (e.button === 0) downAt = { x:e.clientX, y:e.clientY };
+});
+renderer.domElement.addEventListener('pointerup', e => {
+  if (e.button !== 0 || !downAt) return;
+  const moved = Math.abs(e.clientX - downAt.x) + Math.abs(e.clientY - downAt.y);
+  downAt = null;
+  if (moved > 6){ saveUI(); return; }
+  const h = pick(e);
+  if (!h){ select(null); return; }
+  select(h.kind, h.kind === 'muscle' ? resolveDepth(h.id) : h.id);
+});
+renderer.domElement.addEventListener('pointermove', e => {
+  const h = pick(e);
+  const key = h ? h.kind + h.id : '';
+  const prev = hover ? hover.kind + hover.id : '';
+  hover = h; showTip(h, e);
+  renderer.domElement.style.cursor = h ? 'pointer' : 'grab';
+  if (key !== prev) paintNodes();
+});
+function pick(e){
+  if (!DATA || !xMesh) return null;
+  const r = renderer.domElement.getBoundingClientRect();
+  ptr.x = ((e.clientX - r.left) / r.width) * 2 - 1;
+  ptr.y = -((e.clientY - r.top) / r.height) * 2 + 1;
+  ray.setFromCamera(ptr, camera);
+  const targets = [xMesh].concat(muscleGroup.children);
+  const hits = ray.intersectObjects(targets, false);
+  if (!hits.length) return null;
+  const hit = hits[0];
+  if (hit.object === xMesh) return { kind:'exercise', id: xOrder[hit.instanceId].id };
+  const leaf = leafOfVolume.get(volOfMesh.get(hit.object));
+  return leaf ? { kind:'muscle', id: leaf } : null;
+}
+const tip = $('#tip');
+function showTip(h, e){
+  if (!h){ tip.classList.remove('on'); return; }
+  if (h.kind === 'muscle'){
+    const target = M.get(resolveDepth(h.id));
+    const n = rolled(target.id).length;
+    const via = target.id !== h.id ? ' &middot; via ' + esc(M.get(h.id).name) : '';
+    tip.innerHTML = '<div class="t serif">' + esc(target.name) + '</div>'
+      + '<div class="s">' + (target.size || 'group') + ' &middot; ' + n
+      + ' exercise' + (n === 1 ? '' : 's') + via + '</div>';
+  } else {
+    const o = X.get(h.id);
+    tip.innerHTML = '<div class="t serif">' + esc(o.name) + '</div>'
+      + '<div class="s">' + o.sets.toLocaleString() + ' sets logged</div>';
+  }
+  const r = stage.getBoundingClientRect();
+  tip.style.left = (e.clientX - r.left) + 'px';
+  tip.style.top = (e.clientY - r.top) + 'px';
+  tip.classList.add('on');
+}
+function select(kind, id){
+  sel = kind ? { kind, id } : null;
+  UI.sel = sel; saveUI();
+  paintNodes(); rebuildEdges(); renderRail();
+}
+
+/* Every exercise at or beneath a muscle, with its EFFECTIVE role.
+   Computed SERVER-SIDE (see _rollup in frontend/server.py) and read here — the
+   viewer must not own a second copy of the rollup rule, or it grows a second
+   set of numbers. Handles the subtree walk, the count-once rule, and
+   primary-beats-secondary when one lift reaches a muscle both ways. */
+function rolled(mid){
+  return (DATA.rollup || {})[mid] || [];
+}
+/* A rolled-up row is cut only when EVERY edge behind it is cut. */
+const rowCut = r => r.keys.length && r.keys.every(k => decisions[k] === 'cut');
+const rowSets = r => rowCut(r) ? 0 : X.get(r.ex).sets;
+
+/* ── loop ──────────────────────────────────────────────────────────── */
+function tick(){
+  controls.update(); renderer.render(scene, camera);
+  if (DATA && volMeshes.size) placeLabels();
+  requestAnimationFrame(tick);
+}
+
+/* ── rail ──────────────────────────────────────────────────────────── */
+const rail = $('#rail');
+function renderRail(){
+  if (!DATA) return;
+  rail.innerHTML = !sel ? introHTML()
+    : sel.kind === 'muscle' ? muscleHTML(M.get(sel.id)) : exerciseHTML(X.get(sel.id));
+  rail.querySelectorAll('[data-filter]').forEach(b =>
+    b.onclick = () => { UI.filter = b.dataset.filter; saveUI(); rebuildEdges(); paintNodes(); renderRail(); });
+  rail.querySelectorAll('[data-go]').forEach(el =>
+    el.onclick = () => { const [k,i] = el.dataset.go.split(':'); select(k,i); });
+  rail.querySelectorAll('[data-toggle]').forEach(el =>
+    el.onclick = ev => { ev.stopPropagation();
+      const k = el.dataset.toggle;
+      // The rail toggle is cut / NOT-cut. Restoring must clear the entry
+      // rather than record a 'keep', or undoing a cut silently answers the
+      // audit question and the edge drops out of the review queue.
+      // An explicit 'keep' only ever comes from the Audit console.
+      if (decisions[k] === 'cut') delete decisions[k]; else decisions[k] = 'cut';
+      persist(); paintNodes(); rebuildEdges(); renderRail(); renderStats(); });
+}
+function introHTML(){
+  const done = QUEUE.filter(l => decisions[l.key]).length;
+  return `
+    <div class="filters" role="group" aria-label="Filter edges">
+      ${['all','primary','secondary','queue','cut'].map(f =>
+        `<button data-filter="${f}" aria-pressed="${UI.filter===f}">${f==='queue'?'needs review':f}</button>`).join('')}
+    </div>
+    <div class="rail-empty">
+      <p><b style="color:var(--fg)">Click a muscle on the body</b> to see which of
+      your lifts reach it, and why I said so. Click an exercise to see everything
+      it claims.</p>
+      <p>A <span style="color:var(--accent)">carmine</span> line means the lift
+      targets that muscle. A <span style="color:var(--assist)">brass</span> line
+      means it only assists.</p>
+      <p>The brass ones are what deserve your time — <b class="mono">${QUEUE.length}</b>
+      judgement calls. <b class="mono">${done}</b> reviewed so far.</p>
+    </div>`;
+}
+function rowsFor(rows){
+  return rows.map(r => {
+    const e = X.get(r.ex), cut = rowCut(r);
+    return `<li class="go ${cut?'cut':''}" data-go="exercise:${e.id}">
+      <span class="role ${r.role}"></span><span class="nm">${esc(e.name)}</span>
+      ${r.via ? `<span class="via">via ${esc(r.via)}</span>` : ''}
+      <span class="ct">${e.sets ? e.sets.toLocaleString() : '—'}</span></li>`;
+  }).join('');
+}
+function muscleHTML(m){
+  const all = rolled(m.id).slice().sort((a,b) => X.get(b.ex).sets - X.get(a.ex).sets);
+  const prim = all.filter(r => r.role === 'primary');
+  const sec  = all.filter(r => r.role === 'secondary');
+  const kids = kidsOf.get(m.id) || [];
+  const sum = a => a.reduce((n, r) => n + rowSets(r), 0);
+  const inherited = all.some(r => r.via);
+  return `
+    <span class="eyebrow">Muscle</span>
+    <h2 class="rail-title serif">${esc(m.name)}</h2>
+    <div class="path">${esc(m.path).split(' > ').map((n,i,a) =>
+      i===a.length-1 ? `<b>${esc(n)}</b>` : esc(n)).join(' › ')}</div>
+    <dl class="kv">
+      <dt>Size</dt><dd>${m.size || '— grouping node'}</dd>
+      <dt>Targeted</dt><dd class="mono">${sum(prim).toLocaleString()} sets · ${prim.length} lifts</dd>
+      <dt>Assisting</dt><dd class="mono">${sum(sec).toLocaleString()} sets · ${sec.length} lifts</dd>
+    </dl>
+    ${inherited ? `<p class="note">Counts include everything beneath this muscle in
+      the tree — a lift attached to a sub-part is marked <span class="via">via …</span>.
+      Each lift is counted once, and where one reaches this muscle both ways it
+      is listed as primary only. Same rollup the coach uses, so the panel and the
+      answers agree.</p>` : ''}
+    ${kids.length ? `<div class="sec"><span class="eyebrow">Contains</span><ul class="list">${
+      kids.map(k => `<li class="go" data-go="muscle:${k.id}"><span class="nm">${esc(k.name)}</span>
+        <span class="ct">${k.size || ''}</span></li>`).join('')}</ul></div>` : ''}
+    ${prim.length ? `<div class="sec"><span class="eyebrow">Targets it — primary</span>
+      <ul class="list">${rowsFor(prim)}</ul></div>` : ''}
+    ${sec.length ? `<div class="sec"><span class="eyebrow">Assists it — secondary</span>
+      <ul class="list">${rowsFor(sec)}</ul></div>` : ''}`;
+}
+function exerciseHTML(e){
+  const ls = byExercise.get(e.id) || [];
+  return `
+    <span class="eyebrow">Exercise</span>
+    <h2 class="rail-title serif">${esc(e.name)}</h2>
+    <div class="path">${esc(e.equip || '—')} › <b>${esc(e.pattern || '—')}</b></div>
+    <dl class="kv">
+      <dt>Your sets</dt><dd class="mono">${e.sets ? e.sets.toLocaleString() : 'never logged'}</dd>
+      ${e.last ? `<dt>Last done</dt><dd class="mono">${esc(e.last)}</dd>` : ''}
+      <dt>Logged as</dt><dd>${e.aliases.map(esc).join('<br>') || '—'}</dd>
+    </dl>
+    <div class="sec"><span class="eyebrow">Muscles claimed — and why</span>
+      <ul class="list">${ls.map(l => {
+        const m = M.get(l.m), cut = decisions[l.key] === 'cut';
+        return `<li class="${cut?'cut':''}">
+          <span class="role ${l.role}"></span>
+          <span class="nm go" data-go="muscle:${m.id}">${esc(m.name)}</span>
+          <span class="chip ${cut?'cut':l.role}">${cut?'cut':l.role}</span>
+          <button class="mini" data-toggle="${l.key}">${cut?'restore':'cut'}</button></li>
+        <li style="padding:0"><span class="src">${esc(l.src)}</span></li>`;
+      }).join('')}</ul></div>`;
+}
+
+/* ── audit ─────────────────────────────────────────────────────────── */
+const consoleEl = $('#console');
+/* The cursor walks the WHOLE queue, not just the undecided part. Indexing into
+   a filtered "pending" list made every answered call unreachable — you could
+   never go back and change your mind, and the list shifted under you each time
+   you decided something. */
+function nextUndecided(from){
+  for (let i = from; i < QUEUE.length; i++) if (!decisions[QUEUE[i].key]) return i;
+  for (let i = 0; i < QUEUE.length; i++) if (!decisions[QUEUE[i].key]) return i;
+  return -1;
+}
+function gotoCall(i){
+  UI.auditIdx = Math.max(0, Math.min(i, QUEUE.length - 1));
+  saveUI(); renderConsole();
+}
+
+function renderConsole(){
+  if (mode !== 'audit' || !DATA) return;
+  const done = QUEUE.filter(l => decisions[l.key]).length;
+
+  if (done === QUEUE.length){
+    consoleEl.innerHTML = `
+      <div class="console-head"><span class="eyebrow">Audit complete</span>
+        <span class="saved on">saved to ontology/review_cuts.csv</span></div>
+      <p class="verdict serif">All ${QUEUE.length} judgement calls reviewed.</p>
+      <p class="criterion">Tell me in chat and I'll run
+        <span class="mono">scripts/apply_review_cuts.py</span> to fold these into the graph.
+        You can still step back through them with <kbd>&larr;</kbd>.</p>
+      <textarea readonly>${esc(exportText())}</textarea>
+      <div class="actions" style="margin-top:9px">
+        <button class="act" id="bBack">&larr; Review a call</button>
+        <button class="act ghost" id="reset">Start over</button></div>`;
+    $('#bBack').onclick = () => gotoCall(QUEUE.length - 1);
+    $('#reset').onclick = () => { decisions = {}; persist(); UI.auditIdx = 0;
+      paintNodes(); rebuildEdges(); renderConsole(); renderStats(); };
+    return;
+  }
+
+  UI.auditIdx = Math.max(0, Math.min(UI.auditIdx, QUEUE.length - 1));
+  const l = QUEUE[UI.auditIdx], e = X.get(l.ex), m = M.get(l.m);
+  const current = decisions[l.key] || null;
+  select('exercise', e.id);
+
+  const why = l.risk === 'subhead'
+    ? 'Sub-head attribution is contested in the research — keep only if you accept the emphasis claim.'
+    : l.risk === 'contested' ? 'I flagged this one as genuinely disputed when I wrote it.'
+    : 'A secondary should exist only where the muscle does enough work to change what you train next.';
+  const LABEL = { cut:'you cut this', keep:'you kept this',
+                  limiting:'you marked this limiting' };
+  const answered = current
+    ? `<span class="chip ${current === 'keep' ? 'kept' : current}">${LABEL[current]}</span>`
+    : '';
+
+  consoleEl.innerHTML = `
+    <div class="console-head">
+      <span class="eyebrow">Call ${UI.auditIdx + 1} of ${QUEUE.length}</span>
+      <div class="progress"><i style="width:${(done/QUEUE.length*100).toFixed(1)}%"></i></div>
+      <span class="mono" style="font-size:11.5px;color:var(--fg-3)">${done} decided &middot;
+        ${e.sets.toLocaleString()} sets ride on this</span>
+      ${answered}
+      <span class="saved" id="saved">saved</span>
+    </div>
+    <p class="verdict serif">${esc(e.name)} <span style="color:var(--fg-3)">${
+      l.role === 'primary' ? 'targets' : 'also works'}</span> <span class="m">${esc(m.name)}</span></p>
+    <p class="criterion"><b>Which way does the interference run?</b>
+      If working ${esc(m.name)} <i>first</i> would wreck this lift, but this lift leaves
+      ${esc(m.name)} fine &mdash; it only <b>holds</b> the load. If the interference runs
+      <i>both</i> ways, the lift genuinely <b>trains</b> it.<br>
+      ${why}<br><span style="color:var(--fg-3)">My reason was: ${esc(l.src)}</span></p>
+    <div class="actions">
+      <button class="act ghost" id="bPrev" ${UI.auditIdx === 0 ? 'disabled' : ''}
+              title="Previous call - change an answer">&larr; Back</button>
+      <button class="act keep${current === 'keep' ? ' on' : ''}" id="bKeep"
+              title="Trains it - counts as training volume">Trains it <kbd>K</kbd></button>
+      <button class="act hold${current === 'limiting' ? ' on' : ''}" id="bHold"
+              title="Only holds the load - edge kept for ordering, never counted as volume">Only holds it <kbd>L</kbd></button>
+      <button class="act cut${current === 'cut' ? ' on' : ''}" id="bCut"
+              title="The edge is wrong - delete it">Cut it <kbd>X</kbd></button>
+      ${current ? '<button class="act ghost" id="bClear">Un-answer</button>' : ''}
+      <button class="act ghost" id="bNext" title="Next call">Next &rarr;</button>
+      <button class="act ghost" id="bJump">Skip to unanswered</button>
+      <span style="flex:1"></span>
+      <button class="act ghost" id="bExport">Show decisions</button>
+    </div>`;
+
+  $('#bPrev').onclick = () => gotoCall(UI.auditIdx - 1);
+  $('#bNext').onclick = () => gotoCall(UI.auditIdx + 1);
+  $('#bKeep').onclick = () => decide(l, 'keep');
+  $('#bHold').onclick = () => decide(l, 'limiting');
+  $('#bCut').onclick  = () => decide(l, 'cut');
+  $('#bJump').onclick = () => { const n = nextUndecided(UI.auditIdx + 1);
+                                if (n >= 0) gotoCall(n); };
+  if ($('#bClear')) $('#bClear').onclick = () => {
+    delete decisions[l.key]; persist();
+    paintNodes(); rebuildEdges(); renderConsole(); renderStats();
+  };
+  $('#bExport').onclick = showExport;
+}
+
+/* Answering moves to the next UNANSWERED call, so a normal pass forward still
+   feels like a queue; stepping back with the arrows never skips anything. */
+function decide(l, v){
+  decisions[l.key] = v; persist();
+  const n = nextUndecided(UI.auditIdx + 1);
+  if (n >= 0) UI.auditIdx = n;
+  saveUI();
+  paintNodes(); rebuildEdges(); renderConsole(); renderStats();
+}
+
+function exportText(){
+  const cuts = DATA.links.filter(l => decisions[l.key] === 'cut');
+  const hold = DATA.links.filter(l => decisions[l.key] === 'limiting');
+  if (!cuts.length && !hold.length)
+    return 'Nothing changed — the graph stands as drafted.';
+  const line = l => `${X.get(l.ex).name}  ->  ${M.get(l.m).name}`;
+  const out = [];
+  if (cuts.length) out.push(`CUT ${cuts.length} EDGE(S):\n` + cuts.map(line).join('\n'));
+  // A reclassification is a ROLE REWRITE, not a deletion — the edge stays so the
+  // ordering fact survives; it just stops counting as training volume.
+  if (hold.length) out.push(`RECLASSIFY ${hold.length} AS LIMITING `
+    + `(kept, but no longer training volume):\n` + hold.map(line).join('\n'));
+  return out.join('\n\n');
+}
+function showExport(){
+  consoleEl.innerHTML = `
+    <div class="console-head"><span class="eyebrow">Decisions so far</span></div>
+    <textarea readonly>${esc(exportText())}</textarea>
+    <div class="actions" style="margin-top:9px">
+      <button class="act" id="back">Back to review</button></div>`;
+  $('#back').onclick = renderConsole;
+}
+addEventListener('keydown', ev => {
+  if (ev.target.tagName === 'TEXTAREA' || ev.target.tagName === 'INPUT') return;
+  if (ev.key === 'Escape'){ select(null); fitView(); return; }
+  if (ev.key === '1' || ev.key === '2' || ev.key === '3'){ setLevel(+ev.key); return; }
+  if (mode !== 'audit' || !QUEUE.length) return;
+  const l = QUEUE[Math.max(0, Math.min(UI.auditIdx, QUEUE.length - 1))];
+  if (ev.key === 'k' || ev.key === 'K') decide(l, 'keep');
+  else if (ev.key === 'l' || ev.key === 'L') decide(l, 'limiting');
+  else if (ev.key === 'x' || ev.key === 'X') decide(l, 'cut');
+  else if (ev.key === 'ArrowRight') gotoCall(UI.auditIdx + 1);
+  else if (ev.key === 'ArrowLeft')  gotoCall(UI.auditIdx - 1);
+  else if (ev.key === 'Backspace'){
+    ev.preventDefault(); delete decisions[l.key]; persist();
+    paintNodes(); rebuildEdges(); renderConsole(); renderStats();
+  }
+});
+
+/* ── persistence of decisions ──────────────────────────────────────── */
+let saveTimer = null;
+function persist(){
+  try { localStorage.setItem(DEC_KEY, JSON.stringify(decisions)); } catch {}
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(async () => {
+    const rows = DATA.links.filter(l => decisions[l.key]).map(l => ({
+      exercise_id:l.ex, muscle_id:l.m, exercise_name:X.get(l.ex).name,
+      muscle_name:M.get(l.m).name, role:l.role, decision:decisions[l.key] }));
+    try {
+      await fetch('/ontology-review', { method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ decisions: rows }) });
+      const s = $('#saved'); if (s){ s.classList.add('on');
+        setTimeout(() => s.classList.remove('on'), 1400); }
+    } catch {}
+  }, 450);
+}
+
+/* ── chrome ────────────────────────────────────────────────────────── */
+function setMode(m, refit){
+  mode = m; UI.mode = m; document.body.dataset.mode = m;
+  $('#mExplore').setAttribute('aria-pressed', m === 'explore');
+  $('#mAudit').setAttribute('aria-pressed', m === 'audit');
+  saveUI();
+  if (m === 'audit') renderConsole();
+  else { select(null); if (refit) fitView(); }
+  paintNodes(); rebuildEdges();
+}
+$('#mExplore').onclick = () => setMode('explore', true);
+$('#mAudit').onclick = () => setMode('audit', false);
+$('#btnReset').onclick = () => { select(null); fitView(); };
+$('#btnAll').onclick = e => {
+  UI.showAll = !UI.showAll;
+  e.currentTarget.setAttribute('aria-pressed', UI.showAll);
+  saveUI(); paintNodes(); rebuildEdges();
+};
+function setLevel(n){
+  UI.level = n; saveUI();
+  document.querySelectorAll('[data-level]').forEach(b =>
+    b.setAttribute('aria-pressed', String(+b.dataset.level === n)));
+  // A selection made at a deeper level must not survive a move to a
+  // shallower one, or the panel would show a muscle the figure no longer
+  // resolves to.
+  if (sel && sel.kind === 'muscle') select('muscle', resolveDepth(sel.id));
+  else { paintNodes(); rebuildEdges(); }
+}
+document.querySelectorAll('[data-level]').forEach(b =>
+  b.onclick = () => setLevel(+b.dataset.level));
+$('#btnBody').onclick = e => {
+  UI.showBody = !UI.showBody; bodyGroup.visible = UI.showBody;
+  e.currentTarget.setAttribute('aria-pressed', UI.showBody); saveUI();
+};
+$('#rail-toggle').onclick = () => {
+  UI.rail = UI.rail === 'on' ? 'off' : 'on';
+  document.body.dataset.rail = UI.rail;
+  $('#rail-toggle').textContent = UI.rail === 'on' ? '⇔ Wide' : '⇔ Panel';
+  saveUI(); requestAnimationFrame(resize);
+};
+$('#theme').onclick = () => {
+  UI.theme = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+  document.documentElement.dataset.theme = UI.theme; saveUI(); readTheme();
+};
+function renderStats(){
+  $('#sMus').textContent = DATA.muscles.length;
+  $('#sEx').textContent = DATA.exercises.length;
+  $('#sLink').textContent = DATA.links.length;
+  $('#sCut').textContent = DATA.links.filter(l => decisions[l.key] === 'cut').length;
+}
+
+/* ── boot ──────────────────────────────────────────────────────────── */
+(async function(){
+  document.documentElement.dataset.theme = UI.theme
+    || (matchMedia('(prefers-color-scheme:dark)').matches ? 'dark' : 'light');
+  document.body.dataset.rail = UI.rail;
+  $('#rail-toggle').textContent = UI.rail === 'on' ? '⇔ Wide' : '⇔ Panel';
+  $('#btnAll').setAttribute('aria-pressed', UI.showAll);
+  $('#btnBody').setAttribute('aria-pressed', UI.showBody);
+  document.querySelectorAll('[data-level]').forEach(b =>
+    b.setAttribute('aria-pressed', String(+b.dataset.level === UI.level)));
+  resize(); readTheme(); tick();
+
+  try {
+    const res = await fetch('/ontology-graph');
+    if (!res.ok) throw new Error(res.status + ' ' + res.statusText);
+    DATA = await res.json();
+  } catch (err){
+    $('#loading').textContent = 'Could not read the ontology store — ' + err.message;
+    return;
+  }
+  $('#loading').remove();
+
+  // /graph?reset=1 wipes the review slate. The browser keeps its own copy of
+  // the decisions, so clearing the server file alone is not enough - the next
+  // edit would just re-post the stale set.
+  if (new URLSearchParams(location.search).has('reset')){
+    try { localStorage.removeItem(DEC_KEY); } catch {}
+    fetch('/ontology-review', { method:'POST',
+      headers:{'Content-Type':'application/json'}, body:'{"decisions":[]}' });
+    DATA.cuts = [];
+    history.replaceState({}, '', location.pathname);
+  }
+  try { decisions = JSON.parse(localStorage.getItem(DEC_KEY) || '{}'); } catch { decisions = {}; }
+  for (const r of (DATA.cuts || [])){
+    const k = r.exercise_id + '>' + r.muscle_id;
+    if (!(k in decisions)) decisions[k] = r.decision;
+  }
+
+  build();
+  bodyGroup.visible = UI.showBody;
+  QUEUE = DATA.links
+    .filter(l => ['secondary','subhead','contested'].includes(l.risk))
+    .sort((a,b) => X.get(b.ex).sets - X.get(a.ex).sets);
+
+  // restore the whole view, not just the data
+  if (UI.sel && (UI.sel.kind === 'muscle' ? M.has(UI.sel.id) : X.has(UI.sel.id))) sel = UI.sel;
+  readTheme(); renderStats();
+  setMode(UI.mode, false);
+  if (sel) select(sel.kind, sel.id); else renderRail();
+  if (UI.cam){ camera.position.fromArray(UI.cam.p); controls.target.fromArray(UI.cam.t);
+               controls.update(); }
+  else fitView();
+  controls.addEventListener('end', saveUI);
+})();
+</script>
+</body>
+</html>
