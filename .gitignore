@@ -28,3 +28,7 @@ data/
 !data/.gitkeep
 data/user_articles/
 !data/user_articles/.gitkeep
+
+# Ontology review queue (generated; rows here are NOT in the graph yet)
+pending_review.csv
+ontology/review_cuts.csv

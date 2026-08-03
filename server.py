@@ -1048,6 +1048,69 @@ async def reload_db(new_exercises: list = None):
     return JSONResponse(content=payload)
 
 
+def _exercise_context(path: str) -> tuple:
+    """(set_counts, categories) per exercise name — annotation for the review
+    queue only. Category names include user-created ones, which is exactly why
+    they are a hint and never a decision."""
+    try:
+        import sqlite3
+        conn = sqlite3.connect(f"file:{path.replace(os.sep, '/')}?mode=ro", uri=True)
+        try:
+            counts = {r[0]: r[1] for r in conn.execute(
+                """SELECT e.name, COUNT(tl._id) FROM exercise e
+                     LEFT JOIN training_log tl ON tl.exercise_id = e._id
+                    GROUP BY e.name""")}
+            cats = {r[0]: r[1] for r in conn.execute(
+                """SELECT e.name, c.name FROM exercise e
+                     JOIN Category c ON c._id = e.category_id""")}
+            return counts, cats
+        finally:
+            conn.close()
+    except Exception:
+        return {}, {}
+
+
+def _reconcile_new_exercises(new_exercises: list) -> dict:
+    """
+    Stage 1 of ontology reconciliation, run on EVERY path that replaces the DB
+    file. Deterministic and offline — no LLM, no network — so an upload can
+    never fail or hang on this. The web-search proposal happens later, when the
+    user runs scripts/review_pending.py.
+
+    Auto-aliases only categorical matches (spelling/spacing/word-order variants
+    of an exercise the graph already has). Everything else is queued, and its
+    sets stay excluded from muscle counts until the user approves it (R10).
+
+    Never raises: a reconciliation problem must not cost the user their upload.
+    """
+    if not new_exercises:
+        return {"auto_aliased": [], "pending": [], "already_known": []}
+    try:
+        from src import ontology_reconcile as _rec
+        from src.ontology import load_ontology as _load
+
+        counts, cats = _exercise_context(DB_PATH)
+        result = _rec.detect_new(new_exercises, _load(force=True),
+                                 set_counts=counts, categories=cats)
+        if result.auto_aliased:
+            _rec.write_auto_aliases(result.auto_aliased)
+            _load(force=True)          # the store changed under the cache
+        if result.pending:
+            _rec.merge_pending(result.pending)
+        print(f"[Server] ontology reconcile: {result.summary()}")
+        return {
+            "auto_aliased": [{"name": a["db_exercise_name"],
+                              "mapped_to": a["canonical_name"],
+                              "reason": a["reason"]} for a in result.auto_aliased],
+            "pending": [p["db_exercise_name"] for p in result.pending],
+            "already_known": result.already_known,
+        }
+    except Exception as e:
+        print(f"[Server] ontology reconcile failed (non-fatal): {e}")
+        return {"error": str(e), "auto_aliased": [], "pending": [],
+                "already_known": []}
+
+
 async def _maybe_replay_wal() -> dict:
     """
     Replay journaled writes onto the freshly written DB file — unless the
@@ -1123,6 +1186,7 @@ async def upload_db(file: UploadFile):
     reload_response = await reload_db(new_exercises=new_exercises)
     payload = json.loads(reload_response.body)
     payload["wal_replay"] = wal_result
+    payload["ontology"] = _reconcile_new_exercises(new_exercises)
     return JSONResponse(content=payload)
 
 
@@ -1145,8 +1209,15 @@ async def upload_confirm():
     async with _upload_lock:
         # Same drain-then-replace discipline as /upload (see comment there).
         async with agent_lock:
+            # This path replaces the DB file too, so it owes the same
+            # new-exercise diff /upload does. It previously computed none, which
+            # meant a warned-then-confirmed upload silently skipped both the
+            # new_exercises notice and ontology reconciliation — a fix at a
+            # shared seam has to land on every interface, not just one.
+            old_exercises = _get_exercise_names(DB_PATH)
             with open(DB_PATH, "wb") as f:
                 f.write(contents)
+            new_exercises = sorted(_get_exercise_names(DB_PATH) - old_exercises)
 
             _state["pending_upload_path"] = None
             _state["pending_upload_contents"] = None
@@ -1154,9 +1225,10 @@ async def upload_confirm():
             # Same replay gate as /upload — this path also replaces the DB file.
             wal_result = await _maybe_replay_wal()
 
-    reload_response = await reload_db()
+    reload_response = await reload_db(new_exercises=new_exercises)
     payload = json.loads(reload_response.body)
     payload["wal_replay"] = wal_result
+    payload["ontology"] = _reconcile_new_exercises(new_exercises)
     return JSONResponse(content=payload)
 
 
