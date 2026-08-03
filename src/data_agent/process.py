@@ -43,6 +43,43 @@ PULL_CATEGORIES = {"Back", "Biceps"}
 MUSCLE_GROUP_NAMES = frozenset(CATEGORY_NAMES.values())
 
 
+def resolve_category(cat_id, exercise_name: str = "",
+                     ontology: Optional[dict] = None) -> str:
+    """
+    Display group for an exercise. Known FitNotes categories keep their exact
+    current names; the ONLY behaviour that changes is the unknown-id fallback.
+
+    R8 — NEVER INVENT A CATEGORY. `Category._id` is AUTOINCREMENT, so users can
+    create their own; a new user's `category_id = 15` used to surface as the
+    literal string "Category_15" (and "Other"/"Cat_15" elsewhere), which is not
+    a muscle group and poisons every group-level answer.
+
+    A new or different type of rowing is still Back. So when the id is unknown,
+    the group is derived from the exercise's ONTOLOGY muscles — its primary
+    muscle rolled up to that muscle's top-level region — which can only ever
+    yield an existing region, because the muscle set is closed (R7). Nothing
+    here creates a category; there is no code path that can.
+
+    Falls back to "Uncategorised" when the exercise is also unmapped. That is an
+    honest "we don't know", never a fabricated group.
+    """
+    known = CATEGORY_NAMES.get(cat_id)
+    if known:
+        return known
+
+    if ontology and exercise_name:
+        eid = _resolve_alias(ontology, exercise_name)
+        if eid is not None:
+            from src.ontology import top_level_region
+            for edge in ontology.get("edges_by_exercise", {}).get(eid, []):
+                if edge["role"] != "primary":
+                    continue
+                region = top_level_region(ontology, edge["muscle_id"])
+                if region:
+                    return region
+    return "Uncategorised"
+
+
 def match_muscle_group(term: str) -> Optional[str]:
     """
     Return the canonical muscle-group Category name a user/classifier term refers
@@ -2003,7 +2040,8 @@ def _compute_goal_projection(sessions: list, goal: dict, unit: str, today,
 
 def _build_daily_workouts(all_rows: list, ctx: dict,
                            warmup_eligible: Optional[frozenset] = None,
-                           ex_alltime_max_map: Optional[dict] = None) -> list:
+                           ex_alltime_max_map: Optional[dict] = None,
+                           ontology: Optional[dict] = None) -> list:
     by_date: dict = defaultdict(list)
     for row in all_rows: by_date[row["date"]].append(row)
     daily = []
@@ -2020,8 +2058,7 @@ def _build_daily_workouts(all_rows: list, ctx: dict,
             bar_weight_lbs = _get_bar_weight_lbs(ctx, ex_name, training_date)
             _ex_is_kg      = _is_kg_native(ctx, ex_name, training_date)
             bar_weight     = bar_weight_lbs / 2.2046 if _ex_is_kg else bar_weight_lbs
-            category   = CATEGORY_NAMES.get(ex_rows[0]["category_id"],
-                                             f"Cat_{ex_rows[0]['category_id']}")
+            category   = resolve_category(ex_rows[0]["category_id"], ex_name, ontology)
             ex_sets = [{"set_id":           r["set_id"],
                         "set_db_id":         r["set_id"],   # training_log._id; comment bound by id
                         "weight":            _recover_typed_weight(r["metric_weight"], offset),
@@ -2324,7 +2361,8 @@ def _compute_alltime_summary(all_dates: list, alltime_rows: list,
     }
 
 
-def _compute_exercise_lifecycle(lifecycle_rows: list, end_date: str) -> dict:
+def _compute_exercise_lifecycle(lifecycle_rows: list, end_date: str,
+                                 ontology: Optional[dict] = None) -> dict:
     today = datetime.strptime(end_date, "%Y-%m-%d").date()
     lifecycle = []
     for row in lifecycle_rows:
@@ -2334,7 +2372,8 @@ def _compute_exercise_lifecycle(lifecycle_rows: list, end_date: str) -> dict:
                   "dormant"   if days_inactive >= DORMANT_DAYS   else "active")
         lifecycle.append({
             "exercise_name":   row["exercise_name"],
-            "category":        CATEGORY_NAMES.get(row["category_id"], "Other"),
+            "category":        resolve_category(row["category_id"],
+                                                row["exercise_name"], ontology),
             "category_id":     row["category_id"],
             "first_date":      row["first_date"],
             "last_date":       row["last_date"],
@@ -2584,6 +2623,203 @@ def _compute_muscle_group_summary(exercise_results: list) -> list:
     return summary
 
 
+def _compute_muscle_ontology_summary(
+    alltime_sessions_by_ex: dict,
+    ontology:               dict,
+    start_str:              str,
+    end_str:                str,
+    first_training_date:    Optional[str] = None,
+    pending_names:          Optional[frozenset] = None,
+) -> dict:
+    """
+    Per-MUSCLE working-set counts, from the muscle ontology rather than the
+    single FitNotes category. This is the section that makes coverage
+    ("nothing touched the erectors in 90 days") answerable at all.
+
+    Pure — the ontology arrives as a plain dict via the bundle.
+
+    WHY SETS AND NOT VOLUME: volume would drag in the lbs/kg two-frame problem
+    that muscle_group_summary has to carry through every field (a group mixing
+    kg-native and lbs-typed exercises must never add the two). Set counts are
+    frame-free, and coverage and ranking are exactly the questions sets answer.
+
+    WHY TWO COLUMNS AND NEVER A BLEND: if a secondary counted as some fraction of
+    a set, the mostly-secondary muscles (rear delts, erectors, forearms) would sit
+    permanently at the bottom of every ranking — an artifact of the weighting
+    constant, not a training gap. primary_sets and secondary_sets are reported
+    side by side and are never summed into one number anywhere.
+
+    ROLLUP: a muscle's count is its own edges plus everything beneath it, and an
+    exercise is counted ONCE per muscle no matter how many of its edges land in
+    that subtree (mapping a lift to both Triceps and Triceps Long Head must not
+    double the Triceps count). Where one exercise reaches the same muscle both
+    primarily and secondarily — Deadlift reaches Back via Erectors (primary) and
+    via Lats (secondary) — PRIMARY WINS, so no set is counted in both columns.
+
+    ZERO COVERAGE is gated on REACHABILITY: only a muscle some exercise in the
+    store can actually fill may be reported as untouched. A muscle nothing maps
+    to is permanently 0 regardless of training, and stating that as a fact would
+    be a false claim about the user rather than a true one about the data.
+    """
+    if not ontology or not ontology.get("muscles") or not ontology.get("edges"):
+        return {}
+
+    muscles   = ontology["muscles"]
+    ancestors = ontology["ancestors"]
+    reachable = ontology.get("reachable", frozenset())
+
+    start_dt = datetime.strptime(start_str, "%Y-%m-%d").date()
+    end_dt   = datetime.strptime(end_str,   "%Y-%m-%d").date()
+    span     = (end_dt - start_dt).days
+    prior_end_dt   = start_dt - timedelta(days=1)
+    prior_start_dt = prior_end_dt - timedelta(days=span)
+    prior_start, prior_end = (prior_start_dt.strftime("%Y-%m-%d"),
+                              prior_end_dt.strftime("%Y-%m-%d"))
+
+    counts: dict = defaultdict(lambda: {
+        "primary_sets": 0, "secondary_sets": 0, "limiting_sets": 0,
+        "prior_primary_sets": 0, "prior_secondary_sets": 0,
+        "prior_limiting_sets": 0,
+        "exercises": set(), "last_trained_date": None,
+    })
+    unmapped: dict     = {}   # db name -> working sets in window
+    unattributed: dict = {}   # db name -> working sets in window (cardio, by design)
+    counted: set       = set()  # db names that reached at least one muscle in-window
+
+    for ex_name, sessions in (alltime_sessions_by_ex or {}).items():
+        eid = _resolve_alias(ontology, ex_name)
+
+        # Which muscles this exercise reaches, per role, ancestors included.
+        # Routed EXPLICITLY on all three roles. This was
+        #     target = primary_ids if role == "primary" else secondary_ids
+        # which silently swept every non-primary role into the secondary bucket —
+        # so a 'limiting' edge would have been counted as training volume, the
+        # exact thing the role exists to prevent.
+        primary_ids: set = set()
+        secondary_ids: set = set()
+        limiting_ids: set = set()
+        by_role = {"primary": primary_ids, "secondary": secondary_ids,
+                   "limiting": limiting_ids}
+        if eid is not None:
+            for edge in ontology["edges_by_exercise"].get(eid, []):
+                target = by_role.get(edge["role"])
+                if target is None:
+                    continue          # unknown role: count it nowhere, never guess
+                target |= ancestors.get(edge["muscle_id"], frozenset())
+        # One exercise reaching a muscle by several paths counts ONCE, at the
+        # strongest role: primary > secondary > limiting. A muscle genuinely
+        # trained is not demoted because another path merely leans on it.
+        secondary_ids -= primary_ids
+        limiting_ids -= primary_ids | secondary_ids
+
+        for s in sessions or []:
+            date_str = s.get("date")
+            sets     = s.get("working_sets_count") or 0
+            if not date_str or not sets:
+                continue
+            in_window = start_str <= date_str <= end_str
+            in_prior  = prior_start <= date_str <= prior_end
+            if not (in_window or in_prior):
+                continue
+
+            if eid is None:
+                if in_window:
+                    unmapped[ex_name] = unmapped.get(ex_name, 0) + sets
+                continue
+            if not primary_ids and not secondary_ids and not limiting_ids:
+                # In the store but deliberately edge-free (cardio).
+                if in_window:
+                    unattributed[ex_name] = unattributed.get(ex_name, 0) + sets
+                continue
+
+            for mid in primary_ids:
+                bucket = counts[mid]
+                bucket["primary_sets" if in_window else "prior_primary_sets"] += sets
+            for mid in secondary_ids:
+                bucket = counts[mid]
+                bucket["secondary_sets" if in_window else "prior_secondary_sets"] += sets
+            for mid in limiting_ids:
+                bucket = counts[mid]
+                bucket["limiting_sets" if in_window else "prior_limiting_sets"] += sets
+            if in_window:
+                counted.add(ex_name)
+                for mid in primary_ids | secondary_ids:
+                    bucket = counts[mid]
+                    bucket["exercises"].add(ex_name)
+                    if (bucket["last_trained_date"] is None
+                            or date_str > bucket["last_trained_date"]):
+                        bucket["last_trained_date"] = date_str
+
+    # An exercise already queued for approval is NOT the same as one nobody has
+    # ever mapped: the first is "waiting on you", the second is a gap in the
+    # graph. Both stay excluded from every count; only the wording differs.
+    pending_names = pending_names or frozenset()
+    pending = {n: s for n, s in unmapped.items() if n in pending_names}
+    unmapped = {n: s for n, s in unmapped.items() if n not in pending_names}
+
+    rows, zero_coverage = [], []
+    for mid in reachable:
+        m = muscles[mid]
+        c = counts.get(mid)
+        row = {
+            "muscle":     m["name"],
+            "path":       ontology["path"][mid],
+            "size_class": m["size_class"],
+            "primary_sets":         c["primary_sets"]         if c else 0,
+            "secondary_sets":       c["secondary_sets"]       if c else 0,
+            "limiting_sets":        c["limiting_sets"]        if c else 0,
+            "prior_primary_sets":   c["prior_primary_sets"]   if c else 0,
+            "prior_secondary_sets": c["prior_secondary_sets"] if c else 0,
+            "prior_limiting_sets":  c["prior_limiting_sets"]  if c else 0,
+            "exercise_count":       len(c["exercises"])       if c else 0,
+            "last_trained_date":    c["last_trained_date"]    if c else None,
+        }
+        rows.append(row)
+        # Coverage asks whether the muscle was TRAINED. Sets that merely leaned
+        # on it are not stimulus, so a muscle whose only edges are 'limiting' is
+        # still untouched — 266 sets of shrugs do not train the grip.
+        if row["primary_sets"] == 0 and row["secondary_sets"] == 0:
+            zero_coverage.append(m["name"])
+
+    rows.sort(key=lambda r: (-r["primary_sets"], -r["secondary_sets"], r["muscle"]))
+
+    # A prior window reaching back past the user's first ever session cannot be
+    # compared honestly — say so rather than letting "fewer sets than last
+    # quarter" mean "the quarter did not exist".
+    prior_complete = bool(first_training_date) and first_training_date <= prior_start
+
+    return {
+        "window":       {"start": start_str, "end": end_str, "days": span},
+        "prior_window": {"start": prior_start, "end": prior_end,
+                         "complete": prior_complete},
+        "muscles":       rows,
+        "zero_coverage": sorted(zero_coverage),
+        # Every in-window exercise lands in EXACTLY ONE of these four lists.
+        # That is what invariant G7 checks, and it is why a curation gap can
+        # never hide: an exercise missing from the map is named, not dropped.
+        "counted_exercises":      sorted(counted),
+        "unmapped_exercises":     sorted(unmapped),
+        "unmapped_sets":          sum(unmapped.values()),
+        "pending_review_exercises": sorted(pending),
+        "pending_review_sets":      sum(pending.values()),
+        "unattributed_exercises": sorted(unattributed),
+        "unattributed_sets":      sum(unattributed.values()),
+        "note": ("primary_sets, secondary_sets and limiting_sets are SEPARATE "
+                 "columns and must never be added together. limiting_sets is "
+                 "load the muscle HELD without being trained by it, so it is "
+                 "never training volume and never counts as coverage. A muscle's "
+                 "count already includes everything beneath it in the tree"),
+    }
+
+
+def _resolve_alias(ontology: dict, db_exercise_name: str):
+    """Exact (case-insensitive) FitNotes name -> ontology exercise id, or None.
+    Deliberately not fuzzy — see src/ontology.resolve_db_exercise."""
+    if not db_exercise_name:
+        return None
+    return ontology.get("aliases", {}).get(db_exercise_name.strip().lower())
+
+
 def _compute_rankings(exercise_results: list) -> dict:
     def safe(ex, *keys):
         obj = ex
@@ -2665,6 +2901,10 @@ def process_data(
     raw_goals          = bundle["goals"]
     lifecycle_rows     = bundle["lifecycle"]
     alltime_rows       = bundle["alltime_rows"]
+    # Reference domain knowledge, loaded at the fetch boundary (this module is
+    # pure). Also serves resolve_category's unknown-id fallback, so a custom
+    # FitNotes category resolves to a real region instead of "Category_15".
+    _ontology          = bundle.get("ontology") or {}
     total_training_day_count = bundle["total_training_day_count"]  # Bug 2.5: all-scope (317)
 
     # Derive period rows from the already-fetched alltime set
@@ -2717,7 +2957,8 @@ def process_data(
     # ── Daily workout view and supersets ──────────────────────────────────────
     daily_workouts    = _build_daily_workouts(filtered_rows, ctx,
                                               warmup_eligible=warmup_eligible,
-                                              ex_alltime_max_map=_ex_alltime_max)
+                                              ex_alltime_max_map=_ex_alltime_max,
+                                              ontology=_ontology)
     superset_patterns = _detect_supersets(filtered_rows)
 
     # ── Per-exercise ───────────────────────────────────────────────────────────
@@ -2728,6 +2969,12 @@ def process_data(
     alltime_cache: dict = defaultdict(list)
     for r in alltime_rows:
         alltime_cache[r["exercise_name"]].append(r)
+
+    # exercise name -> all-time built sessions, filled by BOTH passes below so it
+    # spans every exercise regardless of the muscle/name filter. The muscle
+    # ontology summary reads it: "which muscles got zero work" has to be answered
+    # across the whole log, never narrowed to whatever the question named.
+    _alltime_sessions_by_ex: dict = {}
 
     exercise_results = []
     end_date_obj = datetime.strptime(end_str, "%Y-%m-%d").date()
@@ -2747,7 +2994,7 @@ def process_data(
     for ex_name, ex_rows in sorted(by_exercise.items()):
         if not ex_rows: continue
         cat_id   = ex_rows[0]["category_id"]
-        category = CATEGORY_NAMES.get(cat_id, f"Category_{cat_id}")
+        category = resolve_category(cat_id, ex_name, _ontology)
         is_cardio = category == "Cardio"
         cardio_note = (
             "Cardio exercise. weight=0 and reps=0 on all entries — these carry no "
@@ -2821,6 +3068,11 @@ def process_data(
                                                        exercise_alltime_max=ex_alltime_max,
                                                        counterbalance_review_log=_raw_counterbalance_log)
                              if alltime_cache.get(ex_name) else sessions)
+        # Retained for the muscle-ontology summary, which needs BOTH the query
+        # window and the window before it (self-comparison) and must span every
+        # exercise, not just the filtered ones. Reuses sessions already built —
+        # no extra _build_sessions_from_rows call, no second DB read.
+        _alltime_sessions_by_ex[ex_name] = alltime_sessions
 
         # ── All-time PR-EVENT post-pass (replaces the is_personal_record flag) ────
         # Single source for every PR count: a session is a PR session iff its date is
@@ -2958,6 +3210,7 @@ def process_data(
             warmup_eligible=warmup_eligible,
             exercise_alltime_max=_ex_alltime_max.get(_ex_name, 0.0),
             counterbalance_review_log=None)
+        _alltime_sessions_by_ex[_ex_name] = _ex_sessions
         _ex_is_cardio = CATEGORY_NAMES.get(_rows[0]["category_id"]) == "Cardio"
         _pr_event_dates_by_ex[_ex_name] = _pr_event_dates(
             _ex_sessions, "kg" if _is_kg_native(ctx, _ex_name, end_str) else "lbs",
@@ -2999,13 +3252,19 @@ def process_data(
         "all_time_summary":         _safe_compute(_compute_alltime_summary,    all_training_dates, alltime_rows, today, ctx, pr_event_count, total_training_day_count, default={},  label="alltime_summary"),
         "muscle_group_summary":     mg_summary,
         "muscle_group_balance":     _safe_compute(_compute_muscle_group_balance, mg_summary,                               default={},  label="mg_balance"),
+        # Ontology-based per-MUSCLE counts. Sits ALONGSIDE muscle_group_summary,
+        # never replacing it: that section is the authoritative VOLUME source
+        # (bar-inclusive, per typed-unit frame) keyed by the FitNotes category,
+        # while this one is set COUNTS keyed by actual muscle. A missing or
+        # broken ontology store degrades to {} here and nothing else changes.
+        "muscle_ontology_summary":  _safe_compute(_compute_muscle_ontology_summary, _alltime_sessions_by_ex, _ontology, start_str, end_str, all_training_dates[0] if all_training_dates else None, bundle.get("pending_review") or frozenset(), default={}, label="muscle_ontology"),
         "training_consistency":     _safe_compute(_compute_training_consistency, all_training_dates, start_str, end_str,   default={},  label="training_consistency"),
         "day_of_week_patterns":     _safe_compute(_compute_day_of_week_patterns, all_training_dates, start_str, end_str,   default={},  label="dow_patterns"),
         "seasonal_patterns":        _safe_compute(_compute_seasonal_patterns,    all_training_dates,                       default=[],  label="seasonal_patterns"),
         "daily_workouts":           daily_workouts,
         "training_density":         _safe_compute(_compute_training_density,     daily_workouts,                           default={},  label="training_density"),
         "superset_patterns":        superset_patterns,
-        "exercise_lifecycle":       _safe_compute(_compute_exercise_lifecycle,   lifecycle_rows, end_str,                  default={},  label="exercise_lifecycle"),
+        "exercise_lifecycle":       _safe_compute(_compute_exercise_lifecycle,   lifecycle_rows, end_str, _ontology,       default={},  label="exercise_lifecycle"),
         "rankings":                 _safe_compute(_compute_rankings,             exercise_results,                         default={},  label="rankings"),
         "bodyweight":               _safe_compute(_process_bodyweight,           period_bw_entries,                        default={"entries": [], "trend": "no_data", "current_kg": None}, label="bodyweight"),
         "goals":                    goal_projs,

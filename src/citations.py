@@ -74,7 +74,7 @@ _LIST_COLLECTIONS = {
 _DICT_SECTIONS = frozenset({
     "all_time_summary", "muscle_group_balance", "training_consistency",
     "day_of_week_patterns", "training_density", "exercise_lifecycle",
-    "rankings", "bodyweight",
+    "rankings", "bodyweight", "muscle_ontology_summary",
 })
 
 
@@ -148,12 +148,37 @@ def _mgb_distribution_view(section: dict) -> dict:
     return by_key
 
 
+def _muscle_ontology_view(section: dict) -> dict:
+    """muscle_ontology_summary.muscles = [{muscle, primary_sets, …}]
+    → {muscle: {<scalar field>: value}}, so a per-muscle set count is a citable
+    SCALAR. (Top-level scalars — unmapped_sets, unattributed_sets — stay on
+    dict_row, so muscle_ontology_summary|-|unmapped_sets is unchanged.)
+
+    Note what is NOT here, deliberately: there is no "lagging", "deficit", or
+    "needs_work" leaf anywhere in the section, so a judgement claim has nothing
+    to cite and the existing grounding stage rejects it. That is what enforces
+    the no-verdict rule — not a phrase blocklist."""
+    by_key: dict = {}
+    for e in (section or {}).get("muscles", []) or []:
+        if not isinstance(e, dict):
+            continue
+        name = e.get("muscle")
+        if name is None:
+            continue
+        d = by_key.setdefault(str(name), {})
+        for k, v in e.items():
+            if k != "muscle" and _is_scalar(v):
+                d[k] = v
+    return by_key
+
+
 # collection → (entity label for the schema, builder). The section value must be
 # a dict (rankings / exercise_lifecycle / muscle_group_balance all are).
 _ENTITY_VIEW_BUILDERS = {
-    "rankings":             ("exercise",      _rankings_view),
-    "exercise_lifecycle":   ("exercise",      _lifecycle_view),
-    "muscle_group_balance": ("muscle_group",  _mgb_distribution_view),
+    "rankings":                ("exercise",      _rankings_view),
+    "exercise_lifecycle":      ("exercise",      _lifecycle_view),
+    "muscle_group_balance":    ("muscle_group",  _mgb_distribution_view),
+    "muscle_ontology_summary": ("muscle",        _muscle_ontology_view),
 }
 
 

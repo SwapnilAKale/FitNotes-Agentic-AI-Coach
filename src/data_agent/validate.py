@@ -697,6 +697,50 @@ def _check_g6(package: dict, v: list) -> None:
                     f"level(s) present ({present}); expected exactly 1"))
 
 
+def _check_g7(package: dict, v: list) -> None:
+    """
+    G7 (soft) — MUSCLE VISIBILITY. Every exercise with logged sets in the window
+    must be visible somewhere in muscle_ontology_summary: counted against a
+    muscle, or listed in unmapped_exercises, or listed in unattributed_exercises
+    (cardio, by design). Nothing may be silently dropped.
+
+    This is deliberately NOT a conservation sum. One exercise legitimately
+    contributes its sets to several muscles at once (a deadlift reaches
+    hamstrings, glutes and erectors), so per-muscle counts do not add up to a
+    total and any such check would fire constantly. The honest invariant is
+    weaker and more useful: nothing is invisible.
+
+    Soft, because the section degrades to {} when the ontology store is missing —
+    that is a reference-data problem and must never block an answer about the
+    user's own training.
+    """
+    section = package.get("muscle_ontology_summary")
+    if not isinstance(section, dict) or not section:
+        return   # ontology absent/degraded — nothing to check
+
+    start_str = section.get("window", {}).get("start") or ""
+    end_str   = section.get("window", {}).get("end")   or ""
+    accounted = (set(section.get("counted_exercises")        or [])
+                 | set(section.get("unmapped_exercises")       or [])
+                 | set(section.get("pending_review_exercises") or [])
+                 | set(section.get("unattributed_exercises")   or []))
+
+    for ex in package.get("exercises", []):
+        name = ex.get("name")
+        if not name or name in accounted:
+            continue
+        has_window_sets = any(
+            start_str <= (s.get("date") or "") <= end_str
+            and (s.get("working_sets_count") or 0) > 0
+            for s in (ex.get("sessions") or []))
+        if has_window_sets:
+            v.append(_soft("G7",
+                f"{name}: has working sets between {start_str} and {end_str} but "
+                f"appears in none of muscle_ontology_summary's counted / unmapped "
+                f"/ pending_review / unattributed lists — its sets are invisible "
+                f"in the muscle view"))
+
+
 # ── Public entry point ────────────────────────────────────────────────────────
 
 def validate(package: dict) -> list:
@@ -739,5 +783,6 @@ def validate(package: dict) -> list:
     _check_g4(package, violations)             # G4
     _check_g5(package, violations)             # G5
     _check_g6(package, violations)             # G6
+    _check_g7(package, violations)             # G7 (muscle visibility)
 
     return violations

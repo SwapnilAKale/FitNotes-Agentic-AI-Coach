@@ -1,0 +1,40 @@
+id,name,parent_id,size_class
+1,Chest,,large
+2,Upper Chest,1,medium
+3,Mid Chest,1,medium
+4,Lower Chest,1,medium
+5,Back,,large
+6,Lats,5,large
+7,Traps,5,medium
+8,Upper Traps,7,medium
+9,Mid Traps,7,small
+10,Lower Traps,7,small
+11,Rhomboids,5,small
+12,Erectors,5,medium
+13,Teres Major,5,small
+14,Shoulders,,medium
+15,Front Delts,14,small
+16,Side Delts,14,small
+17,Rear Delts,14,small
+18,Arms,,
+19,Triceps,18,medium
+20,Triceps Long Head,19,medium
+21,Triceps Lateral Head,19,small
+23,Biceps,18,medium
+26,Brachialis,18,small
+27,Forearms,18,medium
+28,Wrist Flexors,27,small
+29,Wrist Extensors,27,small
+30,Brachioradialis,27,small
+31,Grip,27,small
+32,Legs,,large
+33,Quads,32,large
+34,Hamstrings,32,large
+35,Glutes,32,large
+36,Calves,32,medium
+37,Adductors,32,medium
+38,Hip Flexors,32,small
+39,Core,,medium
+40,Rectus Abdominis,39,medium
+41,Obliques,39,small
+42,Transverse Abdominis,39,small

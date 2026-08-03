@@ -1,0 +1,78 @@
+id,canonical_name,equipment,movement_pattern
+1,Dumbbell Skull Crusher,dumbbell,elbow extension
+2,Cable Triceps Extension,cable,elbow extension
+3,Seated Machine Curl,machine,elbow flexion
+4,Dumbbell Hammer Curl,dumbbell,elbow flexion
+5,Lat Pulldown,cable,vertical pull
+6,Seated Machine Fly,machine,horizontal adduction
+7,Flat Dumbbell Bench Press,dumbbell,horizontal push
+8,Reverse Cable Curl,cable,elbow flexion
+9,Incline Dumbbell Bench Press,dumbbell,incline push
+10,Smith Machine Shrug,smith,shrug
+11,Lateral Dumbbell Raise,dumbbell,lateral raise
+12,Machine Wrist Extension,machine,wrist extension
+13,Rear Delt Machine Fly,machine,horizontal abduction
+14,Decline Dumbbell Bench Press,dumbbell,decline push
+15,Leg Extension Machine,machine,knee extension
+16,Behind the Back Wrist Curl,barbell,wrist flexion
+17,Hamstring Curl Machine,machine,knee flexion
+18,Seated Narrow V Shaped Row,cable,horizontal pull
+19,Narrow Reverse Grip Lat Pulldown,cable,vertical pull
+20,Barbell Upright Row,barbell,upright row
+21,Cable Curl,cable,elbow flexion
+22,Wide Grip Cable Row,cable,horizontal pull
+23,Seated Dumbbell Press,dumbbell,vertical push
+24,Sumo Squat,barbell,squat
+25,Reverse Grip Lat Pulldown,cable,vertical pull
+26,Barbell Curl,barbell,elbow flexion
+27,Dumbbell Pullover,dumbbell,pullover
+28,Leg Press,machine,squat
+29,Walking,bodyweight,cardio
+30,Overhead Press,barbell,vertical push
+31,Deadlift,barbell,hinge
+32,Reverse EZ-Bar Curl,ez-bar,elbow flexion
+33,Farmers Walk,dumbbell,carry
+34,Dumbbell Squat,dumbbell,squat
+35,Smith Machine Bench Press,smith,horizontal push
+36,Hand Gripper,other,grip
+37,Cable Face Pull,cable,horizontal abduction
+38,T-Bar Barbell Row,barbell,horizontal pull
+39,Dumbbell Curl,dumbbell,elbow flexion
+40,Narrow V Shaped Vertical Lat Pulldown,machine,vertical pull
+41,Decline Smith Machine Press,smith,decline push
+42,Smith Machine Squat,smith,squat
+43,Barbell Calf Raise,barbell,calf raise
+44,Incline Smith Machine Press,smith,incline push
+45,Single Hand Dumbbell Row,dumbbell,horizontal pull
+46,Close Grip Smith Machine Bench Press,smith,horizontal push
+47,EZ-Bar Curl,ez-bar,elbow flexion
+48,Cycling,machine,cardio
+49,Treadmill,machine,cardio
+50,Front Dumbbell Raise,dumbbell,front raise
+51,Dumbbell Wrist Curl,dumbbell,wrist flexion
+52,Dumbbell Shrug,dumbbell,shrug
+53,Dumbbell Hold,dumbbell,static hold
+54,Dead Hang,bodyweight,static hold
+55,Barbell Row,barbell,horizontal pull
+56,Pull Up,bodyweight,vertical pull
+57,Machine Chest Press,machine,horizontal push
+58,Lying Hip Thrust,bodyweight,hip extension
+59,Cable Overhead Triceps Extension,cable,elbow extension
+60,Cable Lat Pull with EZ Bar,cable,vertical pull
+61,Behind the Body Lateral Raise,dumbbell,lateral raise
+62,Assisted Pull Up,machine,vertical pull
+63,Decline Barbell Bench Press,barbell,decline push
+64,Push Up,bodyweight,horizontal push
+65,Flat Barbell Bench Press,barbell,horizontal push
+66,Calf Raise,bodyweight,calf raise
+67,Cable Lateral Raise,cable,lateral raise
+68,Ab-Wheel Rollout,other,anti-extension
+69,Cable Crunch,cable,trunk flexion
+70,Crunch,bodyweight,trunk flexion
+71,Crunch Machine,machine,trunk flexion
+72,Decline Crunch,bodyweight,trunk flexion
+73,Dragon Flag,bodyweight,anti-extension
+74,Hanging Knee Raise,bodyweight,hip flexion
+75,Hanging Leg Raise,bodyweight,hip flexion
+76,Plank,bodyweight,anti-extension
+77,Side Plank,bodyweight,anti-lateral-flexion

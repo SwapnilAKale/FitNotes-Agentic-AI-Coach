@@ -1,0 +1,175 @@
+exercise_id,muscle_id,role,source
+1,20,primary,movement-analysis; elbow extension with the humerus flexed -> long-head emphasis
+2,21,primary,movement-analysis; pushdown with the humerus at the side -> lateral/medial-head emphasis
+3,23,primary,movement-analysis
+4,30,primary,movement-analysis; neutral grip -> brachioradialis is a prime mover
+4,26,primary,movement-analysis; neutral grip -> brachialis is a prime mover
+4,23,secondary,movement-analysis
+5,6,primary,movement-analysis
+5,13,secondary,movement-analysis
+5,23,secondary,movement-analysis
+6,3,primary,movement-analysis
+6,15,secondary,movement-analysis
+7,3,primary,movement-analysis
+7,19,secondary,user-ruling R2; dumbbell press loads triceps significantly
+7,15,secondary,movement-analysis
+8,30,primary,movement-analysis; corrects FitNotes category (filed Forearms; it is elbow flexion)
+8,26,primary,movement-analysis; corrects FitNotes category (filed Forearms; it is elbow flexion)
+8,29,secondary,movement-analysis; pronated grip loads the wrist extensors isometrically
+9,2,primary,movement-analysis
+9,15,secondary,user-ruling R2; the shoulder can be the LIMITING factor on incline; failure can precede chest failure
+9,19,secondary,user-ruling R2
+10,8,primary,movement-analysis; corrects FitNotes category (filed Back; scapular elevation is upper traps)
+10,31,secondary,movement-analysis; load is held in the hands throughout
+11,16,primary,movement-analysis
+12,29,primary,movement-analysis
+13,17,primary,movement-analysis
+13,11,secondary,movement-analysis
+13,9,secondary,movement-analysis
+14,4,primary,movement-analysis
+14,19,secondary,user-ruling R2; decline is NOT shoulder-limited the way incline is
+15,33,primary,movement-analysis
+16,28,primary,movement-analysis
+17,34,primary,movement-analysis
+18,6,primary,movement-analysis
+18,9,primary,movement-analysis
+18,11,primary,movement-analysis
+18,23,secondary,movement-analysis
+19,6,primary,movement-analysis
+19,23,secondary,movement-analysis
+20,16,primary,movement-analysis
+20,8,primary,movement-analysis
+20,23,secondary,movement-analysis
+21,23,primary,movement-analysis
+22,9,primary,movement-analysis
+22,11,primary,movement-analysis
+22,17,primary,movement-analysis; wide grip shifts the row toward horizontal abduction
+22,6,secondary,movement-analysis
+22,23,secondary,movement-analysis
+23,15,primary,movement-analysis
+23,19,secondary,user-ruling R2; dumbbell press loads triceps significantly
+23,16,secondary,movement-analysis
+24,33,primary,movement-analysis
+24,35,primary,movement-analysis
+24,37,primary,movement-analysis; the wide stance is what distinguishes sumo from a conventional squat
+25,6,primary,movement-analysis
+25,23,secondary,movement-analysis
+26,23,primary,movement-analysis
+26,26,secondary,movement-analysis
+27,6,primary,movement-analysis; lat vs pec emphasis is genuinely contested; both edges kept deliberately
+27,3,secondary,movement-analysis; lat vs pec emphasis is genuinely contested
+28,33,primary,movement-analysis
+28,35,secondary,movement-analysis
+28,34,secondary,movement-analysis
+30,15,primary,movement-analysis
+30,19,secondary,movement-analysis
+30,16,secondary,movement-analysis
+31,12,primary,user-ruling R2; deadlift works the whole back
+31,35,primary,user-ruling R2; deadlift works glutes
+31,34,primary,user-ruling R2; deadlift works hamstrings
+31,8,secondary,user-ruling R2; deadlift works the whole back
+31,6,secondary,user-ruling R2; deadlift works the whole back
+31,31,secondary,movement-analysis; the bar is held throughout
+31,33,secondary,movement-analysis
+32,30,primary,movement-analysis; pronated grip -> brachioradialis is a prime mover
+32,26,primary,movement-analysis; pronated grip -> brachialis is a prime mover
+32,29,secondary,movement-analysis
+33,31,primary,movement-analysis
+33,8,secondary,movement-analysis
+33,12,secondary,movement-analysis
+33,41,secondary,movement-analysis; unilateral-loaded carry resists lateral flexion
+34,33,primary,movement-analysis
+34,35,secondary,movement-analysis
+34,31,secondary,movement-analysis; the dumbbells are held throughout
+35,3,primary,movement-analysis
+35,19,secondary,movement-analysis
+35,15,secondary,movement-analysis
+36,31,primary,movement-analysis
+37,17,primary,movement-analysis
+37,9,primary,movement-analysis
+37,10,secondary,movement-analysis
+37,11,secondary,movement-analysis
+38,6,primary,movement-analysis
+38,9,primary,movement-analysis
+38,11,primary,movement-analysis
+38,23,secondary,movement-analysis
+38,12,secondary,movement-analysis; the unsupported torso is held against gravity
+39,23,primary,movement-analysis
+40,6,primary,movement-analysis
+40,23,secondary,movement-analysis
+41,4,primary,movement-analysis
+41,19,secondary,movement-analysis
+42,33,primary,movement-analysis
+42,35,secondary,movement-analysis
+43,36,primary,movement-analysis
+44,2,primary,movement-analysis
+44,15,secondary,user-ruling R2; the shoulder can be the LIMITING factor on incline
+44,19,secondary,movement-analysis
+45,6,primary,movement-analysis
+45,9,primary,movement-analysis
+45,23,secondary,movement-analysis
+46,19,primary,movement-analysis; the close grip makes elbow extension the limiting action
+46,3,secondary,movement-analysis
+46,15,secondary,movement-analysis
+47,23,primary,movement-analysis
+47,30,secondary,movement-analysis; the semi-supinated EZ grip recruits brachioradialis
+50,15,primary,movement-analysis
+51,28,primary,movement-analysis
+52,8,primary,movement-analysis
+52,31,secondary,movement-analysis; load is held in the hands throughout
+53,31,primary,movement-analysis
+53,8,secondary,movement-analysis
+54,31,primary,movement-analysis
+54,6,secondary,movement-analysis; the hanging shoulder is held in extension
+55,6,primary,movement-analysis
+55,9,primary,movement-analysis
+55,11,primary,movement-analysis
+55,23,secondary,movement-analysis
+55,12,secondary,movement-analysis; the unsupported torso is held against gravity
+56,6,primary,movement-analysis
+56,13,secondary,movement-analysis
+56,23,secondary,movement-analysis
+56,9,secondary,movement-analysis
+57,3,primary,movement-analysis
+57,19,secondary,movement-analysis
+57,15,secondary,movement-analysis
+58,35,primary,movement-analysis
+58,34,secondary,movement-analysis
+59,20,primary,movement-analysis; the overhead position stretches the long head
+60,6,primary,movement-analysis
+60,23,secondary,movement-analysis
+61,16,primary,movement-analysis
+62,6,primary,movement-analysis
+62,13,secondary,movement-analysis
+62,23,secondary,movement-analysis
+63,4,primary,movement-analysis
+63,19,secondary,movement-analysis
+64,3,primary,movement-analysis
+64,19,secondary,movement-analysis
+64,15,secondary,movement-analysis
+65,3,primary,movement-analysis
+65,19,secondary,movement-analysis
+65,15,secondary,movement-analysis
+66,36,primary,movement-analysis
+67,16,primary,movement-analysis
+68,40,primary,movement-analysis
+68,42,secondary,movement-analysis
+68,6,secondary,movement-analysis
+69,40,primary,movement-analysis
+69,41,secondary,movement-analysis
+70,40,primary,movement-analysis
+71,40,primary,movement-analysis
+72,40,primary,movement-analysis
+72,38,secondary,movement-analysis
+73,40,primary,movement-analysis
+73,42,primary,movement-analysis
+74,40,primary,movement-analysis
+74,38,primary,movement-analysis
+74,31,secondary,movement-analysis; the body hangs from the hands throughout
+75,40,primary,movement-analysis
+75,38,primary,movement-analysis
+75,31,secondary,movement-analysis; the body hangs from the hands throughout
+76,42,primary,movement-analysis
+76,40,secondary,movement-analysis
+77,41,primary,movement-analysis
+77,42,secondary,movement-analysis

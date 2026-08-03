@@ -23,6 +23,10 @@ from src.shared.sql_executor import run_query as _run_ro_query
 # (_weight_aggregate_reason) stays separate from sanitizing — it is a policy
 # guard, not text cleanup.
 from src.shared.sql_sanitize import sanitize_sql
+# Muscle ontology (ontology/*.csv). Loaded here — the I/O boundary — and carried
+# in the bundle, because process.py may not touch the filesystem. load_ontology()
+# is cached and never raises; a broken store yields an empty ontology.
+from src.ontology import load_ontology
 
 logger = logging.getLogger(__name__)
 
@@ -235,6 +239,11 @@ def fetch_data(end_str: str) -> dict:
                          308-basis); drives streaks/gaps/consistency/dow/seasonal/pr-context
         total_training_day_count — distinct training dates, ALL scope (Time/Place/Neck
                          included, 317-basis); the headline training-day count only
+        ontology      — the muscle ontology (reference domain knowledge, read from
+                         ontology/*.csv, NOT from the DB). It rides in the bundle
+                         because process.py is pure — no open(), no os.environ —
+                         so every file read has to happen at this boundary, the
+                         same discipline the sqlite reads already follow.
     """
     conn = _get_connection()
     try:
@@ -246,9 +255,26 @@ def fetch_data(end_str: str) -> dict:
             "lifecycle":       _fetch_exercise_lifecycle(conn),
             "training_dates":  training_dates,
             "total_training_day_count": _fetch_total_training_day_count(conn),
+            "ontology":        load_ontology(),
+            "pending_review":  _load_pending_names(),
         }
     finally:
         conn.close()
+
+
+def _load_pending_names() -> frozenset:
+    """Exercise names sitting in the ontology review queue. Read here (the I/O
+    boundary) so the package can tell 'waiting for your approval' apart from
+    'nobody has ever mapped this' — a materially different thing to tell the
+    user. Never raises: a missing queue just means nothing is pending."""
+    try:
+        from src.ontology_reconcile import load_pending
+        return frozenset((r.get("db_exercise_name") or "").strip()
+                         for r in load_pending()
+                         if (r.get("db_exercise_name") or "").strip())
+    except Exception as exc:
+        logger.warning("[data_agent] pending review queue unreadable (%s)", exc)
+        return frozenset()
 
 
 # ── Dynamic SQL fallback ───────────────────────────────────────────────────────
