@@ -302,13 +302,19 @@ def test_classify_prompt_has_recall_route():
     assert '"recall"' in _CLASSIFY_SYSTEM        # schema enum
     assert "RECALL —" in _CLASSIFY_SYSTEM        # the route section
     assert "restate" in low                       # its core verb
-    assert "choose analytical" in low             # tie-break stays analytical
+    # Tie-break stays analytical. The recall-vs-analytical clause is no longer
+    # local to this section — it is one of the pairs named under the single
+    # global default, which must still name this pair explicitly.
+    assert "analytical vs. recall" in _CLASSIFY_SYSTEM
+    assert "route analytical" in low
 
 
 def test_classify_prompt_has_display_intent():
     from src.coordinator import _CLASSIFY_SYSTEM
     assert "display_intent" in _CLASSIFY_SYSTEM     # schema + param
-    assert "DISPLAY phrasing" in _CLASSIFY_SYSTEM   # its definition (lean TRUE on display phrasing)
+    # Its definition: lean TRUE whenever display phrasing is present.
+    assert "display phrasing is present" in _CLASSIFY_SYSTEM
+    assert "Lean TRUE" in _CLASSIFY_SYSTEM
 
 
 # ── Prompt / docstring presence for the flip ────────────────────────────────
@@ -316,18 +322,27 @@ def test_classify_prompt_has_display_intent():
 def test_classify_prompt_default_is_analytical():
     from src.coordinator import _CLASSIFY_SYSTEM
     low = _CLASSIFY_SYSTEM.lower()
-    assert 'default to "analytical"' in _CLASSIFY_SYSTEM
-    assert "positive allowlist" in low
-    # operational now constrained to TWO cases (writes + research/RAG); session
-    # display moved to the analytical lane (stage 3 boundary flip).
+    assert "route analytical" in low                 # the default's direction
+    assert "single default" in low                   # ...and it is the ONLY one
+    # Operational is a closed allowlist, not a "does this need a tool?" test:
+    # the capability framing is what leaked reads into the operational lane.
+    assert "closed list of exactly two cases" in low
     assert "research" in low
     assert "two cases" in low
-    # session display is now ANALYTICAL (single-line fragment, robust to wrapping)
-    assert "session display — single-exercise or" in low
+    assert "requires mcp tools" not in low
+    # Session display is ANALYTICAL. Asserted STRUCTURALLY — it must appear in
+    # the analytical block, ahead of the OPERATIONAL header — rather than by
+    # matching a sentence, so a rewording cannot silently move the lane.
+    a_at = low.index("analytical — any read")
+    o_at = low.index("operational — a closed list")
+    assert a_at < low.index("session display") < o_at
     # the old operational allowlist phrasing for display is gone
     assert "specific-date session display" not in low
-    # medical is a read → analytical by default, never out_of_scope
-    assert "NEVER out_of_scope" in _CLASSIFY_SYSTEM
+    # Medical is a read → analytical by default, never out_of_scope. Asserted
+    # structurally too: the carve-out must sit in the ANALYTICAL block, since
+    # that is what makes it a lane rule rather than a scope footnote.
+    assert "never out_of_scope" in low
+    assert a_at < low.index("medical") < o_at
 
 
 def test_module_docstring_rationale_flipped():

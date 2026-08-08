@@ -105,18 +105,47 @@ TRANSIENT_BACKOFF      = 5    # s — 503 carries no retryDelay; fixed small wai
 # answer analytical reads). So when ambiguous between "question about writing"
 # and "command to write", we prefer NOT firing (let the classifier decide).
 
-# Interrogative / modal-coaching phrasing → this is a QUESTION, not a command.
-# Matched anywhere (a polite "..., should I add a set?" is still a question).
-_WRITE_QUESTION_RE = re.compile(
+# ── THE question test — one detector, used everywhere ─────────────────────────
+# There used to be two of these. _WRITE_QUESTION_RE gated the write pre-guard;
+# _LOG_TAIL_QUESTION_RE (added later, for /log tail peeling) existed because the
+# first one could not recognize "Also, how is my back progressing" — and the two
+# were then left to disagree. Measured at the time of merging, they returned
+# different answers for 4 of 7 ordinary coaching questions: the write-guard copy
+# said "am I overtraining" and "how has my squat gone" were NOT questions, though
+# both are verbatim analytical examples in _CLASSIFY_SYSTEM.
+#
+# This is their union, and it is the only question test in the module. Three
+# shapes count as a question:
+#   (1) a question mark anywhere;
+#   (2) an interrogative/modal lead at the start, optionally behind a connector
+#       ("Also, how is my back progressing" — no "?" and not sentence-initial);
+#   (3) modal-coaching phrasing anywhere ("..., should I add a set").
+_QUESTION_CONNECTOR = (
+    r"(?:also,?\s+|and\s+also,?\s+|btw,?\s+|by\s+the\s+way,?\s+"
+    r"|oh\s+and\s+|plus,?\s+)?"
+)
+_QUESTION_RE = re.compile(
     r"(?i)(?:"
-    r"\?"                                                       # any question mark
-    r"|\bshould\s+i\b|\bcan\s+i\b|\bcould\s+i\b|\bmay\s+i\b"
+    r"\?"                                                       # (1)
+    r"|^\s*" + _QUESTION_CONNECTOR +                            # (2)
+    r"(?:how|what|why|when|where|which|who|is|are|am|do|does|did"
+    r"|was|were|can|could|should|would|will)\b"
+    r"|\bshould\s+i\b|\bcan\s+i\b|\bcould\s+i\b|\bmay\s+i\b"    # (3)
     r"|\bdo\s+i\b|\bwould\s+it\b|\bdo\s+you\s+think\b"
     r"|\bis\s+it\s+(?:ok|okay|fine|worth|better|good|bad|safe)\b"
     r"|\bwhen\s+should\b|\bhow\s+(?:much|many|often|do|should|can)\b"
-    r"|^\s*(?:is|are|do|does|did|was|were|will|what|why|when|where|which|who)\b"
     r")"
 )
+
+
+def _is_question(message: str) -> bool:
+    """True when the message reads as a question rather than a command.
+
+    THE single question test for the module: the write pre-guard, the /log tail
+    peeler, and the /log carry test all call this, so they can no longer drift
+    apart into three different answers for the same sentence.
+    """
+    return bool(message) and bool(_QUESTION_RE.search(message))
 
 # Weight×reps / sets×reps / unit shorthand — a strong signal a write is being
 # DICTATED ("bench 100x5", "3 sets", "80kg", "12 reps").
@@ -127,15 +156,18 @@ _WRITE_QUANTITY = (
     r"|\d+\s*(?:lbs?|kgs?|pounds?|kilos?)\b"         # 100 lbs, 80kg
     r")"
 )
+# The one compiled form of the above. Shared by the write pre-guard's narration
+# test and by the /log tail peeler — both ask the same question ("does this text
+# carry actual set/rep/weight data?") and must not answer it differently.
+_QUANTITY_RE = re.compile(r"(?i)" + _WRITE_QUANTITY)
 
 # Imperative writes that DO fire (only after the question guard says "not a
-# question"). Three forms:
+# question"). Three forms, each anchored by an explicit write verb:
 #   (A) "set a goal" / "set goal …"
 #   (B) write verb + quantity shorthand → bare "log bench 100x5", "record squat
 #       80kg x5", "add 3 sets of deadlift" (the #8 false-negatives)
 #   (C) write verb + an explicit data noun → "delete my deadlift goal",
 #       "log today's workout", "update my last set"
-#   (D) "I did … today/yesterday/…" narration of a completed session
 # NOTE: standalone "weight" is deliberately NOT a (C) noun — "add weight" is the
 # canonical coaching phrasing ("should I add weight"), so it must not anchor a write.
 _WRITE_IMPERATIVE_RE = re.compile(
@@ -145,22 +177,58 @@ _WRITE_IMPERATIVE_RE = re.compile(
     r".{0,40}?" + _WRITE_QUANTITY +                                        # (B)
     r"|\b(?:log|record|save|add|delete|remove|update|change|correct)\b"
     r".{0,50}\b(?:workout|sets?|reps?|goal|bodyweight|exercise|session)\b" # (C)
-    r"|\bi\s+did\b.{0,80}\b(?:today|yesterday|this\s+morning|this\s+week)\b"  # (D)
     r")"
 )
+
+# (D) Narration of a completed session — "I did … today/yesterday/…". Split out
+# from the imperative forms above because it is a materially WEAKER signal: it
+# carries no write verb, so on its own it cannot tell "I did chest and triceps
+# today" (a session the user wants logged) from "I did shrugs today and my grip
+# gave out" (a complaint about how a lift went, which _CLASSIFY_SYSTEM L414
+# routes analytical).
+#
+# RESOLVED — ledger row E. "I did chest and triceps today" (a session to log) and
+# "I did shrugs today and my grip gave out" (a complaint to explain) are the same
+# shape; no regex separates them, and this one used to call both writes and force
+# the verdict through, making _CLASSIFY_SYSTEM's rule unreachable. So narration
+# no longer DECIDES — it only HINTS. The classifier, which can read the
+# difference, decides; the hint still hard-forces operational when the classify
+# call FAILS, so a write is never lost to an error. See _write_intent_form.
+_WRITE_NARRATION_RE = re.compile(
+    r"(?i)\bi\s+did\b.{0,80}\b(?:today|yesterday|this\s+morning|this\s+week)\b"
+)
+
+# The two strengths of write signal. They differ in what they license, not just
+# in what they matched:
+#   "imperative" — an explicit write verb ("log", "delete", "set a goal"). The
+#                  user named the action, so this BINDS: the regex verdict wins
+#                  over the classifier (the long-standing write-safety rule).
+#   "narration"  — no write verb, just "I did … today". A hint only: it spends
+#                  the classify call and stands in on classify FAILURE, but a
+#                  successful classification overrules it.
+WRITE_FORM_IMPERATIVE = "imperative"
+WRITE_FORM_NARRATION  = "narration"
+
+
+def _write_intent_form(message: str) -> Optional[str]:
+    """Which write signal fired, or None. Question/modal phrasing wins over both
+    (precedence above): if the message reads as a question, no write signal
+    fires and the classifier decides."""
+    if not message or _is_question(message):
+        return None
+    if _WRITE_IMPERATIVE_RE.search(message):
+        return WRITE_FORM_IMPERATIVE
+    if _WRITE_NARRATION_RE.search(message):
+        return WRITE_FORM_NARRATION
+    return None
 
 
 def _is_write_intent(message: str) -> bool:
     """
-    True only for IMPERATIVE writes (commands to record data). Question/modal
-    phrasing wins (precedence above): if the message reads as a question, return
-    False so the classifier — not this pre-guard — decides the route.
+    True when ANY write signal fired — imperative or narration. Callers that
+    need to know whether the signal BINDS must ask _write_intent_form.
     """
-    if not message:
-        return False
-    if _WRITE_QUESTION_RE.search(message):
-        return False
-    return bool(_WRITE_IMPERATIVE_RE.search(message))
+    return _write_intent_form(message) is not None
 
 
 # Strips a single leading markdown header line ("### …") from a chunk answer.
@@ -188,18 +256,6 @@ _LOG_TRAILING_NOTE = (
     "(Noted your other question — ask it again after confirming this log.)"
 )
 
-# Tail-question test for _split_log_tail. Dedicated regex (NOT a change to
-# _WRITE_QUESTION_RE): "Also, how is my back progressing" has no "?", "how is"
-# isn't in _WRITE_QUESTION_RE's alternations, and the leading "Also" breaks its
-# ^ anchor. Optional connector, then an interrogative lead — or a "?" anywhere.
-_LOG_TAIL_QUESTION_RE = re.compile(
-    r"(?i)^\s*(?:also,?\s+|and\s+also,?\s+|btw,?\s+|by\s+the\s+way,?\s+"
-    r"|oh\s+and\s+|plus,?\s+)?"
-    r"(?:how|what|why|when|where|which|who|is|are|am|do|does|did"
-    r"|can|could|should|would|will)\b"
-    r"|\?"
-)
-_LOG_QUANTITY_RE = re.compile(r"(?i)" + _WRITE_QUANTITY)
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 
 
@@ -216,7 +272,7 @@ def _split_log_tail(text: str) -> tuple[str, bool]:
     keep = len(parts)
     while keep > 1:
         seg = parts[keep - 1]
-        if _LOG_TAIL_QUESTION_RE.search(seg) and not _LOG_QUANTITY_RE.search(seg):
+        if _is_question(seg) and not _QUANTITY_RE.search(seg):
             keep -= 1
         else:
             break
@@ -232,7 +288,7 @@ def _log_carry_unrelated(message: str) -> bool:
     Anything else ("yesterday", "3 sets of 12", "the dumbbell one") plausibly
     answers the pending logging clarification and joins the /log flow.
     """
-    return bool(_WRITE_QUESTION_RE.search(message)) or _filler_reply(message) is not None
+    return _is_question(message) or _filler_reply(message) is not None
 
 
 # ── Filler short-circuit (#5a) ────────────────────────────────────────────────
@@ -356,40 +412,21 @@ def _normalize_cardio_lock(raw: Optional[dict]) -> Optional[dict]:
 # ── Classification prompt ─────────────────────────────────────────────────────
 
 _CLASSIFY_SYSTEM = """
-You are a routing classifier for a fitness coaching AI.
+You are a routing classifier for a fitness coaching AI. Return JSON only.
 
-Classify each message as "analytical", "operational", or "recall". Return JSON only.
+A message contains one or more REQUESTS. Your job is to give every request a
+LANE and extract its parameters. The lane rules below define what a lane means
+for ONE request; they are the only lane rules, and they apply identically
+wherever you assign a lane — to the message as a whole (the top-level "route")
+and to each entry in "requests".
 
-ANALYTICAL — needs trend analysis, progression tracking, or pattern detection
-across multiple sessions. Requires computing statistics over training history.
+════ THE LANES ════
 
-  Examples → analytical:
-    "How is my Lat Pulldown progressing?"
-    "Why am I plateauing on bench?"
-    "How has my back training been over the last 3 months?"
-    "Am I overtraining?"
-    "Will I hit my Lat Pulldown goal?"
-    "What patterns do you see in my training?"
-    "How consistent have I been?"
-    "Which muscle groups am I neglecting?"
-    "Show me my last chest session"          (session display — muscle group)
-    "Show me my last Lat Pulldown session"   (session display — one exercise)
-    "How was my back ROM split in the last back session"  (category session display)
+ANALYTICAL — any READ of the user's own training data, and any coaching question
+about their training. One session or a whole history, terse or long ("my
+squat?", "Lat Pulldown PR" are analytical). This is where most messages belong.
 
-OPERATIONAL — use only for questions that require MCP tools:
-  - Write operations: logging, goal setting, corrections, deletions
-  - Research: fitness science questions
-
-  Examples → operational:
-    "Log today's workout"                 (write operation)
-    "Set a goal for 150 lbs on Lat Pulldown" (write operation)
-    "Fix my last set — it was 12 reps not 10" (correction)
-    "What does science say about training frequency?" (research)
-    "Delete my deadlift goal"             (write operation)
-
-  Route ANALYTICAL for any question the Data Agent can answer.
-  The Data Agent computes all of the following deterministically:
-
+  The Data Agent answers all of these deterministically:
     Personal records     — all-time PR, period PR, PR history
     Progression          — has weight or rep count changed over time
     Plateaus             — how long stuck, when stagnation started
@@ -407,28 +444,37 @@ OPERATIONAL — use only for questions that require MCP tools:
                            session, with full set breakdown, for ONE exercise
                            OR all exercises in a muscle group
 
-  Route OPERATIONAL only for things that require MCP tools:
-    Writes      — log workout, set goal, update set, delete anything
-    Research    — fitness science questions, what does science say
+  Also analytical: any MEDICAL or symptom question. A stated pain, injury, or
+  condition is in-domain training territory — never out_of_scope. (The coach's
+  own prompt handles the see-a-professional redirect and refuses only to
+  diagnose or treat.)
 
-RECALL — use ONLY when the message asks you to REPEAT or RESTATE a specific NUMBER
-or FIGURE you already gave earlier in this conversation — nothing more:
-    "what was that number you just mentioned?"     "what did you say again?"
-    "remind me what that percentage was"           "repeat the figure you gave"
-  This lane only re-quotes a value from [PREVIOUS TURNS]; it never looks anything up.
-  It is NOT recall — route ANALYTICAL — if the message asks you to EXPLAIN, IDENTIFY,
-  DESCRIBE, or INVESTIGATE anything, even when it points back at a prior mention
-  ("what was the same pain that re-occurred?", "what did that plateau mean?", "which
-  exercise was that?"), or asks for ANY new stat/PR/trend/date/volume ("and my squat?",
-  "what's my bench PR"). When unsure between recall and analytical, choose analytical.
+OPERATIONAL — a CLOSED list of exactly two cases. If a request is not one of
+these two, it is not operational:
+    1. WRITES — log a workout, set a goal, update or correct a set, delete
+       anything.  "Log today's workout" · "Set a goal for 150 lbs on Lat
+       Pulldown" · "Fix my last set — it was 12 reps not 10" · "Delete my
+       deadlift goal"
+    2. RESEARCH — fitness science questions.  "What does science say about
+       training frequency?"
 
-OUT_OF_SCOPE — refuse politely WITHOUT any tool, search, or analysis. Decide
-this by a FITNESS-CONNECTION test, NOT a keyword blocklist:
-  "Is this about fitness, training, nutrition-for-training, fitness
-   science/history, or the user's own training data?"
-  If yes → route analytical/operational as above. If no → route "out_of_scope".
+RECALL — ONLY to REPEAT or RESTATE a specific NUMBER or FIGURE you already gave
+earlier in this conversation:
+    "what was that number you just mentioned?"   "what did you say again?"
+    "remind me what that percentage was"         "repeat the figure you gave"
+  This lane re-quotes a value from [PREVIOUS TURNS]; it never looks anything up.
+  It is NOT recall if the message asks you to EXPLAIN, IDENTIFY, DESCRIBE, or
+  INVESTIGATE anything, even when it points back at a prior mention ("what was
+  the same pain that re-occurred?", "what did that plateau mean?", "which
+  exercise was that?"), or asks for ANY new stat/PR/trend/date/volume ("and my
+  squat?", "what's my bench PR").
 
-  IN SCOPE (route normally, NOT out_of_scope):
+OUT_OF_SCOPE — refuse politely, with no tool, search, or analysis. Decide by a
+FITNESS-CONNECTION test, NOT a keyword blocklist: "Is this about fitness,
+training, nutrition-for-training, fitness science/history, or the user's own
+training data?"
+
+  IN SCOPE — route by the lanes above, never out_of_scope:
    - The user's own logs / training data — any phrasing, even with no fitness
      words ("how many days have I trained excluding Sundays").
    - Fitness science, exercise physiology, and DEFINITIONS of fitness terms
@@ -437,9 +483,9 @@ this by a FITNESS-CONNECTION test, NOT a keyword blocklist:
      angle ("cook chicken keeping protein high", "good pre-workout meal", macros).
    - Fitness history & culture ("Ronnie Coleman's diet", "who won Mr. Olympia 1998").
    - Program design, splits, recovery, periodization, rest days.
-   - Training / rehab / mobility / warmups around a stated symptom (see MEDICAL).
+   - Anything medical: symptoms, pain, injury, rehab, mobility, warmups.
 
-  OUT OF SCOPE (route "out_of_scope"):
+  OUT OF SCOPE:
    - Coding / software / SQL-for-its-own-sake / tech support.
    - AI / technology topics, writing about AI models.
    - Politics, news, current events, geography, economics.
@@ -451,27 +497,38 @@ this by a FITNESS-CONNECTION test, NOT a keyword blocklist:
    - General cooking / recipes with NO training or nutrition angle.
    - Personal-life advice unrelated to training (relationships, career, finance).
 
-  When GENUINELY ambiguous, lean IN — a false refusal of a real fitness
-  question is worse than answering something borderline.
+════ THE WRITE BOUNDARY ════
+The one genuinely hard call, and the only thing that can judge it is you.
 
-MEDICAL questions are NEVER out_of_scope. A stated symptom, pain, or condition
-is in-domain training territory — route it analytical/operational as normal. The
-answer (governed by the coach's system prompt) gives training adaptations plus a
-see-a-professional redirect and refuses only to DIAGNOSE or TREAT. Never send a
-medical/symptom question to out_of_scope. A medical/symptom question is a
-read/coaching question → ANALYTICAL by the default below.
+A REPORT OF HOW A LIFT WENT IS ANALYTICAL, NOT A WRITE. "My grip gave out on
+shrugs", "I failed the last rep", "that felt heavy", "my squat stalled" describe
+training that ALREADY HAPPENED — they are the fatigue/failure questions named in
+the analytical list, and the user wants them EXPLAINED. Offering to save a note
+about a complaint is not an answer to it.
 
-DEFAULT: operational is a POSITIVE allowlist — route "operational" ONLY for the
-two cases listed above (writes/corrections/goals, and research/RAG), and
-"out_of_scope" only per the test above. Session display — single-exercise or
-muscle-group level — is ANALYTICAL.
-EVERYTHING ELSE is "analytical": every read, trend, stat, PR, volume, frequency,
-plateau, comparison, projection, and coaching question — including terse ones
-("my squat?", "Lat Pulldown PR"). When uncertain, default to "analytical". The
-analytical package is deterministic and validated (it hard-stops on integrity
-failure), whereas the operational hand-rolled-SQL read path is the riskier
-surface for a read.
+A SESSION REPORTED FOR THE RECORD IS A WRITE. "I did … today/yesterday" with NO
+complaint and NO outcome attached is the user telling you what to record — even
+with no logging verb and no numbers.
 
+The difference is the trailing clause, not the words "I did":
+    "I did chest and triceps today"              → operational (a session to log)
+    "I did 3x10 squats today"                    → operational (a session to log)
+    "log 3x10 shrugs at 60kg"                    → operational (a write)
+    "I did shrugs today and my grip gave out"    → analytical (explain it)
+    "I did legs yesterday and it destroyed me"   → analytical (explain it)
+    "my grip gave out on shrugs"                 → analytical (why, and what to do)
+A message that does BOTH ("I did 5 sets of squats yesterday and it felt awful")
+is TWO requests — a write and a question. Split it in "requests" below.
+
+════ WHEN YOU ARE UNSURE ════
+Route ANALYTICAL. This is the single default for every uncertainty on this page
+— analytical vs. operational, analytical vs. recall, in-scope vs. out_of_scope.
+Two reasons, and they point the same way: a false refusal of a real fitness
+question is worse than answering a borderline one, and the analytical package is
+deterministic and validated (it hard-stops on integrity failure) where the
+operational read path is hand-rolled SQL and the riskier surface for a read.
+
+════ CONTEXT ════
 If a [PREVIOUS TURNS] block is present, use it ONLY to resolve pronouns
 and follow-up references in the current message ("what about my squat?",
 "and over the last year?"). Classify and extract parameters for the
@@ -479,15 +536,17 @@ CURRENT MESSAGE, carrying over the topic from previous turns when the
 current message is an elliptical follow-up.
 
 PARAMETER EXTRACTION (analytical route only):
-  display_intent:    true ONLY when the message wants a session or day laid out
-                     set-by-set — explicit DISPLAY phrasing: "show me my last leg day",
-                     "what did I do on Monday", "lay out / breakdown of my last chest
-                     session", "how did that session go". Lean TRUE whenever such display
-                     phrasing is present (a real display question must keep its display).
-                     false for every stat / trend / PR / plateau / pain / volume / "why" /
-                     "when" question ("how has my Lat Pulldown progressed", "what was the
-                     same pain that re-occurred", "total back volume", "when did I first
-                     reach 145"). Default false.
+  display_intent:    a pure PHRASING test, independent of the lane: does the
+                     request ask for a session or day laid out set-by-set?
+                     true  — "show me my last leg day", "what did I do on Monday",
+                             "lay out / breakdown of my last chest session",
+                             "how did that session go". Lean TRUE whenever such
+                             display phrasing is present (a real display question
+                             must keep its display).
+                     false — every stat / trend / PR / plateau / volume / "why" /
+                             "when" question ("how has my Lat Pulldown progressed",
+                             "total back volume", "when did I first reach 145").
+                     Default false.
   exercise_names:    list of specific exercise names mentioned, or null
   muscle_groups:     muscle groups mentioned → map to exact names:
                      Back, Chest, Shoulders, Biceps, Triceps, Legs,
@@ -521,37 +580,33 @@ CUSTOM SQL (analytical route only):
   Custom SQL is for counts, dates, gaps, and patterns — never for
   reporting individual set weights, which the package already covers.
 
-DECOMPOSITION (the "requests" array):
-In ADDITION to all top-level fields, emit a "requests" array that partitions
-the message into its distinct requests. This is extra data only:
+════ THE "requests" ARRAY ════
+Everything above describes ONE request. Emit both scopes:
 
-  - The top-level fields (route, display_intent, exercise_names, muscle_groups,
-    query_period_days, rep_target, cardio_lock, needs_custom_sql,
-    custom_sql_intent) keep describing the WHOLE message exactly as specified
-    above. Do NOT change how you fill them.
-  - One entry per DISTINCT request. A request is distinct when it could be
-    answered/actioned on its own and asks for something different from its
-    siblings — e.g. an analysis question plus a logging instruction, or two
-    unrelated questions joined by "and"/"also".
-  - NEVER split a single request into artificial pieces. One question about
-    several exercises, periods, or stats is ONE request ("compare my squat and
-    bench over 3 months" → one entry with both exercise_names). Most messages
-    are a single request → the array has exactly ONE entry that mirrors the
-    top-level fields.
-  - Per entry:
+  - The top-level fields describe the WHOLE message.
+  - "requests" holds one entry per DISTINCT request, each carrying the same
+    fields for that request alone — the lane rules, the write boundary, the
+    unsure-default, PARAMETER EXTRACTION and CUSTOM SQL, applied to it. The
+    analytical-only fields take their defaults/null on operational, recall, and
+    out_of_scope entries.
+
+  A request is distinct when it could be answered or actioned on its own and
+  asks for something different from its siblings — an analysis question plus a
+  logging instruction, or two unrelated questions joined by "and"/"also".
+
+  NEVER split a single request into artificial pieces. One question about
+  several exercises, periods, or stats is ONE request ("compare my squat and
+  bench over 3 months" → one entry, both exercise_names). Most messages are a
+  single request, so the array usually has exactly ONE entry mirroring the
+  top-level fields.
+
+  Two fields exist only per entry:
       index:       0-based position in message order.
-      lane:        classify THIS request alone, using exactly the same rules
-                   as "route" above ("analytical" | "operational" | "recall" |
-                   "out_of_scope").
       intent_text: a self-contained restatement of this request. Resolve
-                   pronouns and elliptical references using the sibling
-                   requests and [PREVIOUS TURNS] ("is it progressing" after a
-                   squat question → "Is my squat progressing?"). Someone
-                   reading only intent_text must be able to answer it.
-      remaining fields: the same PARAMETER EXTRACTION and CUSTOM SQL rules as
-                   above, applied to this request only (analytical-lane fields
-                   take their defaults/null for operational, recall, and
-                   out_of_scope entries).
+                   pronouns and elliptical references using the sibling requests
+                   and [PREVIOUS TURNS] ("is it progressing" after a squat
+                   question → "Is my squat progressing?"). Someone reading only
+                   intent_text must be able to answer it.
 
 Return ONLY valid JSON, no preamble, no markdown fences:
 {
@@ -630,6 +685,20 @@ _CHUNK_PARAM_DEFAULTS = {
     "needs_custom_sql":  False,
     "custom_sql_intent": None,
 }
+
+
+def _is_mixed_lane_multi(params: dict) -> bool:
+    """True when params carries 2+ requests spanning 2+ lanes — the single
+    condition under which a turn executes per-chunk instead of whole.
+
+    ONE definition, three callers: both of the graph's conditional edges and the
+    write-hint distrust override. All three used to carry an inline copy (one of
+    them annotated "same test as _route_after_classify"), and the test decides
+    whether a turn keeps or drops its sibling chunks — not something to state
+    three times and hope they stay equal.
+    """
+    reqs = (params or {}).get("requests") or []
+    return len(reqs) >= 2 and len({c.get("lane") for c in reqs}) >= 2
 
 
 def _sanitize_requests(params: dict) -> None:
@@ -1570,6 +1639,7 @@ class Coordinator:
         # Stage-2 decision.
         fallback_write = False
         write_intent_hint = False
+        write_intent_hard = False
         params = None
         if log_boundary:
             params = {
@@ -1580,20 +1650,28 @@ class Coordinator:
                 "needs_custom_sql":  False,
                 "custom_sql_intent": None,
             }
-        elif _is_write_intent(question):
-            # Stage 3 (user-approved): a regex-caught write now SPENDS the
-            # classify call so a mixed analytical+write message decomposes
-            # into chunks. Write safety is preserved structurally: the write
-            # chunk still runs the operational lane with all its gates, and
-            # the conditional edge applies a DISTRUST OVERRIDE — if the
-            # classifier claims a single non-decomposable request (or fails
-            # to parse), the turn goes operational-whole exactly as before.
-            # Only the explicit /log boundary above stays classify-free.
-            fallback_write = True
-            write_intent_hint = True
-            # Regex-inferred write: the flow is this single message. The
-            # decomposed executor re-arms this per write CHUNK when it runs.
-            self._log_flow_turns = [question]
+        else:
+            form = _write_intent_form(question)
+            if form is not None:
+                # Stage 3 (user-approved): a regex-caught write SPENDS the
+                # classify call so a mixed analytical+write message decomposes
+                # into chunks. Write safety is preserved structurally: the write
+                # chunk still runs the operational lane with all its gates, and
+                # the DISTRUST OVERRIDE in _node_classify sends a
+                # non-decomposable turn operational-whole.
+                #
+                # Ledger row E: how far that override reaches now depends on
+                # WHICH form fired. An explicit write verb binds as it always
+                # did; verb-less narration only hints, because no regex can tell
+                # "I did chest and triceps today" from "I did shrugs today and
+                # my grip gave out" — the classifier can, so it decides.
+                # Only the explicit /log boundary above stays classify-free.
+                fallback_write = True
+                write_intent_hint = True
+                write_intent_hard = (form == WRITE_FORM_IMPERATIVE)
+                # Regex-inferred write: the flow is this single message. The
+                # decomposed executor re-arms this per write CHUNK when it runs.
+                self._log_flow_turns = [question]
 
         return {
             "question":          question,
@@ -1601,6 +1679,7 @@ class Coordinator:
             "trailing_note":     trailing_note,
             "fallback_write":    fallback_write,
             "write_intent_hint": write_intent_hint,
+            "write_intent_hard": write_intent_hard,
             "params":            params,
         }
 
@@ -1632,13 +1711,21 @@ class Coordinator:
         # behavior. A write must never die unparseable or leak analytical.
         if state.get("write_intent_hint"):
             reqs = params.get("requests") or []
-            decomposable = (len(reqs) >= 2
-                            and len({c.get("lane") for c in reqs}) >= 2)
-            if params.get("_parse_failed") or not decomposable:
+            decomposable = _is_mixed_lane_multi(params)
+            parse_failed = bool(params.get("_parse_failed"))
+            # A classify FAILURE always falls back to the regex verdict, whatever
+            # form fired: an errored call is no evidence, and a write must never
+            # be lost to one. With a successful classify, only the binding form
+            # (an explicit write verb) overrules it — verb-less narration defers,
+            # because the classifier is the only thing here that can tell a
+            # session-to-log from a complaint-to-explain (ledger row E).
+            if parse_failed or (state.get("write_intent_hard") and not decomposable):
                 params["route"] = "operational"
                 params.pop("_parse_failed", None)
-                logger.info("[decomposition] write-hint distrust override — "
-                            "operational-whole (%d chunk(s))", len(reqs))
+                logger.info(
+                    "[decomposition] write-hint distrust override — "
+                    "operational-whole (%d chunk(s), %s)", len(reqs),
+                    "classify failed" if parse_failed else "explicit write verb")
 
         # Parse-failure (#5b) and out_of_scope are routed by the conditional
         # edge on this node's output: unparseable input never builds a
@@ -2205,18 +2292,19 @@ class Coordinator:
         analytical simply won't write (the confirmation gate is operational-only),
         so it cannot corrupt data.
         """
+        # Built from the SAME defaults the success path applies below, so a
+        # failed classify hands downstream code the same SHAPE as a successful
+        # one. It used to omit display_intent/rep_target/cardio_lock, which made
+        # the failure dict a quietly different object — harmless only because
+        # every consumer happens to use .get() with a fallback.
         default = {
-            "route":              "analytical",
-            "exercise_names":     None,
-            "muscle_groups":      None,
-            "query_period_days":  90,
-            "needs_custom_sql":   False,
-            "custom_sql_intent":  None,
-            "requests":           None,
+            "route":     "analytical",
+            "requests":  None,
             # Marks an UNPARSEABLE/errored classify (vs. parsed-but-uncertain).
             # The caller (#5b) returns a cheap rephrase instead of running the
             # full analytical pipeline on garbage input.
-            "_parse_failed":      True,
+            "_parse_failed": True,
+            **_CHUNK_PARAM_DEFAULTS,
         }
         # Follow-up questions ("what about my squat?") are unclassifiable
         # without the previous turn — give the classifier a compact window.
@@ -2267,16 +2355,12 @@ class Coordinator:
                 ).strip()
 
             params = json.loads(raw)
-            # Ensure required keys are present (route defaults analytical — Step C flip)
-            params.setdefault("route",             "analytical")
-            params.setdefault("display_intent",    False)
-            params.setdefault("exercise_names",    None)
-            params.setdefault("muscle_groups",     None)
-            params.setdefault("query_period_days", 90)
-            params.setdefault("rep_target",        None)
-            params.setdefault("cardio_lock",       None)
-            params.setdefault("needs_custom_sql",  False)
-            params.setdefault("custom_sql_intent", None)
+            # Ensure required keys are present (route defaults analytical — Step C flip).
+            # The per-field defaults come from the one constant the per-chunk
+            # sanitizer also uses, so the flat and per-chunk shapes cannot drift.
+            params.setdefault("route", "analytical")
+            for _k, _v in _CHUNK_PARAM_DEFAULTS.items():
+                params.setdefault(_k, _v)
             _sanitize_requests(params)          # requests → None or fully valid
             _log_requests_divergence(params)    # log-only Stage-2 field data
             return params

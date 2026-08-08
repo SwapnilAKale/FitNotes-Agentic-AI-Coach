@@ -137,9 +137,13 @@ def test_classifier_prompt_has_out_of_scope_taxonomy():
     assert "OUT_OF_SCOPE" in _CLASSIFY_SYSTEM
     assert "out_of_scope" in _CLASSIFY_SYSTEM
     assert "FITNESS-CONNECTION test" in _CLASSIFY_SYSTEM
-    assert "lean IN" in _CLASSIFY_SYSTEM
+    # Ambiguity leans IN. This used to be a scope-local "lean IN" clause; it is
+    # now one of the cases under the single global default, which must both
+    # point at analytical and keep the reason the lean exists.
+    assert "false refusal of a real fitness" in _CLASSIFY_SYSTEM
+    assert "Route ANALYTICAL. This is the single default" in _CLASSIFY_SYSTEM
     # medical carve-out: medical is NOT out_of_scope
-    assert "MEDICAL questions are NEVER out_of_scope" in _CLASSIFY_SYSTEM
+    assert "MEDICAL" in _CLASSIFY_SYSTEM and "never out_of_scope" in _CLASSIFY_SYSTEM
     # in/out taxonomy markers
     assert "IN SCOPE" in _CLASSIFY_SYSTEM and "OUT OF SCOPE" in _CLASSIFY_SYSTEM
 

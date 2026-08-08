@@ -36,6 +36,7 @@ from __future__ import annotations
 from langgraph.graph import END, START, StateGraph
 from langgraph.runtime import Runtime
 
+from src.coordinator import _is_mixed_lane_multi
 from src.graph.persistence import get_saver
 from src.graph.state import CoordinatorState, GraphRunContext
 
@@ -76,10 +77,8 @@ def _route_after_entry(state: CoordinatorState) -> str:
         # A disambiguation-resume carries the FULL turn (requests intact). If it
         # is still a mixed-lane multi-chunk turn, it must re-enter the decomposed
         # dispatch — dispatching by the flat `route` alone would silently
-        # collapse it to one lane and drop the sibling chunk(s). Same test as
-        # _route_after_classify.
-        reqs = params.get("requests") or []
-        if len(reqs) >= 2 and len({c.get("lane") for c in reqs}) >= 2:
+        # collapse it to one lane and drop the sibling chunk(s).
+        if _is_mixed_lane_multi(params):
             return "dispatch_decomposed"
         # Dispatch by the params' own route: classify never runs. The /log and
         # write-intent synthetic dicts all carry "operational" (unchanged
@@ -97,8 +96,7 @@ def _route_after_classify(state: CoordinatorState) -> str:
     # Stage 3: a multi-chunk message with MIXED lanes executes per-chunk and
     # merges in index order. All-analytical multi-chunk deliberately stays a
     # single run (live-proven good, and one pipeline is cheaper than two).
-    reqs = params.get("requests") or []
-    if len(reqs) >= 2 and len({c.get("lane") for c in reqs}) >= 2:
+    if _is_mixed_lane_multi(params):
         return "dispatch_decomposed"
     route = params.get("route", "analytical")
     if route == "out_of_scope":

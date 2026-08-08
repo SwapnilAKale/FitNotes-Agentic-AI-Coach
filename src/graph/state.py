@@ -32,6 +32,10 @@ class CoordinatorState(TypedDict, total=False):
     fallback_write: bool
     write_intent_hint: bool  # regex write pre-guard fired; classify ran only
                              # to discover chunks (Stage-3 distrust override)
+    write_intent_hard: bool  # ...and it fired on an EXPLICIT WRITE VERB, so the
+                             # regex verdict binds over a successful classify.
+                             # False = verb-less narration: a hint that stands in
+                             # only when classify fails (ledger row E)
     decomposed: bool         # answer is a Stage-3 per-chunk merge
     decomposed_nonwrite_answer: Optional[str]  # the merge with staged-write
                              # parts excluded (#19); panel stash + CLI finalize

@@ -215,11 +215,11 @@ def test_exception_default_includes_requests_none(coord):
 def test_prompt_integrity_smoke():
     # Guard against accidental truncation of the tuned prompt during the
     # Stage-1 edit: legacy anchors AND the new decomposition anchors.
-    for anchor in ("out_of_scope", "MEDICAL", "RECALL — use ONLY",
+    for anchor in ("out_of_scope", "MEDICAL", "RECALL —",
                    "Return ONLY valid JSON", "PARAMETER EXTRACTION",
                    "CUSTOM SQL"):
         assert anchor in _CLASSIFY_SYSTEM, f"legacy anchor missing: {anchor}"
-    for anchor in ('"requests"', "intent_text", '"lane"', "DECOMPOSITION"):
+    for anchor in ('"requests"', "intent_text", '"lane"'):
         assert anchor in _CLASSIFY_SYSTEM, f"new anchor missing: {anchor}"
 
 
