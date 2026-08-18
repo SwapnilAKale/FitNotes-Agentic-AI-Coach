@@ -150,7 +150,7 @@ def test_classifier_prompt_has_out_of_scope_taxonomy():
 
 def test_analysis_prompt_has_character_and_medical():
     from src.analysis_agent import _ANALYSIS_SYSTEM
-    assert "COACH CHARACTER" in _ANALYSIS_SYSTEM
+    assert "ADVICE STYLE" in _ANALYSIS_SYSTEM
     assert "USER HOLDS THE FINAL CALL" in _ANALYSIS_SYSTEM
     assert "BIAS TOWARD TRAINING" in _ANALYSIS_SYSTEM
     assert "MEDICAL LINE" in _ANALYSIS_SYSTEM
@@ -159,7 +159,7 @@ def test_analysis_prompt_has_character_and_medical():
 
 def test_operational_prompt_has_character_and_medical():
     from src.agent import SYSTEM_PROMPT
-    assert "COACH CHARACTER" in SYSTEM_PROMPT
+    assert "ADVICE STYLE" in SYSTEM_PROMPT
     assert "USER HOLDS THE FINAL CALL" in SYSTEM_PROMPT
     assert "BIAS TOWARD TRAINING" in SYSTEM_PROMPT
     assert "MEDICAL LINE" in SYSTEM_PROMPT

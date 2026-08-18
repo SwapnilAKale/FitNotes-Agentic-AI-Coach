@@ -559,6 +559,6 @@ def test_analysis_prompt_has_formatting_directive_and_exemptions():
                    "character-for-character", "citation tag"):
         assert anchor in _ANALYSIS_SYSTEM, f"missing anchor: {anchor}"
     # legacy anchors intact
-    for anchor in ("ANSWER FORMAT", "COACH CHARACTER", "CITATION TAGS",
+    for anchor in ("ANSWER FORMAT", "ADVICE STYLE", "CITATION TAGS",
                    "Open with the most important finding"):
         assert anchor in _ANALYSIS_SYSTEM, f"legacy anchor missing: {anchor}"
