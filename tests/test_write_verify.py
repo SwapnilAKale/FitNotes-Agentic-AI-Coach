@@ -385,7 +385,7 @@ def _drive_workout_turn(srv, monkeypatch, *, verdict=None, verify_raises=False,
     monkeypatch.setattr(srv, "coordinator", SimpleNamespace(
         route=route, verify_log_staging=verify_log_staging))
     monkeypatch.setattr(srv, "session", SimpleNamespace(
-        call_tool=call_tool, answer=answer))
+        call_tool=call_tool, answer=answer, note_host_write=lambda *a, **k: None))
     body = _body(asyncio.run(srv._process_turn(message)))
     return body, calls, seen
 
@@ -532,7 +532,7 @@ def _cli_fakes(verdict, execute_result=None):
             return json.dumps(execute_result or {"success": True, "message": "saved"})
         return json.dumps({"ok": True})
 
-    session = SimpleNamespace(call_tool=call_tool, _staged_active=True)
+    session = SimpleNamespace(call_tool=call_tool, _staged_active=True, note_host_write=lambda *a, **k: None)
 
     async def verify(flow, slot_json, preview):
         return verdict

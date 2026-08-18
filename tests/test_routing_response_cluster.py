@@ -315,7 +315,7 @@ def _confirm_turn(srv, monkeypatch, formatter_result):
         return json.dumps({"discarded": True})   # turn-start discard_staged_writes
 
     monkeypatch.setattr(srv, "coordinator", SimpleNamespace(route=route))
-    monkeypatch.setattr(srv, "session", SimpleNamespace(call_tool=call_tool))
+    monkeypatch.setattr(srv, "session", SimpleNamespace(call_tool=call_tool, note_host_write=lambda *a, **k: None))
     return _body(asyncio.run(srv._process_turn("log my workout")))
 
 

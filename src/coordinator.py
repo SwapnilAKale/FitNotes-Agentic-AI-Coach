@@ -840,21 +840,37 @@ _WRITE_SUCCESS_CLAIM_RE = re.compile(
 )
 
 # Hole B: looser completion phrasings the narrow regex misses ("I've logged
-# your workout.", "Your workout is saved.", "You're all set!"). Checked ONLY
-# on logging-flow turns (log_boundary/fallback_write — /log boundary, carry
-# reply, or regex-inferred write), where such a phrase can only refer to the
-# workout write. Globally these are ordinary speech ("you're all set for
-# tomorrow", "I've saved that to memory") and replacing a legitimate
-# non-logging answer with the no-write message would be a real false
-# positive — the structural flow fact scopes the looser detector.
-_LOG_FLOW_CLAIM_RE = re.compile(
+# your workout.", "Your workout is saved.", "You're all set!"). Globally these
+# are ordinary speech ("you're all set for tomorrow", "I've saved that to
+# memory"), and _run_operational also serves RESEARCH answers where "the study
+# removed participants" is a sentence about a paper, not a database. So the
+# detector never runs alone — a STRUCTURAL fact scopes it (see the gate).
+#
+# It used to be scoped to logging flows only, and its verb list was the logging
+# verbs. An audit across every write verb found 11 of 17 plausible completion
+# claims undetected — and on goal/set-edit turns, where the loose detector never
+# ran at all, 12 of 13. The gate protected workout logging and almost nothing
+# else. Both the verb list and the scope are widened below; the scope widens to
+# "a write tool was actually called this turn", which still excludes research.
+_WRITE_COMPLETION_CLAIM_RE = re.compile(
     r"(?i)(?:"
     # Unqualified first-person completions — no trailing qualifier required.
-    r"\bi(?:'ve|\s+have)?\s+(?:logged|saved|recorded|added|written|updated)\b"
-    # Subject-state completions ("Your workout is saved.", "3 sets were added").
-    r"|\b(?:workouts?|sets?|exercises?|goals?|entry|entries|it)\s+"
-    r"(?:is|was|are|were|(?:has|have)\s+been)\s+(?:now\s+)?"
-    r"(?:logged|saved|recorded|added|written|in\s+the\s+books)\b"
+    r"\bi(?:'ve|\s+have)?\s+"
+    r"(?:logged|saved|recorded|added|written|updated|deleted|removed"
+    r"|corrected|fixed|created)\b"
+    # Subject-state completions ("Your workout is saved.", "3 sets were added",
+    # "Your goal has been deleted.", "Your goal is now set."). The subject list
+    # is what keeps research prose out: "the study was removed" has no match
+    # because "study" is not one of our data nouns.
+    #
+    # The noun and the verb are NOT required to be adjacent. Real answers put
+    # the details in between — the live failure was "...set of 101 lbs x 7 reps
+    # on 2026-08-08 has been removed...", which an adjacency-only pattern misses
+    # entirely. Bounded, and [^.\n] keeps it inside one sentence.
+    r"|\b(?:workouts?|sets?|exercises?|goals?|entry|entries|it)\b[^.\n]{0,80}?"
+    r"\b(?:is|was|are|were|(?:has|have)\s+been)\s+(?:now\s+)?"
+    r"(?:logged|saved|recorded|added|written|updated|deleted|removed"
+    r"|corrected|fixed|created|set|in\s+the\s+books)\b"
     # "You're all set!" / "All set." — \b already excludes "all sets".
     r"|\ball\s+set\b"
     r")"
@@ -862,7 +878,8 @@ _LOG_FLOW_CLAIM_RE = re.compile(
 
 MSG_NO_WRITE_OCCURRED = (
     "⚠️ Nothing was written to your database this turn — no write was "
-    "executed. Please re-state your logging request (tip: start with /log)."
+    "executed. Please re-state what you wanted saved or changed "
+    "(for workouts, starting with /log is the most reliable route)."
 )
 
 # Hole A's truthful replacement: the turn DID stage a batch but no execute was
@@ -912,6 +929,14 @@ again?", "remind me / repeat that").
 Using ONLY the [CONVERSATION] provided, restate the specific figure or fact the user
 is asking about — verbatim as you already stated it. NEVER compute, estimate, look
 up, or introduce a NEW number; your only job is to repeat what was already said.
+# ONE message, phrased for every write. It used to end "re-state your logging
+# request (tip: start with /log)", which is nonsense after a failed goal or set
+# edit — but splitting it in two turned out to be undoable: the gate fires
+# hardest when the agent called NO tool (it invented the success outright), and
+# in that case nothing distinguishes a logging turn from a goal turn.
+# log_boundary/fallback_write are not that signal either — the canonical live
+# failure is a bare "Yes thats correct" confirming a log, which trips neither.
+# So the tip is made conditional in the WORDING instead of in the code.
 
 If the [CONVERSATION] does not contain a figure matching what they are asking about,
 say you are not sure which number they mean and ask them to clarify — do not guess.
@@ -3060,11 +3085,16 @@ class Coordinator:
         #     the ✅ that follows);
         #   - none of the three → any completed-write claim is false by
         #     construction: replace with the no-write message.
-        # Claim presence: the narrow regex everywhere; the looser one only on
-        # logging-flow turns (see _LOG_FLOW_CLAIM_RE's rationale).
+        # Claim presence: the narrow regex everywhere; the looser one wherever a
+        # write was actually ATTEMPTED this turn. `write_attempted` is the
+        # structural widening — it covers goal and set-edit flows, which the old
+        # logging-only scope left unguarded (an audit found 12 of 13 completion
+        # claims there reaching the user unchecked), while still excluding
+        # research answers, which call no write tool at all.
+        _write_flow = (log_boundary or fallback_write
+                       or bool(result.get("write_attempted")))
         _claim_made = bool(_WRITE_SUCCESS_CLAIM_RE.search(answer)) or (
-            (log_boundary or fallback_write)
-            and bool(_LOG_FLOW_CLAIM_RE.search(answer)))
+            _write_flow and bool(_WRITE_COMPLETION_CLAIM_RE.search(answer)))
         if (not result.get("db_write_effect")
                 and not result.get("staging_reached_confirm")
                 and _claim_made):

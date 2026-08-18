@@ -959,6 +959,14 @@ async def confirm(body: ConfirmRequest):
                 return _error_response(exc)
             if outcome.get("success"):
                 session._staged_active = False   # slot committed+popped; keep resume coherent
+                # Same seam as cli.py: the SERVER executed, so nothing updates
+                # the agent's history and it would go on believing the batch is
+                # still pending — which is how a later "delete that set" reached
+                # for discard_staged_writes and reported a removal that never
+                # happened. Pass the server's own verified message, not a
+                # re-description.
+                session.note_host_write(
+                    outcome.get("message", "Workout saved and verified."))
                 # The committed batch's checkpoint must die NOW (guarded) — a
                 # later "continue" restoring an already-written batch would be
                 # a double write. This is the keep-until-confirm lifecycle's

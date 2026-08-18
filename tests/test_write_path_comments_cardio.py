@@ -415,7 +415,10 @@ def test_discard_staged_writes_clears_all_keys():
     cs._staged_writes["workout"] = [{"exercise_id": 1, "date": "2026-06-29", "sets": []}]
     cs._staged_writes["goal"] = {"exercise_id": 2, "metric_weight": 100.0}
     out = json.loads(cs._discard_staged_writes_sync())
-    assert out == {"discarded": True}
+    # The tool now also reports WHETHER anything was pending — it used to answer
+    # {"discarded": true} even on an empty slot, which let an agent that called
+    # it on already-saved data report a removal that never happened.
+    assert out["discarded"] is True and out["had_pending"] is True
     assert cs._staged_writes == {}               # all keys gone
 
 

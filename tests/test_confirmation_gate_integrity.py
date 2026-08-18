@@ -118,7 +118,7 @@ def _drive(srv, monkeypatch, *, answer_text, slot_response, formatter_response,
 
     monkeypatch.setattr(srv, "coordinator", SimpleNamespace(
         route=route, verify_log_staging=verify_log_staging))
-    monkeypatch.setattr(srv, "session", SimpleNamespace(call_tool=call_tool))
+    monkeypatch.setattr(srv, "session", SimpleNamespace(call_tool=call_tool, note_host_write=lambda *a, **k: None))
     body = _body(asyncio.run(srv._process_turn("Today")))
     return body, calls, seen
 
@@ -208,7 +208,7 @@ def _cli_session(calls, slot_response):
         if name == "execute_staged_workout":
             return json.dumps({"success": True, "message": "written"})
         return json.dumps({"ok": True})
-    return SimpleNamespace(call_tool=call_tool, _staged_active=True)
+    return SimpleNamespace(call_tool=call_tool, _staged_active=True, note_host_write=lambda *a, **k: None)
 
 
 def _cli_coordinator(verdict):
@@ -400,7 +400,7 @@ def _decomposed_turn(srv, monkeypatch, *, execute_response=None):
         route=route, verify_log_staging=verify_log_staging,
         _pending_log_carry=True))          # #13: /confirm must clear this
     monkeypatch.setattr(srv, "session", SimpleNamespace(
-        call_tool=call_tool, chat_history=[], answer=answer))
+        call_tool=call_tool, chat_history=[], answer=answer, note_host_write=lambda *a, **k: None))
     body = _body(asyncio.run(srv._process_turn(
         "is my squat progressing and log bench 100x5")))
     return body, calls

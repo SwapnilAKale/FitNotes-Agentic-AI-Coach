@@ -269,6 +269,7 @@ class AgentSession:
         # db_write_effect / staged_this_turn for the Coordinator's claim gate.
         self._turn_write_effect: bool = False
         self._turn_staged: bool = False
+        self._turn_write_attempted: bool = False
         self._base_system_prompt: str = SYSTEM_PROMPT
         self.chat_history: list[dict] = []
         self._cache_name: str | None = None
@@ -688,6 +689,34 @@ class AgentSession:
             [{"role": "user",      "content": question},
              {"role": "assistant", "content": answer}], 0)
 
+    def note_host_write(self, outcome_text: str) -> None:
+        """Tell the agent that the HOST committed a staged batch.
+
+        WHY THIS EXISTS. Workouts are staged by the agent and executed by the
+        host (cli.py / server.py drive execute_staged_workout after the user
+        confirms — the agent has no workout execute tool). That execute happens
+        outside any agent turn, so nothing updated this history and the agent's
+        last known state stayed "staged, awaiting confirmation". Asked to delete
+        the set a moment later it reached for discard_staged_writes, which
+        cannot touch saved rows, and reported a removal that never happened.
+        That is correct reasoning from a false premise — so fix the premise.
+
+        `outcome_text` must be the SERVER's own verified outcome message, not a
+        sentence composed by the caller: the agent already holds what was
+        staged (its own log_workout call and result are in this history) and the
+        host executes that slot unmodified, so re-describing it would invent a
+        second source of truth. The server's counts also let the agent notice a
+        partial write disagreeing with what it staged.
+
+        Recorded as an assistant turn — the agent's own prior knowledge, which
+        is what it is — and marked so memory extraction skips it.
+        """
+        if not outcome_text:
+            return
+        self._save_exchange(
+            [{"role": "assistant",
+              "content": f"{HOST_WRITE_NOTE_MARK} {outcome_text}"}], 0)
+
     # ------------------------------------------------------------------ #
     #  Main answer loop (LangGraph operational subgraph)                   #
     # ------------------------------------------------------------------ #
@@ -712,6 +741,7 @@ class AgentSession:
         # dict so the Coordinator can gate write-success claims on fact.
         self._turn_write_effect = False
         self._turn_staged = False
+        self._turn_write_attempted = False
 
         turn_id = new_turn_id()
         state = await get_operational_graph().ainvoke(
@@ -913,6 +943,15 @@ class AgentSession:
             if len(result) > 800:
                 result = result[:800] + "... [truncated]"
 
+            # Was a write ATTEMPTED this turn? Deliberately set on the CALL, not
+            # on the parsed result: a write that errored or returned garbage is
+            # still a turn where a completion claim would be about a write. This
+            # is what scopes the loose claim detector — a research turn calls no
+            # write tool, so its prose ("the study removed participants") is
+            # never mistaken for a database claim.
+            if tool_name in DB_WRITE_TOOLS:
+                self._turn_write_attempted = True
+
             try:
                 parsed = json.loads(result)
                 if tool_name in {"log_workout", "set_goal"} and "staged_key" in parsed:
@@ -1013,6 +1052,7 @@ class AgentSession:
             "staging_reached_confirm": state["execute_attempted"],
             "db_write_effect": self._turn_write_effect,
             "staged_this_turn": self._turn_staged,
+            "write_attempted": self._turn_write_attempted,
         }}
 
     def _op_finalize_cancelled(self, state: dict) -> dict:
@@ -1036,6 +1076,7 @@ class AgentSession:
             "staging_reached_confirm": state["execute_attempted"],
             "db_write_effect": self._turn_write_effect,
             "staged_this_turn": self._turn_staged,
+            "write_attempted": self._turn_write_attempted,
         }}
 
     def _op_finalize_max_iter(self, state: dict) -> dict:
@@ -1054,6 +1095,7 @@ class AgentSession:
             "staging_reached_confirm": state["execute_attempted"],
             "db_write_effect": self._turn_write_effect,
             "staged_this_turn": self._turn_staged,
+            "write_attempted": self._turn_write_attempted,
         }}
 
     # ------------------------------------------------------------------ #
@@ -1218,6 +1260,11 @@ class AgentSession:
             for m in exchange:
                 role = "User" if m.get("role") == "user" else "Agent"
                 content = m.get("content") or ""
+                # Host-supplied write notes are plumbing, not something the user
+                # told us — mining them would store "3 sets across 1 exercise"
+                # as a personal fact.
+                if content.startswith(HOST_WRITE_NOTE_MARK):
+                    continue
                 if content and len(content) > 5:
                     conversation_text += f"{role}: {content[:300]}\n"
 

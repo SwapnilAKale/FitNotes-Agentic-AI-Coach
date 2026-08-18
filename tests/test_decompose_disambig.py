@@ -269,7 +269,7 @@ def test_disambiguate_endpoint_resolves_write_to_confirmation(srv, monkeypatch):
         resolve_disambiguation=resolve_disambiguation,
         verify_log_staging=verify_log_staging, _pending_log_carry=False))
     monkeypatch.setattr(srv, "session", SimpleNamespace(
-        call_tool=call_tool, chat_history=[]))
+        call_tool=call_tool, chat_history=[], note_host_write=lambda *a, **k: None))
 
     body = _body(asyncio.run(srv.disambiguate(
         srv.DisambiguateRequest(selections=[

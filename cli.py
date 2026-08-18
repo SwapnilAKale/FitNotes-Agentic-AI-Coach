@@ -112,6 +112,9 @@ async def _finalize_staged_workout(session, coordinator, result, question) -> st
     outcome = json.loads(await session.call_tool("execute_staged_workout", {}))
     if outcome.get("success"):
         session._staged_active = False
+        # The execute happened outside the agent's turn, so nothing else updates
+        # its history — without this it still believes the batch is pending.
+        session.note_host_write(outcome.get("message", "Workout saved and verified."))
         return f"✅ {outcome.get('message', 'Workout saved and verified.')}"
     return f"❌ {outcome.get('message') or outcome.get('error') or 'Workout write failed — nothing was saved.'}"
 
@@ -187,6 +190,9 @@ async def _confirm_restored_workout(session, coordinator, result) -> str:
             if outcome.get("success"):
                 session._staged_active = False
                 _ckpt.clear_staged_checkpoint()
+                # See _confirm_staged_workout: the agent is not otherwise told.
+                session.note_host_write(
+                    outcome.get("message", "Workout saved and verified."))
                 return f"✅ {outcome.get('message', 'Workout saved and verified.')}"
             return f"❌ {outcome.get('message') or outcome.get('error') or 'Workout write failed — nothing was saved.'}"
         if reply in {"no", "n", "cancel"}:

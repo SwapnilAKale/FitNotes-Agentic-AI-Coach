@@ -325,7 +325,7 @@ def _drive_restore_turn(srv, monkeypatch, *, restored_verify, verify_verdict=Non
 
     monkeypatch.setattr(srv, "coordinator", SimpleNamespace(
         route=route, verify_log_staging=verify_log_staging))
-    monkeypatch.setattr(srv, "session", SimpleNamespace(call_tool=call_tool))
+    monkeypatch.setattr(srv, "session", SimpleNamespace(call_tool=call_tool, note_host_write=lambda *a, **k: None))
     monkeypatch.setattr(srv._ckpt, "save_checkpoint", save_checkpoint)
     body = _body(asyncio.run(srv._process_turn(message)))
     return body, calls, seen, saved
@@ -405,7 +405,7 @@ def test_server_normal_pass_writes_checkpoint2(srv, monkeypatch):
 
     monkeypatch.setattr(srv, "coordinator", SimpleNamespace(
         route=route, verify_log_staging=verify_log_staging))
-    monkeypatch.setattr(srv, "session", SimpleNamespace(call_tool=call_tool))
+    monkeypatch.setattr(srv, "session", SimpleNamespace(call_tool=call_tool, note_host_write=lambda *a, **k: None))
     monkeypatch.setattr(srv._ckpt, "save_checkpoint",
                         lambda **kw: saved.append(kw) or kw)
 
@@ -446,7 +446,7 @@ def test_server_checkpoint2_prefers_resolved_question_over_message(srv, monkeypa
 
     monkeypatch.setattr(srv, "coordinator", SimpleNamespace(
         route=route, verify_log_staging=verify_log_staging))
-    monkeypatch.setattr(srv, "session", SimpleNamespace(call_tool=call_tool))
+    monkeypatch.setattr(srv, "session", SimpleNamespace(call_tool=call_tool, note_host_write=lambda *a, **k: None))
     monkeypatch.setattr(srv._ckpt, "save_checkpoint",
                         lambda **kw: saved.append(kw) or kw)
 
@@ -468,7 +468,7 @@ def _confirm_session(calls, execute_result):
     async def answer(msg):
         return {"answer": "ok", "error": None}
     return SimpleNamespace(call_tool=call_tool, answer=answer,
-                           _staged_active=True)
+                           _staged_active=True, note_host_write=lambda *a, **k: None)
 
 
 def test_confirm_success_clears_staged_checkpoint(srv, monkeypatch, ckpt_path):
@@ -602,7 +602,7 @@ def _cli_restore_fakes(verify_verdict=None):
             return json.dumps({"success": True, "message": "saved"})
         return json.dumps({"ok": True})
 
-    session = SimpleNamespace(call_tool=call_tool, _staged_active=True)
+    session = SimpleNamespace(call_tool=call_tool, _staged_active=True, note_host_write=lambda *a, **k: None)
 
     async def verify(flow, slot_json, preview):
         return verify_verdict

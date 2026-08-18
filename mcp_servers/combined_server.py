@@ -171,10 +171,13 @@ async def list_tools() -> list[types.Tool]:
         # consulting list_tools. Handler kept below (unexpose, not delete).
         types.Tool(
             name="discard_staged_writes",
-            description="discard_staged_writes() -> {discarded} — drop ALL pending staged writes "
-                        "(the workout batch and any staged goal/set edit). Called deterministically "
-                        "by the server on a new chat turn and on cancel so a staged write reaches "
-                        "the DB only via an explicit confirm; clears any stale, abandoned batch.",
+            description="discard_staged_writes() -> {discarded, had_pending, message} — drop ALL "
+                        "pending staged writes (the workout batch and any staged goal/set edit). "
+                        "Returns had_pending=false when there was nothing staged: in that case "
+                        "NOTHING was removed and you must not say otherwise. Cannot touch data "
+                        "already saved — use delete_workout_set / delete_goal for that. Called "
+                        "deterministically by the server on a new chat turn and on cancel so a "
+                        "staged write reaches the DB only via an explicit confirm.",
             inputSchema={"type": "object", "properties": {}, "required": []},
         ),
         types.Tool(
@@ -1608,8 +1611,30 @@ def _discard_staged_writes_sync() -> str:
     # slot). The server calls this deterministically at /chat turn-start and on cancel
     # so an abandoned/cancelled batch can never carry into a later execute — a staged
     # write reaches the DB only via an explicit confirm.
+    #
+    # REPORT WHAT ACTUALLY HAPPENED. This used to answer {"discarded": true}
+    # whether it dropped a batch or found an empty slot. An agent that (wrongly)
+    # called it to remove a SAVED row was told "discarded" and passed that on —
+    # the row stayed, the user was told it was gone. The empty case now says so,
+    # and names the tools that do delete saved data, so the tool result itself
+    # corrects the mistake instead of confirming it.
+    had_pending = bool(_staged_writes)
     _staged_writes.clear()
-    return json.dumps({"discarded": True})
+    if had_pending:
+        return json.dumps({
+            "discarded": True,
+            "had_pending": True,
+            "message": "Pending staged writes were discarded. Nothing had been "
+                       "saved to the database, so nothing was removed from it.",
+        })
+    return json.dumps({
+        "discarded": False,
+        "had_pending": False,
+        "message": "There was nothing staged to discard. NOTE: this tool only "
+                   "empties the staging area — it cannot remove data already "
+                   "saved. To delete a saved set or goal use delete_workout_set "
+                   "or delete_goal. Do NOT tell the user anything was removed.",
+    })
 
 
 async def _discard_staged_writes() -> str:
