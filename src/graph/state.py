@@ -88,7 +88,10 @@ class OperationalState(TypedDict, total=False):
     iteration: int
     tool_calls_made: int
     execute_attempted: bool
-    write_cancelled: bool
+    write_cancelled: bool     # stopped at the confirmation gate (either reason)
+    write_deferred: bool      # ...and the reason was "shown to the user", NOT
+                              # "user declined". Routing ignores it; the history
+                              # note and the fallback answer do not.
     has_tool_calls: bool
     last_text: str            # combined_text of the last agent step
     result: Optional[dict]    # the contracted answer() return dict

@@ -22,6 +22,12 @@ server = Server("fitnotes-coach")
 _kb = None
 _staged_writes: dict = {}
 
+# Keys parked in _staged_writes that are NOT pending writes — bookkeeping that
+# rides along so discard_staged_writes wipes it for free (no second reset site,
+# nothing to leak across turns). Excluded from "is anything staged?", or an
+# empty staging area would report itself as having had pending work.
+_NON_PENDING_KEYS = frozenset({"workout_verify", "last_deleted_set"})
+
 
 def _wal_append(tool_name: str, params: dict) -> None:
     """
@@ -212,22 +218,61 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="log_bodyweight",
-            description="log_bodyweight(date, weight, unit) -> {success} — log body weight entry",
+            description=(
+                "log_bodyweight(body_weight, unit, body_fat_percent?, date?) -> "
+                "{staged} — stage a body weight entry for the date (default today). "
+                "ONE ENTRY PER DATE: if that day already has a weigh-in this UPDATES "
+                "it rather than adding a second. To record only body fat for a day "
+                "that already has a weight, pass body_fat_percent and omit "
+                "body_weight. Staged — call execute_staged_bodyweight after the "
+                "user confirms."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "body_weight": {
                         "type": "number",
-                        "description": "body weight value in the specified unit",
+                        "description": ("body weight in the given unit. Omit ONLY when "
+                                        "adding body fat to a day that already has one."),
                     },
                     "unit": {"type": "string", "enum": ["lbs", "kg"]},
                     "body_fat_percent": {
                         "type": "number",
                         "description": "body fat percentage (optional)",
                     },
+                    "date": {
+                        "type": "string",
+                        "description": "YYYY-MM-DD, defaults to today",
+                    },
                 },
-                "required": ["body_weight", "unit"],
+                "required": ["unit"],
             },
+        ),
+        types.Tool(
+            name="execute_staged_bodyweight",
+            description="execute_staged_bodyweight() -> {success} — write the staged body weight",
+            inputSchema={"type": "object", "properties": {}, "required": []},
+        ),
+        types.Tool(
+            name="delete_bodyweight",
+            description=(
+                "delete_bodyweight(date?) -> {staged} — remove the body weight entry "
+                "for a date (default today). Staged — call "
+                "execute_staged_bodyweight_delete after the user confirms."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "date": {"type": "string",
+                             "description": "YYYY-MM-DD, defaults to today"},
+                },
+                "required": [],
+            },
+        ),
+        types.Tool(
+            name="execute_staged_bodyweight_delete",
+            description="execute_staged_bodyweight_delete() -> {success} — delete the staged body weight entry",
+            inputSchema={"type": "object", "properties": {}, "required": []},
         ),
         # Fix 5: verify_workout_logged is NOT declared here — unexposed. It reads
         # training_log, so mid-stage it structurally returns sets_found: 0, which
@@ -342,6 +387,30 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="execute_staged_set_delete",
             description="execute_staged_set_delete() -> {success} — permanently delete set from DB",
+            inputSchema={"type": "object", "properties": {}, "required": []},
+        ),
+        types.Tool(
+            name="set_set_comment",
+            description="set_set_comment(exercise_name, date, weight, reps, unit, comment) -> {staged} "
+                        "— stage a note on an EXISTING set (form cue, how it felt). Pass an empty "
+                        "comment to clear it. Works on any set, including ones recorded in FitNotes: "
+                        "a note is yours to write even when the set itself cannot be changed.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "exercise_name": {"type": "string"},
+                    "date": {"type": "string", "description": "YYYY-MM-DD; omit if unknown — tool will return disambiguation options"},
+                    "weight": {"type": "number", "description": "as originally typed"},
+                    "reps": {"type": "integer"},
+                    "unit": {"type": "string", "enum": ["lbs", "kg"]},
+                    "comment": {"type": "string", "description": "the note; empty string clears it"},
+                },
+                "required": ["exercise_name", "weight", "reps", "unit", "comment"],
+            },
+        ),
+        types.Tool(
+            name="execute_staged_set_comment",
+            description="execute_staged_set_comment() -> {success} — write the staged set comment",
             inputSchema={"type": "object", "properties": {}, "required": []},
         ),
         types.Tool(
@@ -524,6 +593,11 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         # preview from the staged slot.
         elif name == "format_staged_workout_for_confirmation":
             result = await _format_staged_workout_for_confirmation()
+        # Same job for the SIBLING staged writes (goal / set edit / comment),
+        # which had no renderer at all and so were shown to the user as a raw
+        # json.dumps of the tool arguments. Server-internal, unexposed.
+        elif name == "format_staged_write_for_confirmation":
+            result = await _format_staged_write_for_confirmation()
         # Server-internal like execute_staged_workout: not declared in list_tools
         # (the agent never sees it); later verification stages call it to read
         # the RAW staged slot — the exact payload execute will write — as JSON,
@@ -546,6 +620,12 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             result = await _execute_staged_goal()
         elif name == "log_bodyweight":
             result = await _log_bodyweight(arguments)
+        elif name == "execute_staged_bodyweight":
+            result = await _execute_staged_bodyweight()
+        elif name == "delete_bodyweight":
+            result = await _delete_bodyweight(arguments)
+        elif name == "execute_staged_bodyweight_delete":
+            result = await _execute_staged_bodyweight_delete()
         elif name == "verify_workout_logged":
             result = await _verify_workout_logged(
                 arguments["exercise_name"],
@@ -573,6 +653,10 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             result = await _delete_workout_set(arguments)
         elif name == "execute_staged_set_delete":
             result = await _execute_staged_set_delete()
+        elif name == "set_set_comment":
+            result = await _set_set_comment(arguments)
+        elif name == "execute_staged_set_comment":
+            result = await _execute_staged_set_comment()
         elif name == "verify_set_updated":
             result = await _verify_set_updated(
                 arguments["exercise_name"],
@@ -1520,21 +1604,124 @@ async def _log_workout(arguments: dict) -> str:
     return await asyncio.to_thread(_log_workout_sync, arguments)
 
 
-def _readback_count(conn, ids: list) -> int:
-    """Read-back verify inside the execute transaction: how many of the
-    just-inserted training_log rowids are visible on this connection. Matched by
-    id-set, NEVER by date — a date match would sweep pre-existing rows and could
-    mask a partial write."""
-    placeholders = ",".join("?" * len(ids))
-    row = conn.execute(
-        f"SELECT COUNT(*) FROM training_log WHERE _id IN ({placeholders})",
-        list(ids),
-    ).fetchone()
-    return row[0]
+# ── The app-data lock ─────────────────────────────────────────────────────────
+# The agent may ADD to the user's training data and manage what it added. It may
+# never modify or destroy what the FitNotes app recorded — FitNotes stays the
+# source of truth for what the user actually logged.
+#
+# The discriminator is a WATERMARK recorded at upload time: max(_id) per table,
+# taken after the new database is written and BEFORE replay runs. _id is
+# AUTOINCREMENT, so ids only ever increase — everything at or below the mark came
+# from the upload, everything above it the agent created afterwards. One integer
+# per table, no per-row bookkeeping, and it resets naturally on the next upload.
+#
+# This is also what makes WAL replay safe. Once no agent edit or delete can name
+# an app row, every replayed update/delete refers to a row replay itself inserted
+# in the same run — so it remaps its own ids and the two-sequence collision (the
+# agent's local id 6 meeting the app's own id 6 in a later export) has nowhere to
+# occur. The collision is made impossible rather than defended against.
+#
+# Comments are the deliberate exception and are NOT locked: a note about form is
+# the agent's to write even on a set the app logged. Comment is a separate table
+# keyed by owner_id, so the carve-out costs nothing here.
+APP_DATA_WATERMARK_KEY = "app_data_watermark"
+
+
+def _app_owned(table: str, row_id: int) -> bool:
+    """True when this row came from the user's FitNotes app and is off limits.
+
+    No watermark means no upload has happened yet, so there is nothing to
+    protect — a fresh install must not refuse everything.
+    """
+    from src import settings
+
+    marks = settings.get_setting(APP_DATA_WATERMARK_KEY, None)
+    if not isinstance(marks, dict):
+        return False
+    mark = marks.get(table)
+    return isinstance(mark, int) and int(row_id) <= mark
+
+
+def _refuse_app_row(what: str) -> str:
+    # WORDING IS LOAD-BEARING — this string is shown to the USER verbatim when
+    # the Coordinator's write-success gate fires (see `refused` below), and the
+    # agent also paraphrases it. That gate reads prose for completion verbs, so
+    # any it contains come back as a false "you claimed a write happened".
+    #
+    # Two rounds of this, both live-caught. "That set WAS RECORDED in FitNotes"
+    # matched subject+was+recorded. Reworded to "comes from" — and the refusal
+    # still tripped, on "entries I ADDED myself", which reads as first-person
+    # completion. Hence "added by me": same meaning, no `I <verb>` shape.
+    #
+    # Keep this message free of logged/saved/recorded/added/updated/deleted in
+    # any first-person or subject-is-verb construction.
+    # tests/test_write_claim_integrity.py asserts it over every canned message.
+    return json.dumps({
+        # Machine-readable, so the reason reaches the user by construction
+        # rather than by the model choosing to repeat it — it demonstrably
+        # does not (two fabricated success claims in three live turns).
+        "refused": "app_data_locked",
+        "error": (
+            f"That {what} comes from FitNotes, so it can't be changed here — the "
+            f"app is the source of truth for what you logged. Edit or delete it "
+            f"in FitNotes and upload the database again. Only entries added by me "
+            f"can be changed here (comments are the exception — those are always "
+            f"writable)."
+        ),
+    })
+
+
+def _guarded_write(label: str, do_write, *, focus, expect=None, expect_factory=None):
+    """Run a write inside one transaction, committing ONLY if the database
+    changed exactly as intended.
+
+    Pass `expect` when the affected ids are known up front (an update or delete
+    of a staged row), or `expect_factory` when they only exist after the write
+    has run (inserts, whose ids come from lastrowid).
+
+    Returns (True, None) on success, or (False, json_error) when the integrity
+    check rejected it — in which case the transaction has been rolled back and
+    nothing was altered.
+
+    The user-facing text is one plain sentence — the `message` field, which is
+    all a host renders. The observed-vs-expected delta rides alongside it as
+    structured data and also goes to stderr: useful in a test or a bug report,
+    never shown mid-workout. A rejection is NOT a user cancellation, which has
+    its own message.
+    """
+    from src.db import (IntegrityRejected, MSG_INTEGRITY_REJECTED,
+                        assert_only_expected_changed, get_write_connection,
+                        snapshot_for_integrity)
+
+    conn = get_write_connection(DB_PATH)
+    try:
+        before = snapshot_for_integrity(conn, [focus] if isinstance(focus, str) else focus)
+        do_write(conn)
+        assert_only_expected_changed(
+            conn, before, expect_factory() if expect_factory else expect)
+        conn.commit()
+        return True, None
+    except IntegrityRejected as exc:
+        conn.rollback()
+        print(f"[server] integrity rejection ({label}): {exc.reason} — {exc.delta}",
+              file=sys.stderr)
+        return False, json.dumps({
+            "success": False,
+            "verified": False,
+            "integrity_rejected": True,
+            "reason": exc.reason,
+            "delta": exc.delta,
+            "message": MSG_INTEGRITY_REJECTED,
+        })
+    except Exception as exc:
+        conn.rollback()
+        return False, json.dumps({"error": f"Failed to {label}: {exc}"})
+    finally:
+        conn.close()
 
 
 def _execute_staged_workout_sync() -> str:
-    from src.db import get_write_connection, insert_training_log_set, insert_set_comment
+    from src.db import insert_training_log_set, insert_set_comment
 
     # Fix 3: the slot holds a LIST of workouts (a multi-exercise day). Write the
     # whole batch in ONE transaction — outer loop over workouts, inner loop over
@@ -1544,52 +1731,68 @@ def _execute_staged_workout_sync() -> str:
     if not staged_list:
         return json.dumps({"error": "No staged workout found. Call log_workout first."})
 
-    # Fix 5: verify lives INSIDE the transaction — insert the batch, read the new
-    # rows back by their ids, and commit ONLY if every staged set is visible. On
-    # mismatch the transaction rolls back, so the dirty state never persists and
-    # no delete/cleanup is needed. The slot pops ONLY on the commit path; on any
-    # failure it is retained so the batch stays inspectable and confirm can retry.
-    conn = get_write_connection(DB_PATH)
+    # Verify lives INSIDE the transaction — write the batch, then commit ONLY if
+    # the database changed exactly as intended. On mismatch it rolls back, so the
+    # dirty state never persists and no cleanup is needed. The slot pops ONLY on
+    # the commit path; on failure it is retained so the batch stays inspectable
+    # and confirm can retry.
+    #
+    # The check used to be _readback_count: are the ids I inserted visible? That
+    # answered only a question about its OWN rows, so a write landing anywhere
+    # else passed — and so did the rollback, which re-read the same narrow scope.
+    # It now asserts the inserted ids appeared, that nothing else in training_log
+    # or Comment moved, and that no other table moved at all.
     inserted_ids: list = []
-    try:
+    comment_owner_ids: list = []
+    # Row ids per workout, so the WAL record can carry the ids it created. Replay
+    # needs them: on a fresh database the same rows come back under DIFFERENT ids,
+    # and a later journalled edit or delete names the OLD one. Recording them here
+    # is what lets replay remap its own inserts instead of trusting a stale id.
+    ids_by_workout: list = []
+
+    def _write_batch(conn):
         for w in staged_list:
+            this_workout: list = []
             for s in w["sets"]:
                 # Shared writer (also used by WAL replay) → identical rows on replay.
                 new_id = insert_training_log_set(conn, w["exercise_id"], w["date"], s)
                 if s.get("comment"):
                     # Bind the comment to THIS set's new _id (no off-by-one).
                     insert_set_comment(conn, new_id, w["date"], s["comment"])
+                    comment_owner_ids.append(new_id)
                 inserted_ids.append(new_id)
+                this_workout.append(new_id)
+            ids_by_workout.append(this_workout)
 
-        staged_count = len(inserted_ids)
-        written_count = _readback_count(conn, inserted_ids)
-        if written_count != staged_count:
-            conn.rollback()                 # DB untouched; slot retained for retry
-            return json.dumps({
-                "success": False,
-                "verified": False,
-                "sets_expected": staged_count,
-                "sets_found": written_count,
-                "message": (
-                    "Write verification failed — batch rolled back, no changes made. "
-                    f"Expected {staged_count} sets, found {written_count}. The staged "
-                    "workout is still pending; confirm again to retry."
-                ),
-            })
-        conn.commit()                       # ONE commit for the whole verified batch
-    except Exception as exc:
-        conn.rollback()                     # whole batch rolls back — no half-written day
-        return json.dumps({"error": f"Failed to write workout: {exc}"})
-    finally:
-        conn.close()
+    # The expectation is built AFTER the write, because the ids only exist once
+    # the inserts have run.
+    ok, err = _guarded_write(
+        "write workout",
+        _write_batch,
+        focus=("training_log", "Comment"),
+        expect_factory=lambda: {
+            "training_log": {"added": set(inserted_ids)},
+            "Comment": {"added_count": len(comment_owner_ids)},
+        },
+    )
+    if not ok:
+        return err
+    staged_count = len(inserted_ids)
 
     _staged_writes.pop("workout", None)
     # WAL: one record PER workout (NOT the list). append_write does no shape
     # validation and _wal_append swallows errors, so journaling the whole list
     # would silently write an un-replayable record (replay reads one workout per
     # record). Per-workout records keep replay working unchanged.
-    for w in staged_list:
-        _wal_append("execute_staged_workout", w)
+    for w, row_ids in zip(staged_list, ids_by_workout):
+        # exercise_NAME alongside the id: the id is only meaningful in THIS
+        # database, and replay resolving by it can file a workout under a
+        # different exercise after an export renumbers. The name round-trips.
+        _wal_append("execute_staged_workout", {
+            **w,
+            "row_ids": row_ids,
+            "exercise_name": _exercise_name_for_id(w.get("exercise_id")),
+        })
     return json.dumps({
         "success": True,
         "verified": True,
@@ -1618,7 +1821,12 @@ def _discard_staged_writes_sync() -> str:
     # the row stayed, the user was told it was gone. The empty case now says so,
     # and names the tools that do delete saved data, so the tool result itself
     # corrects the mistake instead of confirming it.
-    had_pending = bool(_staged_writes)
+    # Only PENDING WRITES count. _staged_writes also carries bookkeeping that is
+    # deliberately parked there so this clear wipes it for free — the stage-2
+    # verdict, and the id of the set the last execute deleted. Counting those as
+    # pending would resurrect exactly the dishonesty this function was fixed to
+    # remove: "discarded: true" when there was nothing to discard.
+    had_pending = any(k not in _NON_PENDING_KEYS for k in _staged_writes)
     _staged_writes.clear()
     if had_pending:
         return json.dumps({
@@ -1674,6 +1882,134 @@ def _fmt_typed_weight(metric_weight: float) -> str:
     return f"{typed:g}"                       # 100.0 -> "100", 45.4 -> "45.4"
 
 
+def _format_staged_write_for_confirmation_sync() -> str:
+    """Deterministic confirm-panel content for the NON-workout staged writes.
+
+    Sibling of _format_staged_workout_for_confirmation, and the same rule: read
+    the staged SLOT — the exact payload execute will write — never the tool args
+    and never the model's phrasing. Only log_workout had one, so goal, set-edit
+    and comment panels fell through to json.dumps(arguments) and asked the user
+    to approve {"new_weight": 105, "old_reps": 7, ...}.
+
+    Weights are shown as the user types them (lbs), not the kg the slot stores,
+    via the same helper the workout panel uses — a panel that shows 47.6 for a
+    105 lb set is not an approval, it is a puzzle.
+    """
+    for key, render in (
+        ("goal", _preview_goal),
+        ("update_goal", _preview_update_goal),
+        ("delete_goal", _preview_delete_goal),
+        ("update_set", _preview_update_set),
+        ("delete_set", _preview_delete_set),
+        ("set_comment", _preview_set_comment),
+        ("bodyweight", _preview_bodyweight),
+        ("delete_bodyweight", _preview_delete_bodyweight),
+    ):
+        slot = _staged_writes.get(key)
+        if slot:
+            return json.dumps({"preview": render(slot), "staged_key": key})
+    return json.dumps({"error": "No staged write found."})
+
+
+def _preview_goal(s: dict) -> str:
+    name = _exercise_name_for_id(s.get("exercise_id")) or "this exercise"
+    return (f"New goal — {name}\n"
+            f"  Target: {_fmt_typed_weight(s['metric_weight'])} lbs × "
+            f"{s['reps']} reps\n  By: {s['target_date']}")
+
+
+def _preview_update_goal(s: dict) -> str:
+    return (f"Update goal\n"
+            f"  New target: {_fmt_typed_weight(s['new_metric_weight'])} lbs × "
+            f"{s['new_reps']} reps\n  By: {s['new_target_date']}")
+
+
+def _preview_delete_goal(s: dict) -> str:
+    return (f"Delete goal — {s.get('exercise_name', 'this exercise')}\n"
+            f"  Target date: {s.get('target_date')}")
+
+
+def _preview_update_set(s: dict) -> str:
+    return (f"Edit set — {s.get('exercise_name', 'this exercise')} on {s.get('date')}\n"
+            f"  New: {s.get('new_typed_weight')} {s.get('unit', 'lbs')} × "
+            f"{s.get('new_reps')} reps")
+
+
+def _preview_delete_set(s: dict) -> str:
+    return (f"Delete set — {s.get('exercise_name', 'this exercise')} on {s.get('date')}\n"
+            f"  {s.get('weight')} {s.get('unit', 'lbs')} × {s.get('reps')} reps")
+
+
+def _preview_set_comment(s: dict) -> str:
+    comment = (s.get("comment") or "").strip()
+    action = f'Note: "{comment}"' if comment else "Clear the note"
+    return (f"{action}\n"
+            f"  On: {s.get('exercise_name', 'this exercise')} — "
+            f"{s.get('weight')} {s.get('unit', 'lbs')} × {s.get('reps')} reps "
+            f"on {s.get('date')}")
+
+
+def _preview_bodyweight(s: dict) -> str:
+    action = "Update body weight" if s.get("row_id") else "Log body weight"
+    lines = [f"{action} — {s.get('date')}",
+             f"  {_fmt_typed_weight(s['body_weight_metric'])} lbs"]
+    # 0 is the "not measured" sentinel, never a reading — so it is not shown.
+    if s.get("body_fat"):
+        lines.append(f"  Body fat: {s['body_fat']}%")
+    return "\n".join(lines)
+
+
+def _preview_delete_bodyweight(s: dict) -> str:
+    return (f"Delete body weight — {s.get('date')}\n"
+            f"  {_fmt_typed_weight(s['body_weight_metric'])} lbs")
+
+
+# Labels for the DIRECT writes — the ones with no staged slot for the renderers
+# above to read, so their own arguments are the only description of what is
+# about to happen. Without this they reached the user as json.dumps(arguments):
+# the last place a raw blob was shown on a confirmation panel.
+_DIRECT_WRITE_LABELS: dict = {
+    "add_exercise_quirk":    "Remember a note about an exercise",
+    "update_exercise_quirk": "Change a remembered note about an exercise",
+    "delete_exercise_quirk": "Forget a remembered note about an exercise",
+    "delete_user_article":   "Delete an uploaded article — permanent",
+}
+
+
+def format_direct_write_for_confirmation(tool_name: str, arguments: dict) -> str:
+    """Readable panel text for a write that stages nothing."""
+    lines = [_DIRECT_WRITE_LABELS.get(
+        tool_name, f"Confirm: {tool_name.replace('_', ' ')}")]
+    for key, value in (arguments or {}).items():
+        if value in (None, ""):
+            continue
+        lines.append(f"  {key.replace('_', ' ').capitalize()}: {value}")
+    return "\n".join(lines)
+
+
+async def _format_staged_write_for_confirmation() -> str:
+    return await asyncio.to_thread(_format_staged_write_for_confirmation_sync)
+
+
+def _exercise_name_for_id(eid) -> str | None:
+    """Exercise name for an id, or None. Read-only and never raises — callers
+    are display/verification paths that must degrade rather than fail."""
+    if eid is None:
+        return None
+    from src.db import get_connection
+
+    try:
+        conn = get_connection(DB_PATH)
+        try:
+            row = conn.execute(
+                "SELECT name FROM exercise WHERE _id = ?", (eid,)).fetchone()
+        finally:
+            conn.close()
+        return row["name"] if row else None
+    except Exception:
+        return None
+
+
 def _format_staged_workout_for_confirmation_sync() -> str:
     """Deterministic confirm-panel content, read from _staged_writes["workout"]
     itself — the exact payload execute will write — never the log_workout args
@@ -1686,15 +2022,9 @@ def _format_staged_workout_for_confirmation_sync() -> str:
     if not staged_list:
         return json.dumps({"error": "No staged workout found."})
 
-    conn = get_connection(DB_PATH)
-    names: dict = {}
-    for w in staged_list:
-        eid = w["exercise_id"]
-        if eid not in names:
-            row = conn.execute(
-                "SELECT name FROM exercise WHERE _id = ?", (eid,)).fetchone()
-            names[eid] = row["name"] if row else f"Exercise #{eid}"
-    conn.close()
+    names = {w["exercise_id"]: (_exercise_name_for_id(w["exercise_id"])
+                                or f"Exercise #{w['exercise_id']}")
+             for w in staged_list}
 
     dates = {w["date"] for w in staged_list}
     shared_date = next(iter(dates)) if len(dates) == 1 else None
@@ -1725,8 +2055,29 @@ def _read_staged_workout_slot_sync() -> str:
     """Raw _staged_writes["workout"] slot as JSON — NOT the formatted preview.
     Deterministic shape for the later verification stages (an LLM verifier and
     a post-execute compare read the exact payload execute will write): always
-    {"staged_workouts": [...]}, empty list when nothing is staged."""
-    return json.dumps({"staged_workouts": _staged_writes.get("workout", [])})
+    {"staged_workouts": [...]}, empty list when nothing is staged.
+
+    exercise_NAME is resolved in for the verifier's benefit. The slot stores
+    exercise_id only, so the stage-2 verifier — asked to diff the user's own
+    words against this JSON — had no exercise name to match and returned FAIL
+    with "the exercise is missing from the JSON". On a FAIL the server discards
+    the batch, so a correctly staged workout was silently dropped while the
+    reply still told the user it was staged and awaiting confirmation.
+    Live-caught on a real log, after a disambiguation turn (the user's term and
+    the resolved exercise differ, which is exactly when the name matters most).
+
+    Read-only and best-effort: a lookup failure leaves the entry exactly as it
+    was rather than failing the read, since this slot also feeds execute.
+    """
+    staged = _staged_writes.get("workout", [])
+    enriched = []
+    for entry in staged:
+        if isinstance(entry, dict) and "exercise_name" not in entry:
+            name = _exercise_name_for_id(entry.get("exercise_id"))
+            if name:
+                entry = {**entry, "exercise_name": name}
+        enriched.append(entry)
+    return json.dumps({"staged_workouts": enriched})
 
 
 async def _read_staged_workout_slot() -> str:
@@ -1834,15 +2185,18 @@ async def _set_goal(arguments: dict) -> str:
 
 
 def _execute_staged_goal_sync() -> str:
-    from src.db import get_write_connection
-
     staged = _staged_writes.get("goal")
     if not staged:
         return json.dumps({"error": "No staged goal found. Call set_goal first."})
 
-    conn = get_write_connection(DB_PATH)
-    try:
-        conn.execute(
+    # The new row's id, captured for the WAL. Without it a journalled goal has
+    # no id to map FROM, so the update and delete that follow it can never be
+    # rewritten to the row replay creates — they name the old id, miss, and
+    # leave the goal orphaned. Observed live in Phase 8c.
+    new_id: dict = {}
+
+    def _write(conn):
+        cur = conn.execute(
             """INSERT INTO Goal
                (type_id, exercise_id, metric_weight, reps, unit, title, target_date,
                 sort_order, distance, duration_seconds, start_date)
@@ -1856,47 +2210,200 @@ def _execute_staged_goal_sync() -> str:
                 staged["start_date"],
             ),
         )
-        conn.commit()
-    except Exception as exc:
-        conn.rollback()
-        return json.dumps({"error": f"Failed to write goal: {exc}"})
-    finally:
-        conn.close()
+        new_id["goal_id"] = cur.lastrowid
+
+    ok, err = _guarded_write(
+        "write goal", _write,
+        focus="Goal",
+        expect={"Goal": {"added_count": 1}},
+    )
+    if not ok:
+        return err
 
     _staged_writes.pop("goal", None)
-    _wal_append("execute_staged_goal", staged)
-    return json.dumps({"success": True, "message": "Goal saved successfully."})
+    _wal_append("execute_staged_goal", {
+        **staged,
+        "goal_id": new_id.get("goal_id"),
+        "exercise_name": _exercise_name_for_id(staged.get("exercise_id")),
+    })
+    return json.dumps({"success": True, "verified": True,
+                       "message": "Goal saved successfully."})
 
 
 async def _execute_staged_goal() -> str:
     return await asyncio.to_thread(_execute_staged_goal_sync)
 
 
-def _log_bodyweight_sync(arguments: dict) -> str:
-    import datetime
-    from src.db import get_write_connection
+def _bodyweight_row_for(date_str: str):
+    """Today's weigh-in, or None. One entry per date is the rule."""
+    from src.db import get_connection
 
-    body_weight = float(arguments["body_weight"])
-    unit = arguments["unit"]
-    body_fat_percent = arguments.get("body_fat_percent")
-
-    today = datetime.date.today().isoformat()
-    body_weight_metric = body_weight / 2.2046
-
-    conn = get_write_connection(DB_PATH)
+    conn = get_connection(DB_PATH)
     try:
-        conn.execute(
-            "INSERT INTO BodyWeight (date, body_weight_metric, body_fat) VALUES (?, ?, ?)",
-            (today, body_weight_metric, body_fat_percent),
-        )
-        conn.commit()
-    except Exception as exc:
-        conn.rollback()
-        return json.dumps({"error": f"Failed to log body weight: {exc}"})
+        return conn.execute(
+            "SELECT * FROM BodyWeight WHERE date = ? ORDER BY _id LIMIT 1",
+            (date_str,)).fetchone()
     finally:
         conn.close()
 
-    return json.dumps({"success": True, "message": f"Body weight logged: {body_weight} {unit} on {today}."})
+
+def _log_bodyweight_sync(arguments: dict) -> str:
+    """STAGE a body-weight entry — insert, or update the day's existing one.
+
+    This used to write straight through: the only logging operation with no
+    staged/execute pair, which cost it four separate things. It had no update
+    and no delete, so "delete my bodyweight logs" was refused for want of the
+    tools. It was insert-only, so logging body fat after a weight produced a
+    SECOND weigh-in for the same day (live: 180 lbs/0.0 and 180 lbs/21.95, both
+    dated 2026-09-11). Its confirm panel showed a raw JSON blob, because the
+    renderers read the staged slot and a direct write has none. Staging fixes
+    all four at once.
+
+    UPSERT BY DATE. A weigh-in already recorded today means this is an edit of
+    it, not a second measurement — which is what "log my body fat" always meant.
+    """
+    import datetime
+
+    body_weight = arguments.get("body_weight")
+    unit = arguments.get("unit", "lbs")
+    date_str = arguments.get("date") or datetime.date.today().isoformat()
+    existing = _bodyweight_row_for(date_str)
+
+    # body_fat_percent alone is a valid turn once a weight exists for the day.
+    if body_weight is None:
+        if existing is None:
+            return json.dumps({
+                "error": True, "needs_clarification": True,
+                "message": (f"No body weight recorded for {date_str} yet. Ask the "
+                            f"user for their body weight before logging body fat."),
+            })
+        body_weight_metric = existing["body_weight_metric"]
+    else:
+        body_weight_metric = float(body_weight) / (2.2046 if unit == "lbs" else 1.0)
+
+    # BodyWeight.body_fat is NOT NULL, so an absent measurement is stored as 0 —
+    # the convention insert_training_log_set uses for distance/duration. It is a
+    # SENTINEL, not a reading: the read path turns 0 back into None so no
+    # analysis can average "not measured" into a body-fat trend.
+    if arguments.get("body_fat_percent") is not None:
+        body_fat = float(arguments["body_fat_percent"])
+    else:
+        body_fat = float(existing["body_fat"]) if existing else 0.0
+
+    _staged_writes["bodyweight"] = {
+        "row_id": existing["_id"] if existing else None,
+        "date": date_str,
+        "body_weight_metric": body_weight_metric,
+        "body_fat": body_fat,
+        "unit": unit,
+    }
+    typed = _fmt_typed_weight(body_weight_metric)
+    return json.dumps({
+        "staged": True,
+        "requires_confirmation": True,
+        "staged_key": "bodyweight",
+        "summary": (f"{'Update' if existing else 'Log'} body weight on {date_str}: "
+                    f"{typed} lbs" + (f", {body_fat}% body fat" if body_fat else "")),
+        "next_step": "Call execute_staged_bodyweight to complete the write.",
+    })
+
+
+def _execute_staged_bodyweight_sync() -> str:
+    staged = _staged_writes.get("bodyweight")
+    if not staged:
+        return json.dumps({"error": "No staged body weight found. Call log_bodyweight first."})
+
+    row_id = staged.get("row_id")
+    if row_id is None:
+        new_id: dict = {}
+
+        def _write(conn):
+            cur = conn.execute(
+                "INSERT INTO BodyWeight (date, body_weight_metric, body_fat) "
+                "VALUES (?, ?, ?)",
+                (staged["date"], staged["body_weight_metric"], staged["body_fat"]))
+            new_id["row_id"] = cur.lastrowid
+
+        expect = {"BodyWeight": {"added_count": 1}}
+        ok, err = _guarded_write("log body weight", _write,
+                                 focus="BodyWeight", expect=expect)
+        written_id = new_id.get("row_id")
+    else:
+        def _write(conn):
+            conn.execute(
+                "UPDATE BodyWeight SET body_weight_metric = ?, body_fat = ? WHERE _id = ?",
+                (staged["body_weight_metric"], staged["body_fat"], row_id))
+
+        ok, err = _guarded_write(
+            "update body weight", _write, focus="BodyWeight",
+            expect={"BodyWeight": {"modified": {row_id}}})
+        written_id = row_id
+    if not ok:
+        return err
+
+    _staged_writes.pop("bodyweight", None)
+    # row_id journalled so replay can map this entry the way goals and sets are
+    # mapped — without it an update or delete would reach for an id belonging to
+    # a different weigh-in in the uploaded database.
+    _wal_append("execute_staged_bodyweight", {**staged, "row_id": written_id})
+    typed = _fmt_typed_weight(staged["body_weight_metric"])
+    return json.dumps({
+        "success": True, "verified": True,
+        "message": f"Body weight {'updated' if row_id else 'logged'}: "
+                   f"{typed} lbs on {staged['date']}.",
+    })
+
+
+def _delete_bodyweight_sync(arguments: dict) -> str:
+    import datetime
+
+    date_str = arguments.get("date") or datetime.date.today().isoformat()
+    row = _bodyweight_row_for(date_str)
+    if row is None:
+        return json.dumps({"error": f"No body weight recorded on {date_str}."})
+    _staged_writes["delete_bodyweight"] = {
+        "row_id": row["_id"], "date": date_str,
+        "body_weight_metric": row["body_weight_metric"],
+    }
+    return json.dumps({
+        "staged": True,
+        "requires_confirmation": True,
+        "staged_key": "delete_bodyweight",
+        "summary": (f"Delete body weight on {date_str}: "
+                    f"{_fmt_typed_weight(row['body_weight_metric'])} lbs"),
+        "next_step": "Call execute_staged_bodyweight_delete to complete the write.",
+    })
+
+
+def _execute_staged_bodyweight_delete_sync() -> str:
+    staged = _staged_writes.get("delete_bodyweight")
+    if not staged:
+        return json.dumps({"error": "No staged body weight deletion found."})
+    ok, err = _guarded_write(
+        "delete body weight",
+        lambda conn: conn.execute(
+            "DELETE FROM BodyWeight WHERE _id = ?", (staged["row_id"],)),
+        focus="BodyWeight",
+        expect={"BodyWeight": {"removed": {staged["row_id"]}}},
+    )
+    if not ok:
+        return err
+    _staged_writes.pop("delete_bodyweight", None)
+    _wal_append("execute_staged_bodyweight_delete", staged)
+    return json.dumps({"success": True, "verified": True,
+                       "message": f"Body weight on {staged['date']} deleted."})
+
+
+async def _execute_staged_bodyweight() -> str:
+    return await asyncio.to_thread(_execute_staged_bodyweight_sync)
+
+
+async def _delete_bodyweight(arguments: dict) -> str:
+    return await asyncio.to_thread(_delete_bodyweight_sync, arguments)
+
+
+async def _execute_staged_bodyweight_delete() -> str:
+    return await asyncio.to_thread(_execute_staged_bodyweight_delete_sync)
 
 
 async def _log_bodyweight(arguments: dict) -> str:
@@ -2042,6 +2549,9 @@ def _update_goal_sync(arguments: dict) -> str:
     final_reps = int(new_target_reps) if new_target_reps is not None else current_reps
     final_date = new_target_date or current_date
 
+    if _app_owned("Goal", goal["_id"]):
+        return _refuse_app_row("goal")
+
     _staged_writes["update_goal"] = {
         "goal_id": goal["_id"],
         "new_metric_weight": final_metric,
@@ -2062,28 +2572,26 @@ async def _update_goal(arguments: dict) -> str:
 
 
 def _execute_staged_goal_update_sync() -> str:
-    from src.db import get_write_connection
-
     staged = _staged_writes.get("update_goal")
     if not staged:
         return json.dumps({"error": "No staged goal update found. Call update_goal first."})
 
-    conn = get_write_connection(DB_PATH)
-    try:
-        conn.execute(
+    ok, err = _guarded_write(
+        "update goal",
+        lambda conn: conn.execute(
             "UPDATE Goal SET metric_weight = ?, reps = ?, target_date = ? WHERE _id = ?",
-            (staged["new_metric_weight"], staged["new_reps"], staged["new_target_date"], staged["goal_id"]),
-        )
-        conn.commit()
-    except Exception as exc:
-        conn.rollback()
-        return json.dumps({"error": f"Failed to update goal: {exc}"})
-    finally:
-        conn.close()
+            (staged["new_metric_weight"], staged["new_reps"],
+             staged["new_target_date"], staged["goal_id"])),
+        focus="Goal",
+        expect={"Goal": {"modified": {staged["goal_id"]}}},
+    )
+    if not ok:
+        return err
 
     _staged_writes.pop("update_goal", None)
     _wal_append("execute_staged_goal_update", staged)
-    return json.dumps({"success": True, "message": "Goal updated successfully."})
+    return json.dumps({"success": True, "verified": True,
+                       "message": "Goal updated successfully."})
 
 
 async def _execute_staged_goal_update() -> str:
@@ -2134,6 +2642,9 @@ def _delete_goal_sync(arguments: dict) -> str:
     if not goal:
         return json.dumps({"error": f"No goal found for '{exercise_name}' with target date {target_date}."})
 
+    if _app_owned("Goal", goal["_id"]):
+        return _refuse_app_row("goal")
+
     _staged_writes["delete_goal"] = {
         "goal_id": goal["_id"],
         "exercise_name": exercise_name,
@@ -2153,25 +2664,24 @@ async def _delete_goal(arguments: dict) -> str:
 
 
 def _execute_staged_goal_delete_sync() -> str:
-    from src.db import get_write_connection
-
     staged = _staged_writes.get("delete_goal")
     if not staged:
         return json.dumps({"error": "No staged goal deletion found. Call delete_goal first."})
 
-    conn = get_write_connection(DB_PATH)
-    try:
-        conn.execute("DELETE FROM Goal WHERE _id = ?", (staged["goal_id"],))
-        conn.commit()
-    except Exception as exc:
-        conn.rollback()
-        return json.dumps({"error": f"Failed to delete goal: {exc}"})
-    finally:
-        conn.close()
+    ok, err = _guarded_write(
+        "delete goal",
+        lambda conn: conn.execute(
+            "DELETE FROM Goal WHERE _id = ?", (staged["goal_id"],)),
+        focus="Goal",
+        expect={"Goal": {"removed": {staged["goal_id"]}}},
+    )
+    if not ok:
+        return err
 
     _staged_writes.pop("delete_goal", None)
     _wal_append("execute_staged_goal_delete", staged)
-    return json.dumps({"success": True, "message": "Goal deleted successfully."})
+    return json.dumps({"success": True, "verified": True,
+                       "message": "Goal deleted successfully."})
 
 
 async def _execute_staged_goal_delete() -> str:
@@ -2225,6 +2735,8 @@ def _update_workout_set_sync(arguments: dict) -> str:
         })
 
     target = matches[0]
+    if _app_owned("training_log", target["_id"]):
+        return _refuse_app_row("set")
     current_typed = round(target["typed_value"], 2)
     current_reps = target["reps"]
 
@@ -2257,37 +2769,32 @@ async def _update_workout_set(arguments: dict) -> str:
 
 
 def _execute_staged_set_update_sync() -> str:
-    from src.db import get_connection, get_write_connection
-
     staged = _staged_writes.get("update_set")
     if not staged:
         return json.dumps({"error": "No staged set update found. Call update_workout_set first."})
 
-    # Recheck PR: is the new weight a new all-time best for this exercise?
-    read_conn = get_connection(DB_PATH)
-    pr_row = read_conn.execute(
-        "SELECT MAX(metric_weight) AS max_w FROM training_log WHERE exercise_id = ? AND _id != ?",
-        (staged["exercise_id"], staged["set_id"]),
-    ).fetchone()
-    other_max = pr_row["max_w"] if pr_row and pr_row["max_w"] is not None else 0.0
-    is_pr = 1 if staged["new_metric_weight"] > other_max else 0
-
-    conn = get_write_connection(DB_PATH)
-    try:
-        conn.execute(
-            "UPDATE training_log SET metric_weight = ?, reps = ?, is_personal_record = ? WHERE _id = ?",
-            (staged["new_metric_weight"], staged["new_reps"], is_pr, staged["set_id"]),
-        )
-        conn.commit()
-    except Exception as exc:
-        conn.rollback()
-        return json.dumps({"error": f"Failed to update set: {exc}"})
-    finally:
-        conn.close()
+    # is_personal_record is DELIBERATELY not written here. It is FitNotes' column
+    # and means "was a PR when performed" — a historical marker, which is why the
+    # data holds 155 flagged rows across 47 exercises with more than one each.
+    # This used to recompute it as "is this the best right now" and write that in,
+    # so editing a 2024 set stamped it from today's data, or cleared a genuine
+    # historical PR because a later set now exceeds it. Deleting a set already
+    # leaves the column alone; editing one now does too.
+    ok, err = _guarded_write(
+        "update set",
+        lambda conn: conn.execute(
+            "UPDATE training_log SET metric_weight = ?, reps = ? WHERE _id = ?",
+            (staged["new_metric_weight"], staged["new_reps"], staged["set_id"])),
+        focus="training_log",
+        expect={"training_log": {"modified": {staged["set_id"]}}},
+    )
+    if not ok:
+        return err
 
     _staged_writes.pop("update_set", None)
     _wal_append("execute_staged_set_update", staged)
-    return json.dumps({"success": True, "message": "Set updated successfully.", "is_personal_record": bool(is_pr)})
+    return json.dumps({"success": True, "verified": True,
+                       "message": "Set updated successfully."})
 
 
 async def _execute_staged_set_update() -> str:
@@ -2339,6 +2846,8 @@ def _delete_workout_set_sync(arguments: dict) -> str:
         })
 
     target = matches[0]
+    if _app_owned("training_log", target["_id"]):
+        return _refuse_app_row("set")
     typed_w = round(target["typed_value"], 2)
 
     _staged_writes["delete_set"] = {
@@ -2364,26 +2873,165 @@ async def _delete_workout_set(arguments: dict) -> str:
     return await asyncio.to_thread(_delete_workout_set_sync, arguments)
 
 
-def _execute_staged_set_delete_sync() -> str:
-    from src.db import get_write_connection
+def _set_set_comment_sync(arguments: dict) -> str:
+    """Stage a note on an EXISTING set.
 
+    Deliberately NOT subject to the app-data lock. A comment is a note the agent
+    and user write together — about form, about how a set felt — and it stays
+    available even on a set FitNotes recorded and which therefore cannot itself
+    be edited. Comment is a separate table keyed by owner_id, so writing one
+    never touches the training_log row it hangs on.
+
+    Resolution mirrors _delete_workout_set_sync exactly: same match, same
+    disambiguation, so "the set I mean" means the same thing across every tool.
+    """
+    from src.db import get_connection
+
+    exercise_name = arguments["exercise_name"]
+    date = arguments.get("date") or ""
+    if not date.strip():
+        return json.dumps({
+            "needs_clarification": True,
+            "message": "Date required to identify the specific set. Choose an option:",
+            "options": {
+                "1": "Give an approximate date — I'll show records within 7 days of it",
+                "2": "Show me the last 10 sessions for this exercise (newest first)",
+                "3": "Give a date range — I'll show all sessions within it",
+            },
+        })
+    weight = float(arguments["weight"])
+    reps = int(arguments["reps"])
+    unit = arguments["unit"]
+    comment = (arguments.get("comment") or "").strip()
+    stored_weight = weight / 2.2046
+
+    conn = get_connection(DB_PATH)
+    row = conn.execute("SELECT _id FROM exercise WHERE name = ?", (exercise_name,)).fetchone()
+    if not row:
+        return json.dumps({"error": f"Exercise '{exercise_name}' not found."})
+    exercise_id = row["_id"]
+
+    matches = conn.execute(
+        """SELECT tl._id FROM training_log tl
+           WHERE tl.exercise_id = ? AND tl.date = ? AND tl.reps = ?
+             AND ABS(tl.metric_weight - ?) < 0.01
+           ORDER BY tl._id ASC""",
+        (exercise_id, date, reps, stored_weight),
+    ).fetchall()
+    if not matches:
+        return json.dumps({"error": f"No set found for '{exercise_name}' on {date}: {weight} {unit} × {reps} reps."})
+    if len(matches) > 1:
+        return json.dumps({
+            "needs_clarification": True,
+            "message": f"Multiple identical sets found ({weight} {unit} × {reps} reps) on {date}. Cannot determine which to annotate.",
+        })
+
+    _staged_writes["set_comment"] = {
+        "set_id": matches[0]["_id"],
+        "exercise_name": exercise_name,
+        "date": date,
+        "weight": weight,
+        "reps": reps,
+        "unit": unit,
+        "stored_weight": stored_weight,
+        "exercise_id": exercise_id,
+        "comment": comment,
+    }
+    return json.dumps({
+        "staged": True,
+        "requires_confirmation": True,
+        "staged_key": "set_comment",
+        "action": "clear the note on" if not comment else "note on",
+        "summary": f"{exercise_name} {weight} {unit} × {reps} reps on {date}",
+        "comment": comment,
+        "next_step": "Call execute_staged_set_comment to complete the write.",
+    })
+
+
+async def _set_set_comment(arguments: dict) -> str:
+    return await asyncio.to_thread(_set_set_comment_sync, arguments)
+
+
+def _execute_staged_set_comment_sync() -> str:
+    staged = _staged_writes.get("set_comment")
+    if not staged:
+        return json.dumps({"error": "No staged set comment found. Call set_set_comment first."})
+
+    from src.db import get_connection
+
+    # One note per set: replace whatever is there. Count first so the guard is
+    # told the exact number of rows to expect — a replace is delete+insert, a
+    # first note is one insert, and clearing is a delete.
+    conn = get_connection(DB_PATH)
+    existing = [r["_id"] for r in conn.execute(
+        "SELECT _id FROM Comment WHERE owner_type_id = 1 AND owner_id = ?",
+        (staged["set_id"],))]
+    conn.close()
+
+    comment = staged["comment"]
+    expect = {"Comment": {}}
+    if existing:
+        expect["Comment"]["removed"] = set(existing)
+    if comment:
+        expect["Comment"]["added_count"] = 1
+
+    def _write(conn):
+        if existing:
+            conn.execute(
+                "DELETE FROM Comment WHERE owner_type_id = 1 AND owner_id = ?",
+                (staged["set_id"],))
+        if comment:
+            conn.execute(
+                "INSERT INTO Comment (date, owner_type_id, owner_id, comment) "
+                "VALUES (?, 1, ?, ?)",
+                (staged["date"], staged["set_id"], comment))
+
+    ok, err = _guarded_write("set comment", _write, focus="Comment", expect=expect)
+    if not ok:
+        return err
+
+    _staged_writes.pop("set_comment", None)
+    _wal_append("execute_staged_set_comment", staged)
+    return json.dumps({
+        "success": True,
+        "verified": True,
+        "message": ("Note cleared." if not comment else f"Note saved: {comment}"),
+    })
+
+
+async def _execute_staged_set_comment() -> str:
+    return await asyncio.to_thread(_execute_staged_set_comment_sync)
+
+
+def _execute_staged_set_delete_sync() -> str:
     staged = _staged_writes.get("delete_set")
     if not staged:
         return json.dumps({"error": "No staged set deletion found. Call delete_workout_set first."})
 
-    conn = get_write_connection(DB_PATH)
-    try:
-        conn.execute("DELETE FROM training_log WHERE _id = ?", (staged["set_id"],))
-        conn.commit()
-    except Exception as exc:
-        conn.rollback()
-        return json.dumps({"error": f"Failed to delete set: {exc}"})
-    finally:
-        conn.close()
+    # The row was verified present at STAGING time, but time passes before
+    # execute (a restored checkpoint, a concurrent change), and a DELETE matching
+    # zero rows raises nothing. This used to report "Set deleted successfully"
+    # having deleted nothing. Now the transaction only commits if exactly this
+    # row — and nothing else, in any table — actually went.
+    ok, err = _guarded_write(
+        "delete set",
+        lambda conn: conn.execute(
+            "DELETE FROM training_log WHERE _id = ?", (staged["set_id"],)),
+        focus="training_log",
+        expect={"training_log": {"removed": {staged["set_id"]}}},
+    )
+    if not ok:
+        return err
 
     _staged_writes.pop("delete_set", None)
+    # Keep the id so verify_set_deleted has something to check AFTER the slot is
+    # drained. Without it that tool falls back to "is there any row like this?",
+    # which answers yes-it's-deleted for a row that never existed — including
+    # for entities it does not handle at all.
+    _staged_writes["last_deleted_set"] = {"set_id": staged["set_id"]}
     _wal_append("execute_staged_set_delete", staged)
-    return json.dumps({"success": True, "message": "Set deleted successfully."})
+    return json.dumps({"success": True, "verified": True,
+                       "message": "Set deleted successfully."})
 
 
 async def _execute_staged_set_delete() -> str:
@@ -2430,25 +3078,50 @@ async def _verify_set_updated(exercise_name: str, date: str, expected_weight: fl
 
 
 def _verify_set_deleted_sync(exercise_name: str, date: str, weight: float, reps: int, unit: str) -> str:
+    """Confirm a set this session actually deleted is gone.
+
+    ABSENCE IS ONLY EVIDENCE IF THE ROW WAS EVER THERE. This used to answer
+    "is there any row matching this description?" and report `verified: true`
+    whenever there wasn't — so it could only ever say yes. Live, the agent
+    called it after a GOAL deletion (weight=150, reps=1, date=2026-12-31), no
+    such training_log set existed, and it cheerfully confirmed. The user was
+    told their goal was deleted while it sat in the database.
+
+    So verification is anchored to the id the delete actually targeted, which
+    the staged slot recorded. No staged delete, no id, no verdict — "cannot
+    verify" is the honest answer and the caller must not read it as success.
+    """
     from src.db import get_connection
 
-    stored_weight = weight / 2.2046
+    staged = _staged_writes.get("delete_set") or _staged_writes.get("last_deleted_set")
+    set_id = staged.get("set_id") if isinstance(staged, dict) else None
+    if set_id is None:
+        return json.dumps({
+            "verified": False,
+            "unverifiable": True,
+            "message": (
+                "Cannot verify: no set deletion was staged in this session, so "
+                "there is no row to check. This does NOT mean anything was "
+                "deleted — do not report a deletion on the strength of it."
+            ),
+        })
+
     conn = get_connection(DB_PATH)
-    row = conn.execute("SELECT _id FROM exercise WHERE name = ?", (exercise_name,)).fetchone()
-    if not row:
-        return json.dumps({"error": f"Exercise '{exercise_name}' not found."})
-    exercise_id = row["_id"]
+    try:
+        still_there = conn.execute(
+            "SELECT _id FROM training_log WHERE _id = ?", (set_id,)).fetchone()
+    finally:
+        conn.close()
 
-    match = conn.execute(
-        """SELECT tl._id FROM training_log tl
-           WHERE tl.exercise_id = ? AND tl.date = ? AND tl.reps = ?
-             AND ABS(tl.metric_weight - ?) < 0.01""",
-        (exercise_id, date, reps, stored_weight),
-    ).fetchone()
-
-    if not match:
-        return json.dumps({"verified": True, "message": "✅ Set confirmed deleted — no longer in database."})
-    return json.dumps({"verified": False, "message": "❌ Set still exists — delete may have failed."})
+    if still_there:
+        return json.dumps({
+            "verified": False,
+            "message": f"❌ Set {set_id} still exists — the delete did not take effect.",
+        })
+    return json.dumps({
+        "verified": True,
+        "message": f"✅ Set {set_id} confirmed deleted — the row it named is gone.",
+    })
 
 
 async def _verify_set_deleted(exercise_name: str, date: str, weight: float, reps: int, unit: str) -> str:

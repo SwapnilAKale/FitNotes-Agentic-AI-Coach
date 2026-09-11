@@ -31,7 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from src.stdio_utf8 import force_utf8_stdio
 force_utf8_stdio()
 
-from src.agent import AgentSession
+from src.agent import EXECUTE_TOOLS, AgentSession
 from src.coordinator import Coordinator, MSG_VERIFY_RESTATE, format_verify_fail_message
 from src import checkpoint as _ckpt
 from src import settings, wal
@@ -306,17 +306,45 @@ def _ingest_article_sync(filename: str, text: str) -> dict:
     }
 
 
-# Tools that actually write to the database (second phase of the staged write pattern).
-# Staging tools (log_workout, set_goal, etc.) are allowed through so the MCP server
-# can store the staged payload; we only gate on the execute step.
-EXECUTE_TOOLS = {
-    "execute_staged_workout",
-    "execute_staged_goal",
-    "execute_staged_goal_update",
-    "execute_staged_goal_delete",
-    "execute_staged_set_update",
-    "execute_staged_set_delete",
+# Tools that actually write to the database (second phase of the staged write
+# pattern). Staging tools (log_workout, set_goal, etc.) are allowed through so
+# the MCP server can store the staged payload; we only gate on the execute step.
+#
+# IMPORTED, not restated. This was a local copy and it drifted: it never gained
+# execute_staged_set_comment, so the handler below treated that execute as a
+# staging call and a note reached the database with no confirmation panel.
+# src.agent.EXECUTE_TOOLS is the single definition; adding a staged write there
+# gates it here by construction.
+
+# Writes with NO staged/execute pair, so EXECUTE_TOOLS never sees them and they
+# land the moment the agent calls them. The panel blocks the call, and on
+# confirm the turn re-runs with allow_execute set and the agent re-issues it.
+#
+# log_bodyweight has left this set — it is properly staged now, which got it an
+# update, a delete, and a panel rendered from its slot. What remains are the
+# writes to the OTHER stores: exercise quirks (data/user_context.json) and
+# uploaded articles (Chroma). delete_user_article irreversibly destroys a
+# document the user uploaded and, until now, did it with no prompt whatsoever.
+DIRECT_WRITE_TOOLS = {
+    "add_exercise_quirk", "update_exercise_quirk", "delete_exercise_quirk",
+    "delete_user_article",
 }
+
+# Every tool whose call must stop at the confirmation panel.
+GATED_TOOLS = EXECUTE_TOOLS | DIRECT_WRITE_TOOLS
+
+# Returned by the handler INSTEAD of False when the panel is raised. Distinct
+# because "the user is looking at this" and "the user said no" are different
+# events that shared one return value: the agent read the deferral as a refusal
+# and recorded "the write action was cancelled, do not retry" in its history,
+# which nothing ever corrected once the write went through on confirm.
+from src.agent import CONFIRM_DEFERRED  # noqa: E402
+# The panel text for a direct write. Imported from the MCP module so the
+# rendering lives beside the other confirm-panel renderers rather than being a
+# second, drifting copy in the server.
+from mcp_servers.combined_server import (  # noqa: E402
+    format_direct_write_for_confirmation as _format_direct_write,
+)
 
 # Mutable dict avoids `global` keyword inside async functions.
 _state: dict = {
@@ -341,16 +369,27 @@ coordinator: Coordinator | None = None
 agent_lock: asyncio.Lock | None = None
 
 
-async def _confirmation_handler(tool_name: str, arguments: dict) -> bool:
-    if tool_name in EXECUTE_TOOLS:
+async def _confirmation_handler(tool_name: str, arguments: dict):
+    if tool_name in GATED_TOOLS:
         if _state["allow_execute"]:
             return True
-        # Block the execute and signal the HTTP layer to return confirmation_required.
+        # Block the write and signal the HTTP layer to return
+        # confirmation_required. CONFIRM_DEFERRED, never False: the write is in
+        # front of the user, not refused by them, and the agent records those
+        # two outcomes very differently.
         _state["pending_confirmation"] = True
         _state["confirmation_preview"] = (
-            _state["staging_preview"] or f"Confirm: {tool_name.replace('_', ' ')}"
+            _state["staging_preview"]
+            # A direct writer has no staged slot to preview, so its own
+            # arguments are the payload — and unlike a staging call they are
+            # the ONLY description of what is about to be written. Rendered as
+            # labelled lines rather than json.dumps: this was the last place a
+            # raw blob was put in front of the user for approval.
+            or (_format_direct_write(tool_name, arguments)
+                if tool_name in DIRECT_WRITE_TOOLS else "")
+            or f"Confirm: {tool_name.replace('_', ' ')}"
         )
-        return False
+        return CONFIRM_DEFERRED
     # Staging tool — capture its args so the confirmation card can show them.
     # Fix 3: log_workout now stages a multi-exercise day as a batch (N calls before
     # one execute), so ACCUMULATE its previews instead of overwriting — otherwise the
@@ -673,6 +712,21 @@ async def _process_turn(message: str = "", *,
             # not the LLM's phrasing (either can diverge from the payload).
             # Defensive: any failure falls back to the args-based preview so
             # the panel never blanks.
+            if _state["pending_execute_kind"] != "workout":
+                # SIBLING staged writes (goal / set edit / comment). These had
+                # no renderer, so the panel showed a raw json.dumps of the tool
+                # arguments — the user approving {"new_weight": 105, ...}.
+                # Same rule as the workout branch: render the staged SLOT, and
+                # fall back to today's blob rather than ever blanking the panel.
+                try:
+                    rendered = json.loads(await session.call_tool(
+                        "format_staged_write_for_confirmation", {}))
+                    if rendered.get("preview"):
+                        preview = rendered["preview"]
+                        preview_source = "slot"
+                except Exception as exc:
+                    print(f"[server] staged-write preview failed: {exc}",
+                          file=sys.stderr)
             if _state["pending_execute_kind"] == "workout":
                 # Slot FIRST: _confirmation_handler arms pending at tool CALL
                 # time (a pre-call hook cannot see the outcome), so the slot is
@@ -905,6 +959,75 @@ def _with_decomposed_answer(outcome_text: str) -> str:
     return outcome_text
 
 
+# ONE staged key, ONE execute tool. Deterministic, so a confirmed write cannot
+# be skipped, misfired, or narrated instead of performed — the same guarantee
+# execute_staged_workout already has by being server-driven.
+_SIBLING_EXECUTE = {
+    "goal":        "execute_staged_goal",
+    "update_goal": "execute_staged_goal_update",
+    "delete_goal": "execute_staged_goal_delete",
+    "update_set":  "execute_staged_set_update",
+    "delete_set":  "execute_staged_set_delete",
+    "set_comment": "execute_staged_set_comment",
+}
+
+
+async def _commit_staged_sibling():
+    """Execute the confirmed non-workout staged write. None ⇒ nothing staged.
+
+    Reads the staged KEY (not the tool args, not the model's intent) and calls
+    the one execute tool it maps to. The execute already runs the integrity
+    guard, so its result is the outcome — no second opinion, and no verify_*
+    tool standing in for a write that never happened.
+    """
+    try:
+        rendered = json.loads(await session.call_tool(
+            "format_staged_write_for_confirmation", {}))
+    except Exception as exc:
+        print(f"[server] staged-write read failed: {exc}", file=sys.stderr)
+        return None
+    key = rendered.get("staged_key")
+    tool = _SIBLING_EXECUTE.get(key)
+    if tool is None:
+        # Nothing staged, or a key we have no execute for. Never guess — fall
+        # through and let the agent answer, which is the pre-existing behaviour.
+        return None
+
+    preview = rendered.get("preview", "")
+    _state["allow_execute"] = True
+    try:
+        outcome = json.loads(await session.call_tool(tool, {}))
+    except Exception as exc:
+        return _error_response(exc)
+    finally:
+        _state["allow_execute"] = False
+
+    if outcome.get("success"):
+        # set_goal flips _staged_active at staging time, and the agent loop that
+        # would clear it is bypassed when the SERVER drives the execute — so
+        # clear it here, exactly as the workout branch does, or a committed slot
+        # stays "active" and a resume goes looking for it.
+        session._staged_active = False
+        # Same seam as the workout branch: the SERVER wrote it, so nothing else
+        # updates the agent's history and it would go on believing the edit is
+        # still pending — the 4b bug, which these flows had no repair for.
+        session.note_host_write(
+            outcome.get("message", "Saved and verified."), preview)
+        _ckpt.clear_staged_checkpoint()
+        if coordinator is not None:
+            coordinator._pending_log_carry = False
+        return JSONResponse(content={
+            "type": "answer",
+            "text": _with_decomposed_answer(
+                f"✅ {outcome.get('message', 'Saved and verified.')}"),
+        })
+    return JSONResponse(content={
+        "type": "error",
+        "text": _with_decomposed_answer(
+            f"❌ {outcome.get('message') or outcome.get('error') or 'Write failed — nothing was saved.'}"),
+    })
+
+
 @app.post("/confirm")
 async def confirm(body: ConfirmRequest):
     # /confirm is the request that actually executes staged DB writes —
@@ -952,6 +1075,20 @@ async def confirm(body: ConfirmRequest):
         # atomic write-and-verify (rollback on mismatch), so its result IS the
         # outcome; the agent is never re-prompted and cannot misfire mid-flow.
         if body.confirmed and pending_kind == "workout":
+            # BEFORE execute — execute pops the slot, and this renders the slot.
+            # Deterministic (the confirm-panel renderer, reading the exact
+            # payload about to be written), so the agent is handed the very text
+            # the user approved rather than a sentence composed here. Without it
+            # the agent has no exercise/weight/rep/date to answer "what did you
+            # just save?" with, and asks the user to clarify instead.
+            # Best-effort: a preview failure must never block the write.
+            written_preview = ""
+            try:
+                written_preview = json.loads(await session.call_tool(
+                    "format_staged_workout_for_confirmation", {})).get("preview", "")
+            except Exception as exc:
+                print(f"[server] written-preview read failed: {exc}",
+                      file=sys.stderr)
             try:
                 raw = await session.call_tool("execute_staged_workout", {})
                 outcome = json.loads(raw)
@@ -966,7 +1103,8 @@ async def confirm(body: ConfirmRequest):
                 # happened. Pass the server's own verified message, not a
                 # re-description.
                 session.note_host_write(
-                    outcome.get("message", "Workout saved and verified."))
+                    outcome.get("message", "Workout saved and verified."),
+                    written_preview)
                 # The committed batch's checkpoint must die NOW (guarded) — a
                 # later "continue" restoring an already-written batch would be
                 # a double write. This is the keep-until-confirm lifecycle's
@@ -986,8 +1124,26 @@ async def confirm(body: ConfirmRequest):
                 "text": _with_decomposed_answer(
                     f"❌ {outcome.get('message') or outcome.get('error') or 'Workout write failed — nothing was saved.'}"),
             })
-        # Sibling staged flows (goal / set edits) keep the agent-driven execute:
-        # allow_execute unblocks their execute_* tools and the agent is re-prompted.
+        # SIBLING STAGED FLOWS (goal / set edit / comment) — the SERVER commits
+        # them, exactly as it already does for workouts above.
+        #
+        # They used to be left to the agent: allow_execute was unblocked and the
+        # agent re-prompted, on the assumption it would call its execute tool.
+        # Live, it did not — after a confirmed goal delete it skipped straight to
+        # verify_set_deleted, which (wrongly) said yes, and reported the goal
+        # deleted while the row sat in the database. Nothing noticed the staged
+        # slot was never drained.
+        #
+        # A confirmed write must not depend on the model choosing to perform it.
+        # The staged key names exactly one execute tool, so the mapping is
+        # deterministic and the execute's own result — carrying the integrity
+        # guard's verdict — is the outcome.
+        if body.confirmed:
+            outcome = await _commit_staged_sibling()
+            if outcome is not None:
+                return outcome
+        # Not confirmed, or nothing staged to commit: fall through to the agent
+        # so a cancel is narrated normally.
         _state["allow_execute"] = body.confirmed
         message = "Yes, confirmed, please execute" if body.confirmed else "Cancel that"
         try:
@@ -1119,6 +1275,32 @@ def _reconcile_new_exercises(new_exercises: list) -> dict:
                 "already_known": []}
 
 
+def _record_app_data_watermark() -> dict:
+    """Mark everything in the freshly uploaded database as the app's.
+
+    Must run AFTER the new file is in place and BEFORE replay, so the agent's
+    replayed rows land above the mark and stay editable while everything the
+    user logged in FitNotes falls at or below it and becomes untouchable.
+
+    _id is AUTOINCREMENT, so ids only ever increase — one integer per table is
+    enough to separate "came from the app" from "the agent added this", with no
+    per-row bookkeeping and a natural reset on each upload.
+    """
+    from src.db import get_connection
+
+    marks: dict = {}
+    conn = get_connection(DB_PATH)
+    try:
+        for table in ("training_log", "Goal"):
+            row = conn.execute(f"SELECT COALESCE(MAX(_id), 0) AS m FROM [{table}]").fetchone()
+            marks[table] = int(row["m"])
+    finally:
+        conn.close()
+    settings.set_setting("app_data_watermark", marks)
+    print(f"[Server] app-data watermark: {marks}")
+    return marks
+
+
 async def _maybe_replay_wal() -> dict:
     """
     Replay journaled writes onto the freshly written DB file — unless the
@@ -1182,6 +1364,7 @@ async def upload_db(file: UploadFile):
                 # The fresh backup just wiped any agent-written rows — replay
                 # the journaled writes onto the new file before the agent
                 # reinitializes against it (unless the user disabled replay).
+                await asyncio.to_thread(_record_app_data_watermark)
                 wal_result = await _maybe_replay_wal()
 
         except Exception as e:
@@ -1231,6 +1414,7 @@ async def upload_confirm():
             _state["pending_upload_contents"] = None
 
             # Same replay gate as /upload — this path also replaces the DB file.
+            await asyncio.to_thread(_record_app_data_watermark)
             wal_result = await _maybe_replay_wal()
 
     reload_response = await reload_db(new_exercises=new_exercises)

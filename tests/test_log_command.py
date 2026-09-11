@@ -393,9 +393,20 @@ def test_raw_slot_tool_returns_staged_slot_json(db):
 
     slot = json.loads(cs._read_staged_workout_slot_sync())
     # The RAW slot — the exact payload execute will write — not the preview.
-    assert slot["staged_workouts"] == cs._staged_writes["workout"]
+    # exercise_name is added on READ only (see _read_staged_workout_slot_sync):
+    # the stage-2 verifier diffs the user's words against this JSON and had no
+    # name to match, so it FAILed a correctly staged workout and the server
+    # discarded it. Every key execute actually reads must still be untouched.
     assert len(slot["staged_workouts"]) == 1
-    assert slot["staged_workouts"][0]["exercise_id"] == 1
+    entry = slot["staged_workouts"][0]
+    stored = cs._staged_writes["workout"][0]
+    assert entry["exercise_id"] == 1
+    for key in ("exercise_id", "date", "sets"):
+        assert entry[key] == stored[key], f"read altered {key}, which execute writes"
+    assert entry.keys() - stored.keys() == {"exercise_name"}
+    assert entry["exercise_name"] == "Test Press"
+    # the stored slot itself is NOT mutated — execute writes the original
+    assert "exercise_name" not in stored
     assert "preview" not in slot
 
 
@@ -411,3 +422,79 @@ def test_raw_slot_tool_dispatchable_but_unexposed(db):
     # …but absent from list_tools (unexpose-not-delete, like execute_staged_workout).
     exposed = {t.name for t in asyncio.run(cs.list_tools())}
     assert "read_staged_workout_slot" not in exposed
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# The SIBLING confirm panels — goal / set edit / comment
+#
+# Only log_workout had a deterministic renderer, so every other staged write was
+# shown to the user as json.dumps(tool arguments): they were asked to approve
+# {"new_weight": 105, "old_reps": 7, "date": "2026-08-08", ...}. Seen live in
+# Phase 4 screenshots. Same rule as the workout panel — render the staged SLOT,
+# the exact payload execute will write, never the args and never the model's
+# phrasing — and show weights as typed (lbs), not the kg the slot stores.
+# ══════════════════════════════════════════════════════════════════════════════
+
+_SIBLING_SLOTS = {
+    "goal": ({"exercise_id": 1, "metric_weight": 68.0396, "reps": 1,
+              "title": "t", "target_date": "2026-12-31"},
+             ["150", "2026-12-31"]),
+    "update_goal": ({"goal_id": 1, "new_metric_weight": 70.3075, "new_reps": 1,
+                     "new_target_date": "2026-12-31"},
+                    ["155", "2026-12-31"]),
+    "delete_goal": ({"goal_id": 1, "exercise_name": "Test Press",
+                     "target_date": "2026-12-31"},
+                    ["Test Press", "2026-12-31"]),
+    "update_set": ({"set_id": 9, "exercise_name": "Test Press",
+                    "date": "2026-09-10", "new_typed_weight": 105,
+                    "new_reps": 7, "unit": "lbs"},
+                   ["Test Press", "105", "7", "2026-09-10"]),
+    "delete_set": ({"set_id": 9, "exercise_name": "Test Press",
+                    "date": "2026-09-10", "weight": 102, "reps": 6,
+                    "unit": "lbs"},
+                   ["Test Press", "102", "6", "2026-09-10"]),
+    "set_comment": ({"set_id": 9, "exercise_name": "Test Press",
+                     "date": "2026-07-22", "weight": 100, "reps": 5,
+                     "unit": "lbs", "comment": "elbows flared"},
+                    ["elbows flared", "Test Press", "2026-07-22"]),
+}
+
+
+@pytest.mark.parametrize("key", sorted(_SIBLING_SLOTS))
+def test_every_sibling_staged_write_renders_a_readable_panel(db, key):
+    payload, must_contain = _SIBLING_SLOTS[key]
+    cs._staged_writes.clear()
+    cs._staged_writes[key] = payload
+    out = json.loads(cs._format_staged_write_for_confirmation_sync())
+    preview = out.get("preview", "")
+    assert out.get("staged_key") == key
+    for token in must_contain:
+        assert str(token) in preview, f"{key} panel omits {token!r}: {preview!r}"
+    # never a raw dump of the payload
+    assert "{" not in preview and '":' not in preview
+
+
+def test_a_cleared_note_says_so_rather_than_showing_an_empty_string(db):
+    cs._staged_writes.clear()
+    cs._staged_writes["set_comment"] = {
+        "set_id": 9, "exercise_name": "Test Press", "date": "2026-07-22",
+        "weight": 100, "reps": 5, "unit": "lbs", "comment": ""}
+    preview = json.loads(cs._format_staged_write_for_confirmation_sync())["preview"]
+    assert "Clear the note" in preview
+
+
+def test_goal_panels_show_typed_lbs_not_stored_kg(db):
+    """A panel reading 68 for a 150 lb goal is a puzzle, not an approval."""
+    cs._staged_writes.clear()
+    cs._staged_writes["goal"] = {"exercise_id": 1, "metric_weight": 68.0396,
+                                 "reps": 1, "title": "t",
+                                 "target_date": "2026-12-31"}
+    preview = json.loads(cs._format_staged_write_for_confirmation_sync())["preview"]
+    assert "150" in preview
+    assert "68" not in preview
+
+
+def test_nothing_staged_returns_an_error_not_a_blank_panel(db):
+    cs._staged_writes.clear()
+    out = json.loads(cs._format_staged_write_for_confirmation_sync())
+    assert "error" in out and "preview" not in out

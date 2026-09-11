@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from src.stdio_utf8 import force_utf8_stdio
 force_utf8_stdio()
 
-from src.agent import AgentSession
+from src.agent import EXECUTE_TOOLS, AgentSession
 from src.coordinator import Coordinator, MSG_VERIFY_RESTATE, format_verify_fail_message
 
 # Rate-limit errors re-raised by Coordinator — mirror _is_rate_limit from coordinator.py
@@ -78,6 +78,9 @@ async def _finalize_staged_workout(session, coordinator, result, question) -> st
     except Exception as exc:
         print(f"[cli] staged-slot read failed: {exc}", file=sys.stderr)
     verdict = {"verdict": "ERROR", "reason": "verify unavailable"}
+    # Initialized here, not inside the try: it is read again after the except
+    # branch (for note_host_write), where an exception would leave it unbound.
+    fmt: dict = {}
     try:
         if not slot_raw:
             # Slot read failed above — non-verifiable, never diff a good
@@ -114,7 +117,11 @@ async def _finalize_staged_workout(session, coordinator, result, question) -> st
         session._staged_active = False
         # The execute happened outside the agent's turn, so nothing else updates
         # its history — without this it still believes the batch is pending.
-        session.note_host_write(outcome.get("message", "Workout saved and verified."))
+        # The preview goes with it: the outcome message names no exercise,
+        # weight, rep or date, so without it the agent cannot answer "what did
+        # you just save?" and asks the user to clarify instead.
+        session.note_host_write(outcome.get("message", "Workout saved and verified."),
+                                fmt.get("preview", ""))
         return f"✅ {outcome.get('message', 'Workout saved and verified.')}"
     return f"❌ {outcome.get('message') or outcome.get('error') or 'Workout write failed — nothing was saved.'}"
 
@@ -190,9 +197,11 @@ async def _confirm_restored_workout(session, coordinator, result) -> str:
             if outcome.get("success"):
                 session._staged_active = False
                 _ckpt.clear_staged_checkpoint()
-                # See _confirm_staged_workout: the agent is not otherwise told.
+                # See _finalize_staged_workout: the agent is not otherwise told,
+                # and the preview is what lets it say WHAT was saved.
                 session.note_host_write(
-                    outcome.get("message", "Workout saved and verified."))
+                    outcome.get("message", "Workout saved and verified."),
+                    preview or "")
                 return f"✅ {outcome.get('message', 'Workout saved and verified.')}"
             return f"❌ {outcome.get('message') or outcome.get('error') or 'Workout write failed — nothing was saved.'}"
         if reply in {"no", "n", "cancel"}:
@@ -221,11 +230,11 @@ async def main() -> None:
         print(f"⚠️  WRITE ACTION REQUESTED: {tool_name}")
         print(f"{'='*60}")
 
-        if tool_name in {
-            "execute_staged_workout", "execute_staged_goal",
-            "execute_staged_goal_update", "execute_staged_goal_delete",
-            "execute_staged_set_update", "execute_staged_set_delete",
-        }:
+        # Same shared set the web server gates on. It was an inline copy here
+        # and drifted the same way — execute_staged_set_comment fell to the
+        # else-branch, so a note write still prompted but showed raw args
+        # instead of the "permanently modify" warning.
+        if tool_name in EXECUTE_TOOLS:
             print("The agent wants to EXECUTE the staged write to your database.")
             print("This will permanently modify your FitNotes data.")
         else:

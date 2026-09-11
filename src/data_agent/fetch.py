@@ -165,9 +165,14 @@ def _fetch_all_bodyweight(conn: sqlite3.Connection) -> list:
         FROM BodyWeight
         ORDER BY date ASC
     """)
+    # body_fat 0 means NOT MEASURED, not zero percent. The column is NOT NULL,
+    # so an absent measurement has to be stored as a number — but it must not
+    # leave the database as one, or an average or trend will quietly fold a
+    # non-measurement in as a real reading. The read boundary is where the
+    # sentinel is translated back.
     return [{"date": row["date"],
              "weight": row["body_weight_metric"],
-             "body_fat": row["body_fat"],
+             "body_fat": row["body_fat"] or None,
              "comments": row["comments"]}
             for row in cur.fetchall()]
 

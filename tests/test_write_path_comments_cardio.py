@@ -467,6 +467,34 @@ def test_execute_verify_commit_path(db):
     assert cs._staged_writes.get("workout") is None   # slot popped ONLY on commit
 
 
+def _skip_one_insert(monkeypatch):
+    """Inject a REAL partial write: the last staged set silently fails to land
+    while the writer still reports an id for it.
+
+    These tests used to fake the fault by patching _readback_count, the old
+    narrow "are my ids visible?" check. That check is gone — the execute now
+    asserts, inside the transaction, that the rows which appeared are exactly the
+    rows it inserted and that nothing else in the database moved. So the fault is
+    injected where a real one would occur, and the guard has to notice by itself.
+
+    Returns the fault's state dict so a control run can switch it off without
+    monkeypatch.undo(), which would also revert the DB_PATH the fixture set.
+    """
+    import src.db as _db
+    real = _db.insert_training_log_set
+    state = {"calls": 0, "active": True}
+
+    def flaky(conn, exercise_id, date, s):
+        if state["active"]:
+            state["calls"] += 1
+            if state["calls"] == 2:      # second set never reaches the table
+                return 10_000_000 + state["calls"]
+        return real(conn, exercise_id, date, s)
+
+    monkeypatch.setattr(_db, "insert_training_log_set", flaky)
+    return state
+
+
 def test_execute_verify_rollback_on_mismatch(db, monkeypatch, tmp_path):
     # Read-back sees fewer rows than staged → rollback: ZERO rows reach the DB,
     # slot RETAINED (confirm can retry), no WAL record. Then the SAME retained
@@ -480,19 +508,23 @@ def test_execute_verify_rollback_on_mismatch(db, monkeypatch, tmp_path):
         "exercise_name": "Treadmill", "date": "2026-07-01",
         "sets": [{"distance": 2.0, "duration_seconds": 600}]}))
 
-    real_readback = cs._readback_count
-    monkeypatch.setattr(cs, "_readback_count",
-                        lambda conn, ids: real_readback(conn, ids) - 1)
+    fault = _skip_one_insert(monkeypatch)
     out = json.loads(cs._execute_staged_workout_sync())
     assert out["success"] is False and out["verified"] is False
-    assert out["sets_expected"] == 2 and out["sets_found"] == 1
+    assert out["integrity_rejected"] is True
+    # HOW it failed, not merely that it did: two sets were staged, one row landed.
+    # The user-facing message stays a plain sentence; the delta rides beside it.
+    assert out["delta"]["rows_changed"] == 1 and out["delta"]["rows_expected"] == 2
     assert "rolled back" in out["message"]
     assert _rows(db) == []                       # negative: nothing reached the DB
     assert len(cs._staged_writes["workout"]) == 2   # slot retained, batch intact
     assert wal.get_records() == []               # no WAL journal on rollback
 
     # Control: remove the fault, retry the retained slot → commits and verifies.
-    monkeypatch.setattr(cs, "_readback_count", real_readback)
+    # Non-vacuity — it is the rejection that suppressed the write, not a writer
+    # that was broken all along. Switched off via the fault's own flag, since
+    # monkeypatch.undo() would also revert the DB_PATH the fixture set.
+    fault["active"] = False
     done = json.loads(cs._execute_staged_workout_sync())
     assert done["success"] and done["verified"]
     assert len(_rows(db)) == 2
@@ -515,7 +547,7 @@ def test_no_committed_but_unverified_state(db, monkeypatch, tmp_path):
         "exercise_name": "Test Press", "date": "2026-07-01",
         "sets": [{"weight": 100.0, "unit": "lbs", "reps": 5},
                  {"weight": 105.0, "unit": "lbs", "reps": 3}]}))
-    monkeypatch.setattr(cs, "_readback_count", lambda conn, ids: 0)
+    _skip_one_insert(monkeypatch)
     out = json.loads(cs._execute_staged_workout_sync())
     assert out["success"] is False
     assert _rows(db) == before                   # DB unchanged — no dirty state persists

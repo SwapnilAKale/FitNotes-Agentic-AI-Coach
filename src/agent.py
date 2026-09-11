@@ -25,9 +25,21 @@ MODEL = "gemini-3.1-flash-lite"
 
 SERVERS_DIR = Path(__file__).parent.parent / "mcp_servers"
 
-# Hoisted from the old answer() loop locals (unchanged values): the write
-# tools guarded by the confirmation gate, and the execute-stage tools whose
-# ATTEMPT flips staging_reached_confirm.
+# NOT "all the execute tools" — see EXECUTE_TOOLS below for that, and do not
+# reconcile the two. These are the staged SLOTS whose execute the HOST drives
+# after the turn ends, which is why an attempt on one flips
+# staging_reached_confirm: the user has seen the panel and the write follows
+# outside the turn, so a success claim in the answer is legitimate.
+#
+# Widening this to the agent-driven executes would be actively harmful.
+# staging_reached_confirm is one of the two conditions that stop the
+# write-success claim gate from firing, so setting it for set-edit and
+# goal-edit turns would switch that gate OFF exactly where it was added. Those
+# executes need nothing here: the agent calls them itself and their success:true
+# already lands in db_write_effect.
+#
+# Its second use — clearing _staged_active — is consistent for the same reason:
+# only log_workout / set_goal ever set that flag.
 _EXECUTE_TOOL_NAMES = {"execute_staged_workout", "execute_staged_goal"}
 
 # Marks a host-supplied note in the conversation history (see note_host_write).
@@ -35,6 +47,23 @@ _EXECUTE_TOOL_NAMES = {"execute_staged_workout", "execute_staged_goal"}
 # be mined as a remembered fact about the user, so _auto_extract_memories skips
 # anything carrying it.
 HOST_WRITE_NOTE_MARK = "[write committed]"
+
+# A confirmation handler returns True to approve and False to decline. This
+# third value means "I have put this in front of the user and am waiting" —
+# neither of the above.
+#
+# It exists because those two events shared one return value. The web raises its
+# panel by returning False, which the agent read as the user REFUSING: it
+# recorded "The write action was cancelled. Do not retry it." in its history,
+# and when the user then confirmed and the write went through, nothing corrected
+# that record. Live: after a goal was created and updated, the agent said "the
+# previous actions were cancelled and no changes were made" — an invitation to
+# log the same thing twice. Workouts escaped it only because note_host_write
+# repairs them afterwards; agent-driven executes had no such repair.
+#
+# The CLI blocks on input() and genuinely knows the answer, so its False stays a
+# real decline. Only a host with its own confirmation UI returns this.
+CONFIRM_DEFERRED = "deferred"
 
 # TWO JOBS, TWO SETS. These were a single set named WRITE_TOOLS, which worked
 # only for as long as "needs the user's approval" and "can change stored data"
@@ -51,16 +80,51 @@ HOST_WRITE_NOTE_MARK = "[write committed]"
 #     answer may only say something was saved if one of these reported it.
 #   CONFIRM_TOOLS  — must be approved by the user before running. A superset:
 #     every DB write, plus anything else destructive enough to deserve a prompt.
-DB_WRITE_TOOLS = {
-    "log_workout", "set_goal", "log_bodyweight",
+# THE SECOND PHASE of the staged-write pattern, and the ONE definition of it.
+# server.py and cli.py each used to keep their own copy for their confirmation
+# handlers, and both drifted: execute_staged_set_comment was missing from both,
+# so on the web the handler did not recognise it as an execute, took the staging
+# branch, and let a note write to the database with NO confirmation panel —
+# found live. Callers import this; they do not restate it.
+EXECUTE_TOOLS = {
     "execute_staged_workout", "execute_staged_goal",
-    "update_goal", "execute_staged_goal_update",
-    "delete_goal", "execute_staged_goal_delete",
-    "update_workout_set", "execute_staged_set_update",
-    "delete_workout_set", "execute_staged_set_delete",
+    "execute_staged_goal_update", "execute_staged_goal_delete",
+    "execute_staged_set_update", "execute_staged_set_delete",
+    "execute_staged_set_comment",
+    # Body weight was the last logging operation without a staged/execute pair.
+    # It wrote straight through, which left it with no update, no delete, a
+    # duplicate row whenever body fat was added after a weight, and a raw JSON
+    # confirm panel. Staging it fixed all four.
+    "execute_staged_bodyweight", "execute_staged_bodyweight_delete",
 }
 
-CONFIRM_TOOLS = DB_WRITE_TOOLS | {
+# First phase: tools that stage a write.
+_STAGING_WRITE_TOOLS = {
+    "log_workout", "set_goal",
+    "update_goal", "delete_goal",
+    "update_workout_set", "delete_workout_set",
+    # A note on a set is a write like any other: confirmed before it lands, and
+    # it does change stored data (the Comment table).
+    "set_set_comment",
+    "log_bodyweight", "delete_bodyweight",
+}
+
+DB_WRITE_TOOLS = _STAGING_WRITE_TOOLS | EXECUTE_TOOLS
+
+# Writes to the OTHER stores — exercise quirks live in data/user_context.json,
+# articles in the Chroma index. Deliberately NOT in DB_WRITE_TOOLS: that set
+# feeds db_write_effect, the structural fact the claim gate uses to decide
+# whether a TRAINING-DATABASE write happened, and counting these would let "I
+# saved that" pass unchallenged on a turn that touched no training data.
+#
+# They still need approval. delete_user_article irreversibly destroys something
+# the user uploaded and, until this was added, did it with no prompt at all.
+_OTHER_STORE_WRITE_TOOLS = {
+    "add_exercise_quirk", "update_exercise_quirk", "delete_exercise_quirk",
+    "delete_user_article",
+}
+
+CONFIRM_TOOLS = DB_WRITE_TOOLS | _OTHER_STORE_WRITE_TOOLS | {
     # The agent may ASK to drop a staged batch when the user says so, but the
     # drop itself still happens only after an explicit confirmation — the same
     # seam as every write. Host-driven discards (turn-start cleanup, cancel) go
@@ -131,7 +195,14 @@ answers the question:
 ✏️ WRITE — LOGGING NEW DATA:
   log_workout — stage one exercise of a workout day; call once per exercise, all
     in the same turn, to stage the full day (see WRITE ACTIONS for the flow)
-  log_bodyweight — log body weight entry
+
+⚖️ WRITE — BODY WEIGHT (one entry per date):
+  log_bodyweight — stage a body weight for a date. If that date already has an
+    entry this UPDATES it, so to add body fat to a day already weighed, pass
+    body_fat_percent and OMIT body_weight. Never log a second entry for a day.
+  execute_staged_bodyweight — call immediately after log_bodyweight is confirmed
+  delete_bodyweight — remove a date's body weight entry
+  execute_staged_bodyweight_delete — call immediately after delete_bodyweight is confirmed
 
 🎯 WRITE — GOALS:
   set_goal — set a new strength or performance goal
@@ -146,6 +217,23 @@ answers the question:
   execute_staged_set_update — call immediately after update_workout_set is confirmed
   delete_workout_set — permanently remove a specific logged set
   execute_staged_set_delete — call immediately after delete_workout_set is confirmed
+
+  YOU CANNOT CHANGE SETS THE FITNOTES APP RECORDED. Corrections work only on
+  entries YOU added. Anything that came from the user's FitNotes backup is
+  read-only here — the app is the source of truth for what they logged. If a
+  correction is refused for that reason, say so plainly and tell them to make the
+  change in FitNotes and upload the database again. Do not retry, and do not look
+  for another way round it.
+
+📝 NOTES ON A SET:
+  set_set_comment — add, replace, or clear the note on an EXISTING set (a form
+    cue, how it felt). Pass an empty comment to clear it.
+  execute_staged_set_comment — call immediately after set_set_comment is confirmed
+
+  A NOTE IS ALWAYS ALLOWED, even on a set FitNotes recorded and which therefore
+  cannot itself be edited. If the user wants to change what a set SAYS rather
+  than what it holds — "add that my elbows flared", "note that this felt heavy" —
+  this is the tool, and it works on any set.
 
 🗑️ DISCARD STAGED WORK:
   discard_staged_writes — drop everything staged and NOT YET CONFIRMED (the
@@ -270,6 +358,9 @@ class AgentSession:
         self._turn_write_effect: bool = False
         self._turn_staged: bool = False
         self._turn_write_attempted: bool = False
+        # The user-ready sentence explaining why a write was blocked (app-data
+        # lock or integrity rejection), or None. Surfaced as write_block_reason.
+        self._turn_write_block_reason: str | None = None
         self._base_system_prompt: str = SYSTEM_PROMPT
         self.chat_history: list[dict] = []
         self._cache_name: str | None = None
@@ -689,7 +780,8 @@ class AgentSession:
             [{"role": "user",      "content": question},
              {"role": "assistant", "content": answer}], 0)
 
-    def note_host_write(self, outcome_text: str) -> None:
+    def note_host_write(self, outcome_text: str,
+                        written_preview: str = "") -> None:
         """Tell the agent that the HOST committed a staged batch.
 
         WHY THIS EXISTS. Workouts are staged by the agent and executed by the
@@ -708,14 +800,58 @@ class AgentSession:
         second source of truth. The server's counts also let the agent notice a
         partial write disagreeing with what it staged.
 
-        Recorded as an assistant turn — the agent's own prior knowledge, which
-        is what it is — and marked so memory extraction skips it.
+        `written_preview` is that same slot rendered by
+        format_staged_workout_for_confirmation — the deterministic renderer
+        behind the confirmation panel, reading the exact payload execute wrote.
+        Not a re-description either: it is the very text the user approved.
+
+        THE NOTE MUST EXPLAIN ITSELF. Round one shipped just
+        "[write committed] <outcome>" as an ASSISTANT turn, and the agent went
+        on saying the set was "currently staged and has not been saved yet"
+        (reproduced live twice). Two reasons, both fixed here:
+
+        1. Nothing ever taught the model what the mark means — it is defined for
+           the memory-extraction filter, never in the system prompt — while the
+           staging tool result beside it says "the server commits the batch when
+           the user confirms". Its last EXPLAINED state was "awaiting
+           confirmation", so that is what it reported. Hence the framing
+           sentence, and the USER role: an assistant note is the model's own
+           prior speech, easy to read past; a user-role note is an external fact
+           it must account for. Same shape as the cancelled-write note in
+           _op_finalize_cancelled, which does land.
+
+        2. The outcome message names no exercise, weight, rep or date, so asked
+           "what did you just save?" the agent had nothing to answer WITH and
+           asked the user to clarify an unambiguous question — costing a round
+           trip and implying nothing was saved. The preview is what makes a
+           direct answer possible.
+
+        Marked so memory extraction skips it (matched on startswith, so the
+        role change is safe).
         """
         if not outcome_text:
             return
-        self._save_exchange(
-            [{"role": "assistant",
-              "content": f"{HOST_WRITE_NOTE_MARK} {outcome_text}"}], 0)
+        # NO INSTRUCTION VERBS. The first version said "If asked what was just
+        # saved, STATE IT directly from the record below" — and the reply came
+        # back "I STATED that you performed 1 set of 102 lbs…", the agent
+        # narrating its own speech act instead of reporting the save, because
+        # the verb was sitting right there to mirror. So this note describes
+        # facts and properties only; it never tells the agent how to speak.
+        # test_row1_note_gives_the_agent_no_verb_to_mirror holds the line.
+        note = (
+            f"{HOST_WRITE_NOTE_MARK} The user confirmed this workout and the "
+            f"server wrote it to the database. It is saved, not pending — the "
+            f"staging area is now empty."
+        )
+        if written_preview:
+            note += f"\n\nSaved to the database:\n{written_preview}"
+        note += f"\n\nServer outcome: {outcome_text}"
+        note += (
+            "\n\nThis record is complete and authoritative: it is what the "
+            "database now holds, there is nothing ambiguous in it, and no tool "
+            "call is needed to describe it."
+        )
+        self._save_exchange([{"role": "user", "content": note}], 0)
 
     # ------------------------------------------------------------------ #
     #  Main answer loop (LangGraph operational subgraph)                   #
@@ -742,6 +878,7 @@ class AgentSession:
         self._turn_write_effect = False
         self._turn_staged = False
         self._turn_write_attempted = False
+        self._turn_write_block_reason = None
 
         turn_id = new_turn_id()
         state = await get_operational_graph().ainvoke(
@@ -812,6 +949,7 @@ class AgentSession:
             "tool_calls_made": 0,
             "execute_attempted": False,
             "write_cancelled": False,
+            "write_deferred": False,
         }
 
     async def _op_agent_step(self, state: dict, cache) -> dict:
@@ -905,6 +1043,7 @@ class AgentSession:
         gemini_contents = cache.gemini_contents
 
         write_cancelled = False
+        write_deferred = False
         tool_response_parts: list = []
         for tc_dict in tool_calls:
             tool_name = tc_dict["function"]["name"]
@@ -918,21 +1057,38 @@ class AgentSession:
 
             if tool_name in CONFIRM_TOOLS and self.confirmation_handler:
                 approved = await self.confirmation_handler(tool_name, arguments)
-                if not approved:
-                    result = json.dumps({
-                        "cancelled": True,
-                        "message": "Write action cancelled by user. No changes were made.",
-                    })
+                if approved is not True:
+                    # BLOCKED EITHER WAY — the write does not run. Only what the
+                    # agent is TOLD differs, and that difference matters: a
+                    # deferral reported as a cancellation left the agent
+                    # believing a confirmed write never happened.
+                    deferred = (approved == CONFIRM_DEFERRED)
+                    if deferred:
+                        payload = {
+                            "deferred": True,
+                            "message": (
+                                "Shown to the user for confirmation. Nothing is "
+                                "cancelled and nothing is lost — the write runs "
+                                "as soon as they confirm. Do not retry it now "
+                                "and do not tell the user it was cancelled or "
+                                "that nothing was saved."
+                            ),
+                        }
+                    else:
+                        payload = {
+                            "cancelled": True,
+                            "message": "Write action cancelled by user. No changes were made.",
+                        }
+                    result = json.dumps(payload)
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call_id,
                         "content": result,
                     })
                     tool_response_parts.append(types.Part.from_function_response(
-                        name=tool_name,
-                        response={"cancelled": True, "message": "Write action cancelled by user. No changes were made."},
-                    ))
+                        name=tool_name, response=payload))
                     write_cancelled = True
+                    write_deferred = deferred
                     continue
 
             try:
@@ -969,6 +1125,17 @@ class AgentSession:
                         self._turn_write_effect = True
                     if "staged_key" in parsed:
                         self._turn_staged = True
+                    # WHY a write was blocked, captured structurally. Both
+                    # blocking paths already return a machine-readable tag and a
+                    # user-ready sentence; without this the sentence only reaches
+                    # the user if the model repeats it, and the model instead
+                    # fabricated success on two of three live refusals. FIRST
+                    # reason of the turn wins — it is the one that explains.
+                    if self._turn_write_block_reason is None:
+                        if parsed.get("integrity_rejected"):
+                            self._turn_write_block_reason = parsed.get("message")
+                        elif parsed.get("refused"):
+                            self._turn_write_block_reason = parsed.get("error")
             except (json.JSONDecodeError, TypeError):
                 pass
 
@@ -1012,7 +1179,25 @@ class AgentSession:
             "tool_calls_made": state["tool_calls_made"] + len(tool_calls),
             "execute_attempted": execute_attempted,
             "write_cancelled": write_cancelled,
+            "write_deferred": write_deferred,
             "iteration": state["iteration"] + 1,
+        }
+
+    def _turn_write_facts(self, state: dict) -> dict:
+        """The per-turn write facts every finalize node must report.
+
+        ONE definition, because there are three finalize nodes and they must not
+        disagree. They previously repeated this block verbatim, so a new fact had
+        to be added in three places and would be silently missing from whichever
+        one was forgotten — the Coordinator would then see a different turn
+        depending on how the turn happened to end.
+        """
+        return {
+            "staging_reached_confirm": state["execute_attempted"],
+            "db_write_effect": self._turn_write_effect,
+            "staged_this_turn": self._turn_staged,
+            "write_attempted": self._turn_write_attempted,
+            "write_block_reason": self._turn_write_block_reason,
         }
 
     async def _op_finalize_answer(self, state: dict) -> dict:
@@ -1049,22 +1234,37 @@ class AgentSession:
             "answer": final_answer,
             "tool_calls_made": tool_calls_made,
             "error": None,
-            "staging_reached_confirm": state["execute_attempted"],
-            "db_write_effect": self._turn_write_effect,
-            "staged_this_turn": self._turn_staged,
-            "write_attempted": self._turn_write_attempted,
+            **self._turn_write_facts(state),
         }}
 
     def _op_finalize_cancelled(self, state: dict) -> dict:
-        """Node: a write was cancelled at the confirmation gate."""
+        """Node: a write stopped at the confirmation gate — declined OR deferred.
+
+        Both end the turn without writing, so they share a node, but they must
+        not share a STORY. This note is the agent's lasting record of what
+        happened, and for a deferral the old text was false twice over: the
+        write was not cancelled, and it is about to be retried by the host.
+        Nothing corrected it afterwards on the agent-driven execute paths, so
+        the agent went on telling the user their goal was never saved.
+        """
         question = state["question"]
         messages = state["messages"]
+        deferred = bool(state.get("write_deferred"))
         messages.append({
             "role": "user",
-            "content": "The write action was cancelled. Do not retry it.",
+            "content": (
+                "That write is now in front of the user for confirmation. It "
+                "was NOT cancelled and nothing has been lost — it will be "
+                "written as soon as they confirm. Do not retry it and do not "
+                "say it was cancelled or that nothing was saved."
+                if deferred else
+                "The write action was cancelled. Do not retry it."
+            ),
         })
         self._save_exchange(messages, state["new_exchange_start"])
-        _cancelled_answer = state.get("last_text") or "Write action cancelled. No changes were made."
+        _cancelled_answer = state.get("last_text") or (
+            "Waiting for your confirmation before writing."
+            if deferred else "Write action cancelled. No changes were made.")
         _now = _datetime.now().isoformat()
         self.chat_history.append({"role": "user", "text": question, "timestamp": _now})
         self.chat_history.append({"role": "assistant", "text": _cancelled_answer, "timestamp": _now})
@@ -1073,10 +1273,7 @@ class AgentSession:
             "answer": _cancelled_answer,
             "tool_calls_made": state["tool_calls_made"],
             "error": None,
-            "staging_reached_confirm": state["execute_attempted"],
-            "db_write_effect": self._turn_write_effect,
-            "staged_this_turn": self._turn_staged,
-            "write_attempted": self._turn_write_attempted,
+            **self._turn_write_facts(state),
         }}
 
     def _op_finalize_max_iter(self, state: dict) -> dict:
@@ -1092,10 +1289,7 @@ class AgentSession:
             "answer": _max_iter_answer,
             "tool_calls_made": state["tool_calls_made"],
             "error": "max_iterations_reached",
-            "staging_reached_confirm": state["execute_attempted"],
-            "db_write_effect": self._turn_write_effect,
-            "staged_this_turn": self._turn_staged,
-            "write_attempted": self._turn_write_attempted,
+            **self._turn_write_facts(state),
         }}
 
     # ------------------------------------------------------------------ #

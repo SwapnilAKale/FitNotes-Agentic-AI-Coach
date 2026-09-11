@@ -528,6 +528,7 @@ question is worse than answering a borderline one, and the analytical package is
 deterministic and validated (it hard-stops on integrity failure) where the
 operational read path is hand-rolled SQL and the riskier surface for a read.
 
+
 ════ CONTEXT ════
 If a [PREVIOUS TURNS] block is present, use it ONLY to resolve pronouns
 and follow-up references in the current message ("what about my squat?",
@@ -665,6 +666,58 @@ def _norm_name(s: str) -> str:
     strip, collapse internal whitespace (same discipline as the resolver's
     Tier-0 space-normalized compare)."""
     return re.sub(r"\s+", " ", (s or "").strip().lower())
+
+
+def unresolved_scope_note(
+    unresolved_names,
+    exercise_muscle_map,
+    effective_names,
+    query_period_days,
+):
+    """The note prepended when a named exercise produced no rows. '' when none.
+
+    TWO DIFFERENT MISSES, TWO DIFFERENT SENTENCES. This used to say "wasn't
+    found in your workout history" for both, which reported Lat Pulldown — 366
+    logged sets — as an exercise the user had never performed.
+
+      • absent from the WINDOW  is a fact about the window
+      • absent from the HISTORY is a fact about the user
+
+    Saying the second when only the first is true is a plain untruth about their
+    training, and it is the half of the bug the user actually noticed.
+
+    The distinction is READ FROM DATA, never inferred: exercise_muscle_map
+    carries `ever_logged` per name, sourced all-time rather than from the
+    window, precisely so this call cannot become a guess.
+    """
+    names = [n for n in (unresolved_names or []) if str(n).strip()]
+    if not names:
+        return ""
+
+    emap = exercise_muscle_map or {}
+
+    def _ever_logged(name) -> bool:
+        entry = emap.get(name)
+        if entry is None:
+            entry = next((v for k, v in emap.items()
+                          if _norm_name(k) == _norm_name(name)), None)
+        return bool(isinstance(entry, dict) and entry.get("ever_logged"))
+
+    stale  = [n for n in names if _ever_logged(n)]
+    absent = [n for n in names if not _ever_logged(n)]
+
+    parts = []
+    if stale:
+        window = (f"the last {query_period_days} days"
+                  if query_period_days else "this period")
+        parts.append(f"you haven't done {', '.join(stale)} in {window}")
+    if absent:
+        verb = "isn't" if len(absent) == 1 else "aren't"
+        parts.append(f"{', '.join(absent)} {verb} in your training history")
+
+    coverage = (", ".join(effective_names) if effective_names
+                else "your overall training")
+    return f"Note: {'; '.join(parts)}, so this answer covers {coverage} instead."
 
 
 _VALID_LANES = {"analytical", "operational", "recall", "out_of_scope"}
@@ -832,9 +885,22 @@ MSG_VERIFY_RESTATE = "I may have misread that — could you re-state the workout
 _WRITE_SUCCESS_CLAIM_RE = re.compile(
     r"(?i)(?:"
     r"successfully\s+(?:logg|sav|record|writ|add|updat|delet)"
+    # ...and the reverse order, which is how the tools themselves phrase it
+    # ("Set deleted successfully.", "Goal saved successfully."). Uncaught until
+    # a live check turned it up: an agent echoing the tool's own success string
+    # after a REFUSED write would have sailed through.
+    r"|(?:logged|saved|recorded|written|added|updated|deleted|removed)\s+successfully"
     r"|(?:logged|saved|recorded|written|added)\b[^.\n]{0,60}?"
     r"(?:successfully|to\s+your\s+(?:database|log|workout|fitnotes))"
-    r"|has\s+been\s+(?:logged|saved|recorded|written|added)"
+    # deleted/removed/updated were missing, and they are the claims this whole
+    # arc is about. Live: after a confirmed goal delete that never executed, the
+    # reply "The goal ... has been deleted from your database" reached the user
+    # untouched — the LOOSE detector matched it, but that one only runs on turns
+    # where a write tool was called, and the post-confirm continuation called
+    # none. So on exactly the turn that mattered, only this alternation was
+    # looking, and it could not see a deletion claim.
+    r"|has\s+been\s+(?:logged|saved|recorded|written|added"
+    r"|deleted|removed|updated)"
     r"|✅[^\n]{0,80}(?:logged|saved|recorded|written)"
     r")"
 )
@@ -876,6 +942,73 @@ _WRITE_COMPLETION_CLAIM_RE = re.compile(
     r")"
 )
 
+# ONE message, phrased for every write. It used to end "re-state your logging
+# request (tip: start with /log)", which is nonsense after a failed goal or set
+# edit — but splitting it in two turned out to be undoable: the gate fires
+# hardest when the agent called NO tool (it invented the success outright), and
+# in that case nothing distinguishes a logging turn from a goal turn.
+# log_boundary/fallback_write are not that signal either — the canonical live
+# failure is a bare "Yes thats correct" confirming a log, which trips neither.
+# So the tip is made conditional in the WORDING instead of in the code.
+# A sentence that DENIES doing something is not a claim of having done it.
+# Live-caught: the agent correctly refused an edit — "I cannot delete that set
+# because it comes from your FitNotes app" — and the completion detector matched
+# on subject+verb, so the honest explanation was replaced by the generic no-write
+# warning. The user learned nothing was written but never why.
+#
+# Checked PER CLAUSE, not per answer and not merely per sentence. "I couldn't
+# change the weight, but I logged the set" is ONE sentence carrying both a
+# denial and a real claim — sentence-level splitting let the denial cover the
+# lie, which is precisely the failure this gate exists to stop (verified: the
+# sentence-level version scored that case wrong). So the split also breaks at
+# contrastive joins, where a denial stops applying and a new assertion begins.
+_DENIAL_RE = re.compile(
+    r"(?i)\b(?:cannot|can't|cant|could\s+not|couldn't|won't|will\s+not"
+    r"|unable\s+to|did\s+not|didn't|do\s+not|don't|no\s+longer\s+able"
+    r"|not\s+able\s+to|wasn't|was\s+not|weren't|were\s+not|isn't|is\s+not"
+    r"|nothing\s+was)\b"
+)
+_CLAUSE_SPLIT_RE = re.compile(
+    r"(?i)[.!?\n;]+|\s+(?:but|however|although|though|whereas|yet)\s+")
+
+
+def _write_claim_clause(answer: str, *, write_flow: bool,
+                        pattern=None) -> str | None:
+    """The clause asserting a write landed, or None. Denials are ignored.
+
+    The narrow detector runs on every operational turn; the looser one only
+    where a write was actually attempted, which is what keeps research prose
+    ("the study removed participants") out of scope.
+
+    Returns the offending CLAUSE rather than a bool so the suppression warning
+    can name it. Twice in one live check a suppression had to be diagnosed from
+    an answer truncated at 120 chars, and the second time the trigger was past
+    the cut — the log said what was suppressed but never why.
+    """
+    for clause in _CLAUSE_SPLIT_RE.split(answer or ""):
+        if not clause.strip() or _DENIAL_RE.search(clause):
+            continue
+        # `pattern` swaps in a different claim family (the staged-claim mirror)
+        # while keeping the clause splitting and the denial handling, which are
+        # the parts that were expensive to get right — "I couldn't stage that"
+        # must not read as a staging claim any more than "I couldn't save it"
+        # reads as a save.
+        if pattern is not None:
+            if pattern.search(clause):
+                return clause.strip()
+            continue
+        if _WRITE_SUCCESS_CLAIM_RE.search(clause):
+            return clause.strip()
+        if write_flow and _WRITE_COMPLETION_CLAIM_RE.search(clause):
+            return clause.strip()
+    return None
+
+
+def _claims_a_write_happened(answer: str, *, write_flow: bool) -> bool:
+    """True when the answer asserts a write landed, ignoring denials."""
+    return _write_claim_clause(answer, write_flow=write_flow) is not None
+
+
 MSG_NO_WRITE_OCCURRED = (
     "⚠️ Nothing was written to your database this turn — no write was "
     "executed. Please re-state what you wanted saved or changed "
@@ -886,9 +1019,41 @@ MSG_NO_WRITE_OCCURRED = (
 # attempted and nothing was written — a completed-write claim is premature,
 # not baseless. Never claims failure (the CLI executes right after this text;
 # the web panel supersedes it when the slot is real).
+#
+# "...before anything is WRITTEN to your database" tripped our own claim gate
+# (subject + is + written). Harmless in place — a replacement is never
+# re-checked — but it is the same defect that suppressed an honest refusal, so
+# it is worded out rather than exempted. tests/test_write_claim_integrity.py
+# holds every canned message to this.
 MSG_STAGED_NOT_SAVED = (
     "⚠️ That isn't saved yet — it's staged and still needs your confirmation "
-    "before anything is written to your database."
+    "before it reaches your database."
+)
+
+# The mirror of the completed-write claim: an answer saying something is STAGED
+# and waiting for you, when nothing was staged at all.
+#
+# Live-caught 2026-08-31. The stage-2 verifier returned FAIL, the server
+# discarded the batch, and the reply still read "The following workout has been
+# staged and is awaiting your confirmation" — with a full set list under it. The
+# claim gate never looked: it reads completed-write verbs only. So the user sat
+# waiting to confirm a batch that no longer existed, and the workout was silently
+# lost. They had to notice it themselves.
+_STAGED_CLAIM_RE = re.compile(
+    r"(?i)(?:"
+    r"\b(?:has|have)\s+been\s+staged"
+    r"|\bis\s+staged\b|\bare\s+staged\b"
+    r"|\bi(?:'ve|\s+have)?\s+staged\b"
+    r"|\bawaiting\s+your\s+confirmation"
+    r"|\bwaiting\s+for\s+your\s+confirmation"
+    r"|\bready\s+(?:for|to)\s+(?:your\s+)?confirm"
+    r")"
+)
+
+MSG_NOTHING_STAGED = (
+    "⚠️ Nothing is staged — there's no pending write waiting for your "
+    "confirmation, so nothing would be saved by confirming. Please re-state "
+    "what you wanted recorded."
 )
 
 
@@ -929,14 +1094,6 @@ again?", "remind me / repeat that").
 Using ONLY the [CONVERSATION] provided, restate the specific figure or fact the user
 is asking about — verbatim as you already stated it. NEVER compute, estimate, look
 up, or introduce a NEW number; your only job is to repeat what was already said.
-# ONE message, phrased for every write. It used to end "re-state your logging
-# request (tip: start with /log)", which is nonsense after a failed goal or set
-# edit — but splitting it in two turned out to be undoable: the gate fires
-# hardest when the agent called NO tool (it invented the success outright), and
-# in that case nothing distinguishes a logging turn from a goal turn.
-# log_boundary/fallback_write are not that signal either — the canonical live
-# failure is a bare "Yes thats correct" confirming a log, which trips neither.
-# So the tip is made conditional in the WORDING instead of in the code.
 
 If the [CONVERSATION] does not contain a figure matching what they are asking about,
 say you are not sure which number they mean and ask them to clarify — do not guess.
@@ -2615,10 +2772,19 @@ class Coordinator:
             display_intent=params.get("display_intent", False),
         )
 
-        # Pop unresolved exercise names before the LLM sees the package.
-        # These are names the filter failed to match; the package covers
-        # overall training as a broad fallback in that case.
-        unresolved_names = pkg.pop("unresolved_exercise_names", None)
+        # Unresolved exercise names: names the filter matched no rows for.
+        #
+        # READ, DO NOT POP. This used to be removed before the LLM saw the
+        # package, and a disclaimer was string-prepended to the finished answer
+        # instead. The model therefore answered a question about a named
+        # exercise with NO IDEA it had no rows for it — and filled the gap from
+        # aggregate counts belonging to other lifts, producing a confident claim
+        # that contradicted the note stapled above it.
+        #
+        # A model that knows the data is missing can decline. One that does not
+        # know will invent. Leaving the field in the package is what makes the
+        # analysis prompt's no-claims gate enforceable at all.
+        unresolved_names = pkg.get("unresolved_exercise_names") or None
 
         # Effective names: those that actually appeared in the package
         # (used to build scope notes — unresolved names are excluded).
@@ -2921,24 +3087,86 @@ class Coordinator:
                 "(most-recent claim carried a non-latest session date)",
                 f.get("original"), f.get("corrected"), f.get("exercise"))
 
-        # Prefix answer when requested exercises weren't found in the DB.
-        # Partial resolution (some names matched) covers the matched
-        # exercises; total failure falls back to the broad package.
-        if unresolved_names:
-            names_str = ", ".join(unresolved_names)
-            if effective_names:
-                coverage = ", ".join(effective_names)
-                answer = (
-                    f"Note: {names_str} wasn't found in your workout history, "
-                    f"so this answer covers {coverage}.\n\n"
-                    + answer
-                )
-            else:
-                answer = (
-                    f"Note: {names_str} wasn't found in your workout history, "
-                    f"so this answer covers your overall training instead.\n\n"
-                    + answer
-                )
+        # ── Limiting guard (deterministic, pure — no LLM) ──────────────────────
+        # A muscle the graph records as HELD must never be described as trained.
+        # Live, the draft cited `limiting` correctly — one clean tag — and still
+        # wrote "your Lat Pulldowns do train your biceps". The citation gate
+        # proves which field was read, never what the sentence means, so the
+        # invariant needs enforcing the same way recency does.
+        answer, limiting_flags = _cite.limiting_claim_guard(answer, pkg)
+        for f in limiting_flags:
+            logger.warning(
+                "[coordinator] limiting guard: rewrote '%s' → '%s' (%s holds "
+                "%s; it does not train it)",
+                f.get("original"), f.get("corrected"),
+                f.get("exercise"), f.get("muscle"))
+
+        # ── Plan guard (deterministic check, ONE re-prompt) ───────────────────
+        # A muscle must not get DIRECT work on consecutive days of a plan. Live,
+        # a week plan put Barbell Curl on day 4 and Seated Machine Curl on day 5;
+        # the ontology held every fact needed to catch it and nothing looked.
+        #
+        # Unlike the guards above this one does NOT rewrite: code cannot write a
+        # training plan. It follows the [DISPLAY] precedent instead — re-prompt
+        # ONCE with the clash named, and if the plan still violates, say so in
+        # the answer. A named problem beats a silently shipped one.
+        plan_flags: list = []
+        try:
+            from src.ontology import load_ontology as _load_ont
+            _ont = _load_ont()
+            violations, plan_flags, concerns = _cite.plan_guard(answer, _ont)
+            if violations or concerns:
+                logger.warning("[coordinator] plan guard: %d violation(s) %s | "
+                               "%d concern(s) %s",
+                               len(violations), "; ".join(violations),
+                               len(concerns), "; ".join(concerns))
+                asks = []
+                if violations:
+                    asks.append(
+                        "That plan trains the same muscle directly on consecutive "
+                        "days: " + "; ".join(violations) + ". Rebuild it so no "
+                        "muscle gets direct work two days running.")
+                if concerns:
+                    asks.append(
+                        "These days stack assisting work onto the next day's "
+                        "target: " + "; ".join(concerns) + ". Either space them "
+                        "or keep the order and SAY why it still works — the "
+                        "reader needs to see you considered it.")
+                fix_context = list(conversation_context or []) + [
+                    {"role": "assistant", "content": answer},
+                    {"role": "user", "content": " ".join(asks) + " Keep the same "
+                     "focus, coverage and format."},
+                ]
+                retried = _cite.strip_tags(await self._call_with_per_minute_retry(
+                    analysis_agent.analyze, pkg, scoped_question, research,
+                    memories, fix_context, custom_query))
+                # Only a VIOLATION blocks; a concern the coach has now been asked
+                # to justify is allowed to stand.
+                still, plan_flags2, _ = _cite.plan_guard(retried, _ont)
+                if not still:
+                    answer, plan_flags = retried, plan_flags
+                else:
+                    # Repair failed. Do not hide it.
+                    logger.warning("[coordinator] plan guard: re-prompt did not "
+                                   "resolve %s", "; ".join(still))
+                    answer = (retried + "\n\nNote: this plan still has "
+                              + "; ".join(still)
+                              + ". Move one of those sessions before running it.")
+                    plan_flags = plan_flags2
+        except Exception as exc:                       # never break an answer
+            logger.warning("[coordinator] plan guard skipped (%s)", exc)
+
+        recency_flags = recency_flags + limiting_flags + plan_flags
+
+        # Prefix answer when requested exercises produced no rows. The window
+        # comes from the same persisted params this stage's other scope fields
+        # do — it is what makes "not in the last N days" nameable instead of
+        # collapsing back into "not in your history".
+        note = unresolved_scope_note(
+            unresolved_names, pkg.get("exercise_muscle_map"), effective_names,
+            (state.get("params") or {}).get("query_period_days", 90))
+        if note:
+            answer = note + "\n\n" + answer
 
         # Record the analytical turn so memory extraction sees it. The analytical
         # path runs the analysis pipeline directly and never enters the agent's
@@ -2969,7 +3197,11 @@ class Coordinator:
             reps_floor=params.get("rep_target"),
             cardio_lock=_normalize_cardio_lock(params.get("cardio_lock")),
         )
-        pkg.pop("unresolved_exercise_names", None)
+        # unresolved_exercise_names STAYS, exactly as on the first-build path.
+        # This rebuild must be byte-equivalent to _stage_build_package or a
+        # resumed run silently loses the "I have no rows for that lift" fact and
+        # the model is free to invent again — the same defect, on the other
+        # interface.
         return pkg
 
     # ── Custom SQL ────────────────────────────────────────────────────────────
@@ -3093,21 +3325,53 @@ class Coordinator:
         # research answers, which call no write tool at all.
         _write_flow = (log_boundary or fallback_write
                        or bool(result.get("write_attempted")))
-        _claim_made = bool(_WRITE_SUCCESS_CLAIM_RE.search(answer)) or (
-            _write_flow and bool(_WRITE_COMPLETION_CLAIM_RE.search(answer)))
+        _claim_clause = _write_claim_clause(answer, write_flow=_write_flow)
+        _answer_replaced = False
         if (not result.get("db_write_effect")
                 and not result.get("staging_reached_confirm")
-                and _claim_made):
+                and _claim_clause is not None):
+            _answer_replaced = True
+            # Log the triggering clause, not just the head of the answer — the
+            # clause is the only part that explains the decision, and it is
+            # routinely past a head-truncation.
             if result.get("staged_this_turn"):
                 logger.warning(
                     "[coordinator] rewrote premature saved-claim on a "
-                    "staged-only turn: %r", answer[:120])
+                    "staged-only turn: clause=%r | answer=%r",
+                    _claim_clause, answer)
                 answer = MSG_STAGED_NOT_SAVED
             else:
+                # If a write tool BLOCKED this turn (app-data lock, integrity
+                # rejection) it produced a user-ready sentence saying why. Show
+                # that instead of the generic warning: the reason is a
+                # structural fact of the turn, so it reaches the user whether
+                # the model relayed it, garbled it, or — as observed live on two
+                # of three refusals — claimed success outright.
+                _reason = result.get("write_block_reason")
                 logger.warning(
-                    "[coordinator] suppressed unbacked write-success claim: %r",
-                    answer[:120])
-                answer = MSG_NO_WRITE_OCCURRED
+                    "[coordinator] suppressed unbacked write-success claim: "
+                    "clause=%r | reason=%r | answer=%r",
+                    _claim_clause, _reason, answer)
+                answer = f"⚠️ {_reason}" if _reason else MSG_NO_WRITE_OCCURRED
+        elif (not result.get("db_write_effect")
+                and not result.get("staged_this_turn")
+                and not result.get("staging_reached_confirm")
+                and _write_flow):
+            # THE MIRROR CLAIM: "it's staged, waiting for you" when nothing was
+            # staged. False by construction here — no write landed, no batch was
+            # staged, no execute was attempted. Live, the verifier had discarded
+            # the batch and the reply still invited the user to confirm it, so
+            # they waited for a panel that was never coming and the workout was
+            # lost. Checked through the same clause splitter, so "I couldn't
+            # stage that" is a denial, not a claim.
+            _staged_clause = _write_claim_clause(
+                answer, write_flow=False, pattern=_STAGED_CLAIM_RE)
+            if _staged_clause is not None:
+                _answer_replaced = True
+                logger.warning(
+                    "[coordinator] suppressed unbacked STAGED claim: "
+                    "clause=%r | answer=%r", _staged_clause, answer)
+                answer = MSG_NOTHING_STAGED
         if log_boundary or fallback_write:
             # Fallback (regex-inferred) writes are the same flow as /log turns:
             # a turn that ends pending a logging clarification must carry the
@@ -3118,7 +3382,21 @@ class Coordinator:
                 or result.get("staged_this_turn", False))
         if trailing_note:
             answer = answer.rstrip() + "\n\n" + _LOG_TRAILING_NOTE
-        if fallback_write:
+        if (fallback_write and not _answer_replaced
+                and not result.get("write_block_reason")
+                and "/log" not in answer):
+            # The nudge is advice for NEXT time on a write we had to infer, so
+            # three cases must not get it:
+            #   - the gate replaced the answer: MSG_NO_WRITE_OCCURRED already
+            #     ends "...starting with /log is the most reliable route", which
+            #     printed the same tip twice in one message;
+            #   - the write was BLOCKED (app-data lock, integrity rejection) —
+            #     /log cannot edit a row FitNotes owns, so the tip is not merely
+            #     redundant but wrong. Keyed on the block FACT, not on the gate
+            #     firing: live, the agent explained the refusal honestly, the
+            #     gate correctly stayed out of it, and the bad tip appeared
+            #     anyway;
+            #   - any future message that carries its own /log advice.
             answer = answer.rstrip() + "\n\n" + _LOG_FALLBACK_NUDGE
         return answer
 
