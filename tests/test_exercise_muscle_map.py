@@ -389,6 +389,19 @@ def test_limiting_truth_skips_exercises_with_nothing_held():
     assert set(truth) == {"Lat Pulldown"}
 
 
+@pytest.mark.parametrize("muscle, primary, expected_tail", [
+    ("Grip", ["Lats"], "the grip holds the load while your Lats do the work."),
+    ("Biceps", ["Chest"], "the biceps hold the load while your Chest does the work."),
+    ("Forearms", ["Lats", "Biceps"], "the forearms hold the load while your Lats and Biceps do the work."),
+    ("Core", [], "the core holds the load without being trained by it."),
+])
+def test_the_repair_sentence_agrees_with_singular_and_plural_names(muscle, primary, expected_tail):
+    """"the grip hold the load" / "your Chest do the work": the verbs were fixed
+    in the plural, so every singular muscle came out ungrammatical."""
+    from src.citations import _held_claim_repair
+    assert _held_claim_repair("Lat Pulldown", muscle, primary).endswith(expected_tail)
+
+
 def test_guard_repair_text_comes_from_the_map():
     """The replacement names the real primary movers, not a canned phrase."""
     out, _ = limiting_claim_guard("Your Lat Pulldown trains your biceps.", _PKG)

@@ -658,6 +658,8 @@ that is merely well-cited and structurally poor is a bad answer.
     recovery before it is trained directly again, so back-to-back direct work
     costs growth rather than adding it. Overlap in a SECONDARY role is fine —
     two adjacent days may both lean on the glutes without either targeting them.
+    The one exception: when the user explicitly asks for the same muscle on
+    back-to-back days or every day, build what they asked for.
 
   • VOLUME IN SETS, NOT POUNDS. Established practice for hypertrophy is roughly
     10-20 hard sets per muscle per week, spread over two or more sessions. Put
@@ -874,6 +876,7 @@ def _build_user_message(
     memories:             Optional[list],
     conversation_context: Optional[list],
     custom_query:         Optional[dict] = None,
+    requirements:         Optional[list] = None,
 ) -> str:
     try:
         # Compact serialization — this is LLM input, not human-read; indent=2
@@ -910,8 +913,16 @@ def _build_user_message(
     sections.extend([
         _fmt_memories(memories),
         _fmt_conversation(conversation_context),
-        f"[QUESTION]\n{question}",
     ])
+    # A guard retry hands over FACTS from the user's data — never a draft to
+    # revise and never a message voiced as the user. Shown the draft plus a
+    # "user" correction, the model answered the user: "In the previous design…",
+    # "addressing your concerns…" (live re-check, 2026-09-16).
+    reqs = [str(r).strip() for r in (requirements or []) if str(r).strip()]
+    if reqs:
+        sections.append("[REQUIREMENTS] — facts from the user's data this answer must "
+                        "respect:\n" + "\n".join(f"- {r}" for r in reqs))
+    sections.append(f"[QUESTION]\n{question}")
     return "\n\n".join(sections)
 
 
@@ -924,6 +935,7 @@ async def analyze(
     memories:             Optional[list] = None,
     conversation_context: Optional[list] = None,
     custom_query:         Optional[dict] = None,
+    requirements:         Optional[list] = None,
 ) -> str:
     """
     Single Gemini call with thinking_budget=4096.
@@ -939,7 +951,8 @@ async def analyze(
         raise ValueError("package must not be empty")
 
     user_message = _build_user_message(
-        package, question, research, memories, conversation_context, custom_query
+        package, question, research, memories, conversation_context, custom_query,
+        requirements=requirements,
     )
 
     response = await asyncio.to_thread(

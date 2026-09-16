@@ -57,7 +57,9 @@ _EDGES = [
     (6, 5, "primary",   "test"),   # Close Grip Bench     -> Triceps (PARENT)
     (7, 9, "primary",   "test"),   # Preacher Machine Curl -> Brachialis ONLY
 ]
-_ALIASES = [(n, i) for i, n, *_ in _EXERCISES]
+# The user logs Hip Thrust under their own spelling; every other alias is the
+# graph name. A note about a clash must use the name the user knows.
+_ALIASES = [(("Lying Hip Thrusts" if n == "Hip Thrust" else n), i) for i, n, *_ in _EXERCISES]
 
 
 @pytest.fixture
@@ -90,7 +92,7 @@ def test_flags_the_same_muscle_on_consecutive_days(ont):
     v, flags, _c = plan_guard(_plan((4, "Skull Crusher, Barbell Curl"),
                                 (5, "Machine Curl")), ont)
     assert len(v) == 1
-    assert "Biceps" in v[0] and "day 4" in v[0] and "day 5" in v[0]
+    assert "Biceps" in v[0] and "Day 4" in v[0] and "Day 5" in v[0]
     assert flags[0]["muscle"] == "Biceps"
     assert flags[0]["day_a"] == 4 and flags[0]["day_b"] == 5
 
@@ -284,3 +286,276 @@ def test_longest_exercise_name_wins_its_span(ont):
     v, _f, _c = plan_guard(_wk(("Mon", "Preacher Machine Curl"),
                                ("Tue", "Barbell Curl")), ont)
     assert v == []
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# A DAY ENDS WHERE THE PLAN'S LAYOUT ENDS (live re-check, 2026-09-16)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# A day used to run to the next day label, so the LAST day ran to the end of the
+# answer. The prompt requires "EXPLAIN THE STRUCTURE" after every plan, and that
+# explanation names every day's exercises — so a plan whose last day was arm work
+# was reported as hamstrings on "day 5 and day 6", re-prompted, and shipped with
+# a false "Note: this plan still has…".
+
+_WEEK = ("### Your week\n\n"
+         "* **Monday: Pull**\n * Chin Up (4 sets)\n"
+         "* **Tuesday: Arms**\n * Barbell Curl (4 sets)\n"
+         "* **Wednesday: Legs**\n * Hip Thrust (4 sets)\n")
+_EXPLANATION = ("\n### Structure\n"
+                "* **Spacing:** Barbell Curl sits on Tuesday so Machine Curl never "
+                "follows it; Hip Thrust closes the week.\n")
+
+
+def test_the_explanation_after_a_plan_is_not_part_of_the_last_day(ont):
+    """Wednesday is legs only. The explanation names Barbell Curl and Machine
+    Curl — read as Wednesday, that was a Tuesday/Wednesday biceps clash."""
+    v, _f, _c = plan_guard(_WEEK + _EXPLANATION, ont)
+    assert v == []
+
+
+def test_a_real_clash_on_the_last_day_is_still_caught(ont):
+    plan = _WEEK.replace(" * Hip Thrust (4 sets)\n", " * Machine Curl (4 sets)\n")
+    v, _f, _c = plan_guard(plan + _EXPLANATION, ont)
+    assert len(v) == 1 and "Biceps" in v[0]
+
+
+def test_a_table_row_is_its_own_day(ont):
+    """The live table shape: Day 7 is rest, and the reasons below name Day 6's lift."""
+    text = ("| Session | Focus | Exercises |\n|:--- |:--- |:--- |\n"
+            "| Day 1 | Legs | Hip Thrust (4 sets) |\n"
+            "| Day 6 | Arms | Barbell Curl (4 sets) |\n"
+            "| Day 7 | Rest | Complete rest |\n\n"
+            "### Reasons for This Plan\n- Barbell Curl on Day 6 keeps arm work late.")
+    v, _f, _c = plan_guard(text, ont)
+    assert v == []
+
+
+def test_a_table_row_ends_at_its_line_even_with_prose_right_below(ont):
+    """No blank line between the table and the text under it: the row still ends
+    at its own line, so the prose naming Day 6's lift is not read as Day 7."""
+    text = ("| Day | Work |\n|:--- |:--- |\n"
+            "| 6 | Barbell Curl (4 sets) |\n"
+            "| 7 | Rest |\n"
+            "Barbell Curl sits on Day 6 so the week ends on rest.")
+    v, _f, _c = plan_guard(text, ont)
+    assert v == []
+
+
+def test_heading_days_keep_content_after_a_blank_line(ont):
+    """A heading day's exercises often sit after a blank line. Cutting the day at
+    the blank line would silently miss this real clash."""
+    text = ("### Day 1\n\nBarbell Curl 4 sets\n\nGo heavy.\n\n"
+            "### Day 2\n\nMachine Curl 4 sets\n\n## Why this works\nHip Thrust later.")
+    v, _f, _c = plan_guard(text, ont)
+    assert len(v) == 1 and "Biceps" in v[0]
+
+
+_RECAP = ("Last week you logged:\n\n"
+          "* **Monday (2026-09-07):** Barbell Curl (4 sets)\n"
+          "* **Tuesday (2026-09-08):** Machine Curl (4 sets)\n")
+
+
+def test_dated_days_are_logged_training_not_a_plan(ont):
+    """What the user DID is not a plan to judge. A recap of their own sessions
+    was reported as a biceps clash."""
+    assert plan_guard(_RECAP, ont) == ([], [], [])
+
+
+def test_a_recap_before_a_plan_leaves_only_the_plan_judged(ont):
+    text = _RECAP + ("\nNext week:\n\n* **Monday:** Hip Thrust (4 sets)\n"
+                     "* **Tuesday:** Chin Up (4 sets)\n")
+    v, _f, _c = plan_guard(text, ont)
+    assert v == []
+
+
+def test_a_weekday_line_inside_the_explanation_does_not_join_the_plan(ont):
+    """"Thursday" opens a line in the prose after the plan. It is not a day that
+    follows Wednesday."""
+    text = (_WEEK + "\nThis keeps the week balanced.\n\n"
+            "Thursday stays free; do Hip Thrust again only if recovered.\n")
+    v, _f, _c = plan_guard(text, ont)
+    assert v == []
+
+
+# ── The note names days and exercises the way the user reads them ────────────
+
+def test_the_clash_names_the_plans_own_days_and_the_users_spelling(ont):
+    text = ("* **Friday:** Hip Thrust (4 sets)\n"
+            "* **Saturday/Sunday:** Hip Thrust (3 sets)\n")
+    v, flags, _c = plan_guard(text, ont)
+    assert v == ["Lying Hip Thrusts on Friday and Lying Hip Thrusts on "
+                 "Saturday/Sunday both train Glutes directly"]
+    assert (flags[0]["label_a"], flags[0]["label_b"]) == ("Friday", "Saturday/Sunday")
+    assert (flags[0]["day_a"], flags[0]["day_b"]) == (5, 6)
+
+
+# ── The live answer itself, against the real store ───────────────────────────
+
+_LIVE_PROMPT_1 = """To increase your hamstring volume to the target of 10 sets per week, this plan splits that direct work across two separate days. I have sequenced the exercises to prevent any muscle group from receiving direct primary training on consecutive days, while addressing your concerns regarding secondary muscle involvement.
+
+### Weekly Training Plan
+
+This 5-day split spaces your hamstring work and ensures that your pressing movements do not immediately stress your front delts before their primary training day.
+
+* **Monday: Back Primary**
+ * Lat Pulldown (4 sets)
+ * T-Bar Barbell Row (4 sets)
+ * Wide Grip Cable Row (4 sets)
+* **Tuesday: Hamstring Focus (Direct Work)**
+ * Hamstring Curls Machine (5 sets)
+* **Wednesday: Chest Primary**
+ * Flat Dumbbell Bench Press (4 sets)
+ * Incline Dumbbell Bench Press (4 sets)
+ * Seated Machine Fly (4 sets)
+* **Thursday: Shoulder Primary (Front/Side/Rear)**
+ * Seated Dumbbell Press (4 sets)
+ * Lateral Dumbbell Raise (4 sets)
+ * Rear Delt Machine Fly (4 sets)
+* **Friday: Hamstring Focus (Direct Work) & Leg Maintenance**
+ * Hamstring Curls Machine (5 sets)
+ * Sumo Squats (4 sets)
+ * Leg Extension Machine (4 sets)
+* **Saturday/Sunday: Active Recovery/Arms**
+ * *Optional:* Barbell Curl (3 sets) and dumbbell skull crusher (3 sets)
+
+### Structure and Sequencing
+* **Hamstring Dose:** You are moving from **2.0** to **10 sets** per week. By placing these sessions on Tuesday and Friday, you provide 48 hours of recovery between direct bouts.
+* **Pressing Sequencing:** In the previous design, the overlap between Incline Bench Press (secondary front delt work) and Seated DB Press (direct front delt work) was problematic. By placing your chest primary work on Wednesday and your shoulder primary work on Thursday, you are technically working the front delts on back-to-back days. However, because Incline Dumbbell Bench Press uses the front delts only as a secondary muscle, the stress is significantly lower than the primary volume on Thursday. If your front delts feel fatigued, you may swap Monday and Wednesday to create a full day of rest between these pressing movements.
+* **Maintenance:** Your back volume remains aligned with your current **18.0**, and chest volume stays consistent with your **11.4**.
+* **Leg Maintenance:** Sumo Squats and Leg Extensions are kept on your second hamstring day to ensure your quads continue to receive maintenance volume without interfering with your fresh hamstring performance on Tuesday.
+
+This plan uses only exercises you have already logged. Monitor your performance on the Hamstring Curls Machine; as your volume increases, focus on full-range execution to avoid the increasing reliance on partial repetitions seen in your recent training data."""
+
+
+def test_live_prompt_1_has_no_false_clash(monkeypatch):
+    """The exact answer from the 2026-09-16 re-check, on the real store (read
+    only). It reported four clashes on "day 5 and day 6"; its real hamstring days
+    are Tuesday and Friday."""
+    import os
+    monkeypatch.setenv("ONTOLOGY_DIR", os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ontology"))
+    ont_mod.clear_cache()
+    try:
+        v, _f, _c = plan_guard(_LIVE_PROMPT_1, ont_mod.load_ontology(force=True))
+    finally:
+        ont_mod.clear_cache()
+    assert v == []
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# THE GUARD JUDGES ONLY PLANS THE USER ASKED FOR
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# It ran on every analysis answer, so a recap of the user's own week was reported
+# as a scheduling error, and a split the user asked for on purpose (the same
+# muscle every day) was overridden. The user's QUESTION decides: a plan is judged
+# only when they asked the coach to build one, and not when they asked for
+# back-to-back training. Real wordings from earlier live checks.
+
+def is_plan_request(question):
+    from src.citations import is_plan_request as detector
+    return detector(question)
+
+
+def asks_for_consecutive(question):
+    from src.citations import asks_for_consecutive as detector
+    return detector(question)
+
+
+@pytest.mark.parametrize("question", [
+    "plan me a week that brings up my hamstrings, keep everything else steady",
+    "build me a week of training that pushes and focuses my arms without dropping anything else",
+    "build me a week of training that pushes my calves and rear delts without dropping anything else",
+    "give me a 4 day split focused on chest",
+    "Make me a one week plan that helps me reach this goal and also, give reasons for what the plan",
+    "plan my next triceps session",
+    "show my last week, then plan next week",
+    "can you design a new push pull legs routine for me?",
+    "write me a three-day program",
+])
+def test_a_plan_request_is_recognised(question):
+    assert is_plan_request(question)
+
+
+@pytest.mark.parametrize("question", [
+    "how was my back ROM split in the last back session",
+    "Should I take a deload week?",
+    "how many sets per week am I doing for my mid traps?",
+    "How many sets per week is optimal for triceps?",
+    "how has my Seated Machine Fly gone over the past 3 weeks?",
+    "what does the research say about training a muscle twice a week?",
+    "what split am I running?",
+    "give me a summary of my week",
+    "show me my last week",
+    "give me a breakdown of last week's sessions",
+    "is my plan working?",
+    "how did my last session go?",
+    "make a note that my shoulder hurt this week",
+    "log 3 sets of curls for today",
+])
+def test_other_questions_are_not_plan_requests(question):
+    assert not is_plan_request(question)
+
+
+@pytest.mark.parametrize("question, expected", [
+    ("build me a week that trains arms every day", True),
+    ("give me a split with biceps daily", True),
+    ("plan back-to-back leg days for me", True),
+    ("make me a week that hits chest two days in a row", True),
+    ("plan me a week that brings up my hamstrings, keep everything else steady", False),
+    ("give me a 4 day split focused on chest", False),
+    ("how many days a week do I train?", False),
+])
+def test_back_to_back_requests_are_recognised(question, expected):
+    assert asks_for_consecutive(question) is expected
+
+
+# ── Wiring: the coordinator asks the question before judging the answer ──────
+
+_CLASH = "* **Monday:** Barbell Curl (4 sets)\n* **Tuesday:** Machine Curl (4 sets)\n"
+
+
+def _run_guard_stage(monkeypatch, question, answer):
+    """Drive the real _stage_display_fidelity with a fake cache; record whether
+    the plan guard's re-prompt ran."""
+    import asyncio
+    from types import SimpleNamespace
+    from src import analysis_agent
+    from src.coordinator import Coordinator
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")    # client construction only; no call is made
+    calls = []
+
+    async def fake_analyze(*args, **kwargs):
+        calls.append(args)
+        return "* **Monday:** Barbell Curl (4 sets)\n* **Wednesday:** Machine Curl (4 sets)\n"
+
+    monkeypatch.setattr(analysis_agent, "analyze", fake_analyze)
+    pkg = {"exercises": [], "query_period_days": 90}
+
+    async def ensure_package(_coordinator, _state):
+        return pkg
+
+    cache = SimpleNamespace(ensure_package=ensure_package, research=None, memories=None,
+                            conversation_context=None, custom_query=None)
+    state = {"question": question, "scoped_question": question, "answer": answer,
+             "params": {"query_period_days": 90}}
+    out = asyncio.run(Coordinator(agent_session=None)._stage_display_fidelity(state, cache))
+    return out["answer"], calls
+
+
+def test_a_recap_is_never_judged_as_a_plan(ont, monkeypatch):
+    answer, calls = _run_guard_stage(monkeypatch, "what did I train last week?", _CLASH)
+    assert calls == [] and answer == _CLASH
+
+
+def test_a_requested_plan_is_judged(ont, monkeypatch):
+    _answer, calls = _run_guard_stage(monkeypatch, "build me a week of arm training", _CLASH)
+    assert len(calls) == 1
+
+
+def test_a_requested_back_to_back_plan_is_not_overridden(ont, monkeypatch):
+    answer, calls = _run_guard_stage(
+        monkeypatch, "build me a week that trains arms every day", _CLASH)
+    assert calls == [] and answer == _CLASH

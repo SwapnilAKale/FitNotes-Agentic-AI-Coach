@@ -306,6 +306,24 @@ def test_build_user_message_injects_schema(pkg):
     assert "pr.weight" in schema_block and "period_volume_lbs" in schema_block
 
 
+def test_build_user_message_renders_requirements_before_the_question(pkg):
+    """A guard retry hands the model FACTS, not a draft to revise and not a
+    message voiced as the user."""
+    from src.analysis_agent import _build_user_message
+    msg = _build_user_message(pkg, "How is my Lat Pulldown?", None, None, None, None,
+                              requirements=["Use only these figures."])
+    assert "[REQUIREMENTS]" in msg and "Use only these figures." in msg
+    assert msg.index("[REQUIREMENTS]") < msg.index("[QUESTION]")
+
+
+def test_build_user_message_without_requirements_is_unchanged(pkg):
+    from src.analysis_agent import _build_user_message
+    before = _build_user_message(pkg, "How is my Lat Pulldown?", None, None, None, None)
+    after = _build_user_message(pkg, "How is my Lat Pulldown?", None, None, None, None,
+                                requirements=None)
+    assert after == before and "[REQUIREMENTS]" not in after
+
+
 def test_draft_prompt_has_stage15_rules():
     from src.analysis_agent import _ANALYSIS_SYSTEM as P
     # Fix 1: only-cite-listed-leaves

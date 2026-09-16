@@ -162,6 +162,56 @@ def test_agent_replies_go_through_md_not_esc():
     assert "addMsg('agent', md(" in src
 
 
+def _restore_history_src() -> str:
+    m = re.search(r"function restoreHistory\(history\)[\s\S]*?\n\}", _source())
+    assert m, "could not extract restoreHistory from index.html"
+    return m.group(0)
+
+
+def test_restored_agent_replies_go_through_md():
+    """The RELOAD path. Live (2026-09-16) every answer showed raw ### and ** after
+    a page reload: restoreHistory rendered every message with esc(), and the test
+    above never saw it because it only looks for the literal `addMsg('agent', esc(`
+    while restoreHistory writes `addMsg(role, ...)`. So look inside the function
+    itself: esc() may only ever apply to the user's own text there."""
+    code = [ln for ln in _restore_history_src().splitlines()
+            if not ln.strip().startswith("//")]          # comments may say anything
+    assert any("md(" in ln for ln in code), \
+        "restoreHistory never renders markdown — reloads show raw ### and **"
+    for ln in code:
+        if "esc(" in ln:
+            # Only the user's own text and a recorded ERROR are plain escaped
+            # text; a coach answer is markdown. tests/test_reload_page.py checks
+            # what each actually renders.
+            assert "user" in ln or "error" in ln, \
+                f"esc() on a coach-answer path in restoreHistory: {ln.strip()!r}"
+
+
+@_needs_node
+def test_reload_renders_agent_markdown_and_escapes_user_text():
+    """Run the REAL restoreHistory, with addMsg stubbed to record what it is handed."""
+    src = _source()
+    parts = [re.search(p, src).group(0) for p in _MD_PARTS]
+    script = ("\n".join(parts) + "\n"
+              + "const calls = [];\n"
+              + "function chatInner() { return {}; }\n"
+              + "function addMsg(role, html, time) { calls.push([role, html]); }\n"
+              + _restore_history_src() + "\n"
+              + "restoreHistory(JSON.parse(process.argv[1]));\n"
+              + "process.stdout.write(JSON.stringify(calls));")
+    history = [{"role": "user", "text": "plan <b>my</b> week"},
+               {"role": "assistant", "text": "### Your week\n* **Monday:** 4 sets"}]
+    out = subprocess.run([_NODE, "-e", script, json.dumps(history)],
+                         capture_output=True, text=True, encoding="utf-8")
+    assert out.returncode == 0, out.stderr
+    (user_role, user_html), (agent_role, agent_html) = json.loads(out.stdout)
+    assert (user_role, agent_role) == ("user", "agent")
+    assert user_html == "plan &lt;b&gt;my&lt;/b&gt; week"
+    assert '<span class="md-h">Your week</span>' in agent_html
+    assert "<strong>Monday:</strong>" in agent_html
+    assert "###" not in agent_html and "**" not in agent_html
+
+
 def test_md_escapes_before_decorating():
     """Reversing these two steps would make every reply an injection point."""
     md_src = re.search(r"function md\(s\)[\s\S]*?\n  \}\n\}", _source()).group(0)
@@ -348,6 +398,14 @@ def test_plan_rules_cover_scope_frequency_and_completeness():
     assert "SCOPE FORK" in p
     assert "CONSECUTIVE DAYS" in p
     assert "A SESSION IS A SESSION" in p
+
+
+def test_the_consecutive_days_rule_gives_way_to_an_explicit_request():
+    """A user may WANT the same muscle every day. The rule used to say NEVER with
+    no exception, so the coach (and the plan guard) overrode a split the user
+    asked for on purpose (live re-check, 2026-09-16)."""
+    rule = _prompt().split("CONSECUTIVE DAYS")[1].split("VOLUME IN SETS")[0]
+    assert "explicitly asks" in rule
 
 
 def test_plan_rule_examples_avoid_the_live_probes():

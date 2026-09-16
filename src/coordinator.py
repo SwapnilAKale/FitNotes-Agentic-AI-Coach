@@ -379,6 +379,16 @@ def _is_transient_server_error(exc: Exception) -> bool:
     return _ckpt.is_transient_server_error(exc, _GenaiServerError)
 
 
+def _plan_note(violations: list) -> str:
+    return ("\n\nNote: this plan still has " + "; ".join(violations)
+            + ". Move one of those sessions before running it.")
+
+
+def _set_count_note(violations: list) -> str:
+    return ("\n\nNote: some set counts above do not match your data — "
+            + "; ".join(violations) + ".")
+
+
 def _run_rewrite_guards(answer: str, pkg: dict, ontology) -> tuple:
     """The deterministic REWRITE guards for the live-verification defects:
     exact exercise names (B3), sets never called sessions (B1), and no window
@@ -3002,34 +3012,22 @@ class Coordinator:
         conversation_context = cache.conversation_context
         custom_query    = cache.custom_query
         try:
-            answer, complete = await self._call_with_per_minute_retry(
+            checked = await self._call_with_per_minute_retry(
                 self._coverage_check, question, answer)
+            answer, complete = checked[0], checked[1]
+            missing = list(checked[2]) if len(checked) > 2 else []
 
             if not complete:
-                # One retry: add first draft + gaps to context, re-run analysis
+                # One retry: a FRESH answer told what it must also cover. It never
+                # sees the draft and nothing is voiced as the user — "Your previous
+                # answer did not fully address the question" as a USER turn is how
+                # answers came to talk about a previous version.
                 logger.info("[coordinator] coverage incomplete — retrying analysis")
-                retry_context = list(conversation_context or []) + [
-                    {"role": "assistant", "content": answer},
-                    {
-                        "role": "user",
-                        "content": (
-                            "Your previous answer did not fully address the question. "
-                            "Please revise to cover all parts."
-                        ),
-                    },
-                ]
-                retry_draft_tagged = await self._call_with_per_minute_retry(
-                    analysis_agent.analyze,
-                    pkg, scoped_question, research, memories, retry_context, custom_query)
-                # Same citation path + Stage-2 split as the first draft.
-                retry_cited = _cite.extract_cited_values(retry_draft_tagged, pkg)
-                self._log_citation_health(retry_cited)
-                retry_draft = _cite.strip_tags(retry_draft_tagged)
-                retry_gctx  = _cite.build_grounding_context(retry_cited, pkg)
-                logger.info("[coordinator] grounding path (retry): %s",
-                            retry_gctx.get("mode"))
-                answer, flagged2 = await self._call_with_per_minute_retry(
-                    analysis_agent.ground_check, retry_draft, retry_gctx)
+                requirements = ([f"The answer must also address: {m}" for m in missing]
+                                or ["The answer must address every part of the question."])
+                answer, flagged2 = await self._redraft_grounded(
+                    pkg, scoped_question, research, memories, conversation_context,
+                    custom_query, requirements)
                 flagged.extend(flagged2)
                 # No second coverage check — return best effort
         except Exception as e:
@@ -3043,6 +3041,53 @@ class Coordinator:
                 raise _ckpt.QuotaInterrupted(e, _ckpt.MSG_VERIFY_INTERRUPTED)
             raise
         return {"answer": answer, "flagged": flagged}
+
+    async def _redraft_grounded(self, pkg, scoped_question, research, memories,
+                                conversation_context, custom_query, requirements) -> tuple:
+        """A FRESH answer, fact-checked like a first draft: analyze with the
+        ORIGINAL conversation plus [REQUIREMENTS] → cite → ground. Every retry
+        uses it — coverage, display re-frame, and _redraft_checked. None of them
+        shows the model its draft or voices the correction as the user; that is
+        what made answers say "In the previous design…" (live re-check,
+        2026-09-16). Returns (answer, grounding_flagged_claims); raises on failure.
+        """
+        tagged = await self._call_with_per_minute_retry(
+            analysis_agent.analyze, pkg, scoped_question, research, memories,
+            conversation_context, custom_query, requirements=requirements)
+        cited = _cite.extract_cited_values(tagged, pkg)
+        self._log_citation_health(cited)
+        draft = _cite.strip_tags(tagged)
+        gctx = _cite.build_grounding_context(cited, pkg)
+        logger.info("[coordinator] grounding path (retry): %s", gctx.get("mode"))
+        answer, flagged = await self._call_with_per_minute_retry(
+            analysis_agent.ground_check, draft, gctx)
+        return answer, list(flagged or [])
+
+    async def _redraft_checked(self, pkg, scoped_question, research, memories,
+                               conversation_context, custom_query, requirements,
+                               ontology) -> tuple:
+        """A guard retry: a FRESH answer, checked like the first draft.
+
+        The model gets the ORIGINAL conversation plus [REQUIREMENTS] — facts from
+        the user's data. It never sees its draft and nothing is voiced as the
+        user: shown the draft and a "user" correction, it answered the user
+        ("In the previous design…", "addressing your concerns…"). And the retry
+        used to skip every check the first draft passed; prompt 1's shipped
+        answer was an ungrounded retry (live re-check, 2026-09-16). So: cite →
+        ground → display lines → recency → limiting → rewrite guards, the same
+        order as the first draft. Raises on failure; the caller decides.
+
+        Returns (answer, grounding_flagged_claims, guard_flags).
+        """
+        answer, flagged = await self._redraft_grounded(
+            pkg, scoped_question, research, memories, conversation_context,
+            custom_query, requirements)
+        if pkg.get("display_sets") and analysis_agent.display_sets_missing(answer, pkg):
+            answer = analysis_agent.append_missing_display(answer, pkg)
+        answer, recency = _cite.recency_guard(answer, pkg)
+        answer, limiting = _cite.limiting_claim_guard(answer, pkg)
+        answer, rewrites = _run_rewrite_guards(answer, pkg, ontology)
+        return answer, list(flagged or []), recency + limiting + rewrites
 
     async def _stage_display_fidelity(self, state: dict, cache) -> dict:
         """Node: deterministic display-sets verbatim-integrity check +
@@ -3064,24 +3109,22 @@ class Coordinator:
         # ignores them (correct — not citable). This check guarantees they
         # survive verbatim into the answer: re-prompt ONCE for a verbatim
         # reproduction, else assemble them raw from the package (no LLM).
+        reframe_flagged: list = []     # grounding findings on a display re-frame
         if pkg.get("display_sets"):
             base_answer = answer
 
             async def _reframe_display():
-                reframe_context = list(conversation_context or []) + [
-                    {"role": "assistant", "content": base_answer},
-                    {"role": "user", "content": (
-                        "Reproduce the per-set display lines from the package EXACTLY "
-                        "and VERBATIM — character-for-character, including weights, "
-                        "reps, comments, and arrows. Do not paraphrase, round, or "
-                        "summarise them."
-                    )},
-                ]
-                tagged = await self._call_with_per_minute_retry(
-                    analysis_agent.analyze,
-                    pkg, scoped_question, research, memories,
-                    reframe_context, custom_query)
-                return _cite.strip_tags(tagged)
+                # A FRESH, fact-checked answer told to copy the display lines —
+                # not the draft plus a correction voiced as the user, and no
+                # longer ungrounded.
+                reframed, flagged_reframe = await self._redraft_grounded(
+                    pkg, scoped_question, research, memories, conversation_context,
+                    custom_query,
+                    ["Reproduce every line of the [DISPLAY] block exactly as written — "
+                     "character for character, including weights, reps, comments and "
+                     "arrows."])
+                reframe_flagged.extend(flagged_reframe)
+                return reframed
 
             try:
                 answer = await analysis_agent.enforce_display_fidelity(
@@ -3141,29 +3184,32 @@ class Coordinator:
         # Code cannot know which real figure was meant, so — like the plan guard
         # — re-prompt once with the real figures named, then say so plainly.
         count_flags: list = []
+        retry_flagged: list = []       # grounding findings on a retried answer
+        retry_flags: list = []         # guard findings on a retried answer
         try:
             count_violations, count_flags = _cite.set_count_guard(answer, pkg)
             if count_violations:
                 logger.warning("[coordinator] set-count guard: %s",
                                "; ".join(count_violations))
-                fix_context = list(conversation_context or []) + [
-                    {"role": "assistant", "content": answer},
-                    {"role": "user", "content": "These set counts do not match my "
-                     "data: " + "; ".join(count_violations) + ". Use the real "
-                     "figures. Keep the same focus, coverage and format."},
-                ]
-                retried = _cite.strip_tags(await self._call_with_per_minute_retry(
-                    analysis_agent.analyze, pkg, scoped_question, research,
-                    memories, fix_context, custom_query))
-                retried, _ = _run_rewrite_guards(retried, pkg, _guard_ont)
-                still, count_flags2 = _cite.set_count_guard(retried, pkg)
-                if still:
-                    logger.warning("[coordinator] set-count guard: re-prompt did "
-                                   "not resolve %s", "; ".join(still))
-                    retried += ("\n\nNote: some set counts above do not match your "
-                                "data — " + "; ".join(still) + ".")
-                    count_flags = count_flags2
-                answer = retried
+                try:
+                    retried, flagged2, flags2 = await self._redraft_checked(
+                        pkg, scoped_question, research, memories, conversation_context,
+                        custom_query, _cite.set_count_requirements(count_flags, pkg),
+                        _guard_ont)
+                except Exception as exc:
+                    # A failed retry must not ship the wrong count silently.
+                    logger.warning("[coordinator] set-count guard: retry failed (%s) "
+                                   "— keeping the answer with a note", exc)
+                    answer += _set_count_note(count_violations)
+                else:
+                    retry_flagged += flagged2
+                    retry_flags += flags2
+                    still, count_flags = _cite.set_count_guard(retried, pkg)
+                    if still:
+                        logger.warning("[coordinator] set-count guard: retry did "
+                                       "not resolve %s", "; ".join(still))
+                        retried += _set_count_note(still)
+                    answer = retried
         except Exception as exc:                       # never break an answer
             logger.warning("[coordinator] set-count guard skipped (%s)", exc)
 
@@ -3176,50 +3222,81 @@ class Coordinator:
         # training plan. It follows the [DISPLAY] precedent instead — re-prompt
         # ONCE with the clash named, and if the plan still violates, say so in
         # the answer. A named problem beats a silently shipped one.
+        #
+        # ONLY A PLAN THE USER ASKED FOR IS JUDGED, and never one they asked to
+        # be back-to-back. Run on every answer, it called a recap of the user's
+        # own week a scheduling error, and it overrode an "arms every day" split
+        # the user wanted (live re-check, 2026-09-16). The question decides.
         plan_flags: list = []
+        volume_flags: list = []
+        judge_plan = (_cite.is_plan_request(question)
+                      and not _cite.asks_for_consecutive(question))
+        if not judge_plan:
+            logger.info("[coordinator] plan guard: not a plan request (or back-to-back "
+                        "was asked for) — answer not judged as a plan")
         try:
             from src.ontology import load_ontology as _load_ont
             _ont = _load_ont()
-            violations, plan_flags, concerns = _cite.plan_guard(answer, _ont)
-            if violations or concerns:
-                logger.warning("[coordinator] plan guard: %d violation(s) %s | "
-                               "%d concern(s) %s",
-                               len(violations), "; ".join(violations),
-                               len(concerns), "; ".join(concerns))
-                asks = []
+            violations, plan_flags, concerns = (
+                _cite.plan_guard(answer, _ont) if judge_plan else ([], [], []))
+            if concerns:
+                # Secondary work the day before direct work is a legitimate
+                # structure — reported, never a reason to rewrite the answer.
+                logger.info("[coordinator] plan guard: %d concern(s), not retried: %s",
+                            len(concerns), "; ".join(concerns))
+            # F6 · every other group stays at maintenance by DEFAULT; only an explicit
+            # "only X / nothing else" opts out (checked inside). Independent of the
+            # back-to-back gate: "arms every day" still keeps the rest steady.
+            def _shortfalls(text):
+                return (_cite.plan_volume_shortfalls(text, _ont, pkg, question)
+                        if _cite.is_plan_request(question) else [])
+            shortfalls = _shortfalls(answer)
+            if shortfalls:
+                logger.warning("[coordinator] plan volume: %s", "; ".join(
+                    f"{s['group']} {s['planned']} vs {s['current']}/wk" for s in shortfalls))
+            if violations or shortfalls:
                 if violations:
-                    asks.append(
-                        "That plan trains the same muscle directly on consecutive "
-                        "days: " + "; ".join(violations) + ". Rebuild it so no "
-                        "muscle gets direct work two days running.")
-                if concerns:
-                    asks.append(
-                        "These days stack assisting work onto the next day's "
-                        "target: " + "; ".join(concerns) + ". Either space them "
-                        "or keep the order and SAY why it still works — the "
-                        "reader needs to see you considered it.")
-                fix_context = list(conversation_context or []) + [
-                    {"role": "assistant", "content": answer},
-                    {"role": "user", "content": " ".join(asks) + " Keep the same "
-                     "focus, coverage and format."},
-                ]
-                retried = _cite.strip_tags(await self._call_with_per_minute_retry(
-                    analysis_agent.analyze, pkg, scoped_question, research,
-                    memories, fix_context, custom_query))
-                retried, _ = _run_rewrite_guards(retried, pkg, _ont)
-                # Only a VIOLATION blocks; a concern the coach has now been asked
-                # to justify is allowed to stand.
-                still, plan_flags2, _ = _cite.plan_guard(retried, _ont)
-                if not still:
-                    answer, plan_flags = retried, plan_flags
+                    logger.warning("[coordinator] plan guard: %d violation(s) %s",
+                                   len(violations), "; ".join(violations))
+                try:
+                    # ONE retry carries both kinds of fact.
+                    retried, flagged2, flags2 = await self._redraft_checked(
+                        pkg, scoped_question, research, memories, conversation_context,
+                        custom_query,
+                        _cite.plan_requirements(plan_flags)
+                        + _cite.volume_requirements(shortfalls), _ont)
+                except Exception as exc:
+                    # A failed retry must not ship the clash or the cut silently.
+                    logger.warning("[coordinator] plan guard: retry failed (%s) — "
+                                   "keeping the plan with a note", exc)
+                    if violations:
+                        answer += _plan_note(violations)
+                    answer += _cite.volume_note(shortfalls)
+                    volume_flags += [dict(s, kind="plan_volume_shortfall") for s in shortfalls]
                 else:
-                    # Repair failed. Do not hide it.
-                    logger.warning("[coordinator] plan guard: re-prompt did not "
-                                   "resolve %s", "; ".join(still))
-                    answer = (retried + "\n\nNote: this plan still has "
-                              + "; ".join(still)
-                              + ". Move one of those sessions before running it.")
-                    plan_flags = plan_flags2
+                    retry_flagged += flagged2
+                    retry_flags += flags2
+                    # Flags describe the answer that SHIPS, not the one replaced.
+                    still, plan_flags, _ = (_cite.plan_guard(retried, _ont)
+                                            if judge_plan else ([], [], []))
+                    if still:
+                        logger.warning("[coordinator] plan guard: retry did not "
+                                       "resolve %s", "; ".join(still))
+                        retried += _plan_note(still)
+                    still_short = _shortfalls(retried)
+                    if still_short:
+                        logger.warning("[coordinator] plan volume: retry still short")
+                        retried += _cite.volume_note(still_short)
+                        volume_flags += [dict(s, kind="plan_volume_shortfall")
+                                         for s in still_short]
+                    # A retried plan is a new answer: its set counts get checked too.
+                    wrong, wrong_flags = _cite.set_count_guard(retried, pkg)
+                    if wrong:
+                        logger.warning("[coordinator] set-count guard (plan retry): %s",
+                                       "; ".join(wrong))
+                        retried += _set_count_note(wrong)
+                        count_flags += wrong_flags
+                    answer = retried
         except Exception as exc:                       # never break an answer
             logger.warning("[coordinator] plan guard skipped (%s)", exc)
 
@@ -3235,7 +3312,8 @@ class Coordinator:
             logger.warning("[coordinator] target guard skipped (%s)", exc)
 
         recency_flags = (recency_flags + limiting_flags + rewrite_flags
-                         + count_flags + plan_flags + target_flags)
+                         + count_flags + plan_flags + target_flags
+                         + retry_flags + retry_flagged + reframe_flagged + volume_flags)
 
         # Prefix answer when requested exercises produced no rows. The window
         # comes from the same persisted params this stage's other scope fields
@@ -3565,11 +3643,11 @@ class Coordinator:
         self,
         question: str,
         answer:   str,
-    ) -> tuple[str, bool]:
+    ) -> tuple[str, bool, list]:
         """
         Verify the answer covers all parts of the question.
         No data access — checks coverage only, not correctness.
-        Returns (answer, is_complete).
+        Returns (answer, is_complete, missing_parts).
         On failure: returns original answer and True (avoid false retries).
         """
         prompt = f"[QUESTION]\n{question}\n\n[ANSWER]\n{answer}"
@@ -3613,7 +3691,8 @@ class Coordinator:
                     "[coordinator] coverage gaps: %s",
                     "; ".join(missing),
                 )
-            return answer, complete
+            # The gaps go back to the caller: they are the facts a retry needs.
+            return answer, complete, [str(m) for m in (missing or [])]
 
         except Exception as e:
             if _is_rate_limit(e):
@@ -3621,7 +3700,7 @@ class Coordinator:
             logger.warning(
                 "[coordinator] coverage check failed: %s — returning original", e
             )
-            return answer, True   # fail open: avoid false retry
+            return answer, True, []   # fail open: avoid false retry
 
     async def _run_recall(self, question: str) -> str:
         """

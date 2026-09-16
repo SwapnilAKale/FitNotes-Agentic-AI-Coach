@@ -549,6 +549,15 @@ function setBusy(b) {
   if (!b) document.getElementById('input').focus();
 }
 
+// The server refused a request because a turn is still running (a 429 that is
+// NOT the daily quota). Every request says so plainly and loses nothing: a busy
+// Confirm used to hide the panel and add an empty bubble, and a busy send
+// silently dropped what was typed.
+const BUSY_TEXT = 'Your coach is still answering the previous message — this wasn\'t sent.';
+function isBusy(res, data) {
+  return res.status === 429 && (data || {}).error !== 'rate_limit';
+}
+
 // ── Message rendering ─────────────────────────────────────────────────────────
 function addMsg(role, html, time) {
   const inner = chatInner();
@@ -730,45 +739,71 @@ function renderResumeNotice(message) {
   inner.appendChild(row);
   scrollBottom();
 
-  document.getElementById('resume-btn').addEventListener('click', async () => {
+  document.getElementById('resume-btn').addEventListener('click', () => {
     row.remove();                 // one-shot: remove the button on click
-    setBusy(true);
-    addThinking();
-    try {
-      const res = await fetch(`${API}/resume`, {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: '{}',
-      });
-      const data = await res.json();
-      removeThinking();
-      if (res.status === 429 && data.error === 'rate_limit') {
-        handleRateLimitError(data);          // quota still down — re-offer Resume
-      } else if (data.type === 'error') {
-        addMsg('error', esc(data.text || 'An error occurred.'));
-        setBusy(false);
-      } else {
-        addMsg('agent', md(data.text || ''));
-        setBusy(false);
-      }
-    } catch (e) {
-      removeThinking();
-      addMsg('error', 'Could not reach the server to resume.');
-      setBusy(false);
-    }
+    resumeSavedQuestion();
   });
 }
 
+async function resumeSavedQuestion() {
+  setBusy(true);
+  addThinking();
+  try {
+    const res = await fetch(`${API}/resume`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: '{}',
+    });
+    const data = await res.json();
+    removeThinking();
+    if (isBusy(res, data)) {
+      addMsg('error', esc(BUSY_TEXT));
+      setBusy(false);
+    } else if (res.status === 429) {
+      handleRateLimitError(data);          // quota still down — re-offer Resume
+    } else if (data.type === 'error') {
+      addMsg('error', esc(data.text || 'An error occurred.'));
+      setBusy(false);
+    } else {
+      addMsg('agent', md(data.text || ''));
+      setBusy(false);
+    }
+  } catch (e) {
+    removeThinking();
+    addMsg('error', 'Could not reach the server to resume.');
+    setBusy(false);
+  }
+}
+
 // ── History restore ───────────────────────────────────────────────────────────
+// Draws the server's history and returns true while a turn is still being
+// answered. The server records a turn the moment it starts — its reply is a
+// blank entry flagged `pending` until done — so a page reloaded mid-answer shows
+// "…" instead of losing the turn (live re-check, 2026-09-16).
 function restoreHistory(history) {
   chatInner().innerHTML = '';
-  history.forEach(m => {
+  let inProgress = false;
+  history.forEach((m, i) => {
     const role = m.role === 'user' ? 'user' : 'agent';
     const time = m.timestamp
       ? new Date(m.timestamp).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})
       : null;
-    addMsg(role, esc(m.text), time);
+    if (m.pending) {
+      inProgress = true;
+      addThinking();
+      return;
+    }
+    // Same rendering as a live reply: the user's own text is escaped, an agent
+    // reply goes through md() (which escapes first). esc() for both showed every
+    // restored answer as raw ### and ** after a reload.
+    if (role === 'user') addMsg('user', esc(m.text), time);
+    // A quota stop that saved a checkpoint showed a Resume button live; offer it
+    // again after a reload — but only as the LAST entry, never a stale button.
+    else if (m.kind === 'error' && m.resumable && i === history.length - 1) renderResumeNotice(m.text || '');
+    else if (m.kind === 'error') addMsg('error', esc(m.text || ''), time);
+    else addMsg('agent', md(m.text || ''), time);
   });
+  return inProgress;
 }
 
 // ── Upload busy state ─────────────────────────────────────────────────────────
@@ -815,15 +850,36 @@ async function waitForReady() {
   }
 
   document.getElementById('init-banner').style.display = 'none';
+  let inProgress = false;
   try {
     const hist = await fetch(`${API}/history`).then(r => r.json());
     if (hist.history && hist.history.length > 0) {
-      restoreHistory(hist.history);
+      inProgress = restoreHistory(hist.history);
     } else {
       addWelcomeMessage();
     }
   } catch {
     addWelcomeMessage();
+  }
+  // A turn is still being answered (the page was reloaded mid-answer): keep the
+  // input locked and follow it until the answer is recorded. Unlocking here used
+  // to lose the turn, and a message typed then was rejected as busy.
+  let drawn = null;
+  while (inProgress) {
+    await new Promise(r => setTimeout(r, 1500));
+    let hist;
+    try {
+      hist = await fetch(`${API}/history`).then(r => r.json());
+    } catch {
+      removeThinking();
+      addMsg('error', 'Lost contact with the server while your answer was being prepared.');
+      break;
+    }
+    const snapshot = JSON.stringify(hist.history || []);
+    if (snapshot !== drawn) {          // redraw only on change — no flicker
+      drawn = snapshot;
+      inProgress = restoreHistory(hist.history || []);
+    }
   }
   setBusy(false);
   // Reload persistence: if a disambiguation slot is still live server-side
@@ -832,6 +888,14 @@ async function waitForReady() {
     const pd = await fetch(`${API}/pending-disambiguation`).then(r => r.json());
     if (pd.groups) renderDisambiguation(pd.groups);
   } catch { /* no backend / no pending — stay in chat */ }
+  // Same for a staged write still waiting for Confirm / Cancel.
+  try {
+    const pc = await fetch(`${API}/pending-confirmation`).then(r => r.json());
+    if (pc.preview) {
+      renderConfirmPreview(pc.preview);
+      document.getElementById('confirm-bar').classList.remove('hidden');
+    }
+  } catch { /* no backend / nothing waiting — stay in chat */ }
 }
 
 // ── Send message ──────────────────────────────────────────────────────────────
@@ -843,7 +907,7 @@ async function sendMessage(forcedText) {
   if (!forcedText) input.value = '';
   input.style.height = 'auto';
   lastQuestion = text;
-  addMsg('user', esc(text));
+  const sentBubble = addMsg('user', esc(text));
   setBusy(true);
   const thinking = addThinking();
 
@@ -856,9 +920,14 @@ async function sendMessage(forcedText) {
     const data = await res.json();
     removeThinking();
 
-    if (res.status === 429) {
-      if (data.error === 'rate_limit') handleRateLimitError(data);
-      else setBusy(false);
+    if (isBusy(res, data)) {
+      // Not sent: take the bubble back and return what was typed to the box.
+      sentBubble.parentElement.parentElement.remove();
+      if (!forcedText) input.value = text;
+      addMsg('error', esc(BUSY_TEXT));
+      setBusy(false);
+    } else if (res.status === 429) {
+      handleRateLimitError(data);
     } else if (data.error === 'overload') {
       handleOverloadError();
     } else if (data.type === 'confirmation_required') {
@@ -902,6 +971,13 @@ async function sendConfirm(confirmed) {
     });
     const data = await res.json();
     removeThinking();
+    if (isBusy(res, data)) {
+      // Not sent: the staged write is still waiting, so the panel comes back.
+      document.getElementById('confirm-bar').classList.remove('hidden');
+      addMsg('error', esc(BUSY_TEXT));
+      setBusy(false);
+      return;
+    }
     if (res.status === 503 && data.type === 'error') {
       // Upload in progress — show toast, leave input locked, don't add a
       // chat bubble. The upload flow (waitForReady) owns the busy state.
@@ -990,7 +1066,11 @@ async function submitDisambiguation() {
     });
     const data = await res.json();
     removeThinking();
-    if (data.type === 'disambiguation_required') {
+    if (isBusy(res, data)) {
+      // Not sent: bring the same panel back so the picks can be submitted again.
+      addMsg('error', esc(BUSY_TEXT));
+      renderDisambiguation(disambigGroups);
+    } else if (data.type === 'disambiguation_required') {
       renderDisambiguation(data.groups);          // re-prompt (Other still ambiguous)
     } else if (data.type === 'confirmation_required') {
       renderConfirmPreview(data.preview);

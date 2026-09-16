@@ -89,7 +89,8 @@ def empty_ontology() -> dict:
         "muscles": {}, "by_muscle_name": {}, "children": {},
         "descendants": {}, "ancestors": {}, "path": {},
         "exercises": {}, "edges": [], "edges_by_exercise": {},
-        "aliases": {}, "reachable": frozenset(), "errors": [], "loaded": False,
+        "aliases": {}, "alias_names": {},
+        "reachable": frozenset(), "errors": [], "loaded": False,
     }
 
 
@@ -268,6 +269,9 @@ def _build(directory: str) -> dict:
             errors.append(f"aliases.csv: duplicate db_exercise_name {db_name!r}")
             continue
         o["aliases"][key] = eid
+        # The lookup key is lowercase; this keeps how the user actually spells
+        # it, so an answer can leave "T Bar Barbell Row" as the user wrote it.
+        o["alias_names"][key] = db_name
 
     # ── reachability ──────────────────────────────────────────────────────────
     # A muscle is REACHABLE when at least one exercise in the store maps to it or

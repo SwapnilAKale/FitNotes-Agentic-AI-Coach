@@ -663,12 +663,20 @@ def _norm_name(s: str) -> str:
 def recency_truth(package: dict) -> dict:
     """
     The deterministic "most recent session" date the answer MUST use, per
-    exercise plus a program-wide fallback:
-      {"per_exercise": {exercise_name: latest_date}, "global": latest_date | None}
-    latest_date = progression.latest_session_date (strength) / last_session_date
-    (cardio), falling back to max(session dates). global = training_frequency.
-    last_session_date, else the max across exercises. None-tolerant; never raises;
+    exercise:
+      {"per_exercise": {exercise_name: latest_date}}
+    latest_date = progression.latest_session_date (strength) / the exercise's
+    top-level last_session_date (cardio — its progression carries no session
+    date), falling back to max(session dates). None-tolerant; never raises;
     omits exercises with no derivable date.
+
+    THERE IS NO PROGRAM-WIDE DATE, ON PURPOSE. It could only apply to a package
+    with no exercises, and a real package has none only when the user asked about
+    an exercise with nothing in the window. Its answer quotes THAT exercise's
+    older date, which is correct; "correcting" it to the user's overall last
+    session made it wrong (Close Grip Smith Machine Bench Press 2026-06-13 →
+    2026-09-10, re-check 2026-09-16). A program-level package with no exercises
+    has no last session either, so the branch could never help.
     """
     pkg = package or {}
     per: dict = {}
@@ -679,16 +687,14 @@ def recency_truth(package: dict) -> dict:
         if not name:
             continue
         prog = ex.get("progression") or {}
-        latest = prog.get("latest_session_date") or prog.get("last_session_date")
+        latest = prog.get("latest_session_date") or ex.get("last_session_date")
         if not latest:
             dates = [s.get("date") for s in (ex.get("sessions") or [])
                      if isinstance(s, dict) and s.get("date")]
             latest = max(dates) if dates else None
         if latest:
             per[str(name)] = latest
-    tf = pkg.get("training_frequency") or {}
-    global_latest = tf.get("last_session_date") or (max(per.values()) if per else None)
-    return {"per_exercise": per, "global": global_latest}
+    return {"per_exercise": per}
 
 
 def recency_guard(answer: str, package: dict) -> tuple:
@@ -703,10 +709,9 @@ def recency_guard(answer: str, package: dict) -> tuple:
     """
     if not answer or not answer.strip():
         return answer, []
-    truth = recency_truth(package)
-    per, global_latest = truth["per_exercise"], truth["global"]
-    if not per and not global_latest:
-        return answer, []
+    per = recency_truth(package)["per_exercise"]
+    if not per:
+        return answer, []                 # nothing to scope a claim to — see recency_truth
 
     norm_per    = {_norm_name(n): (n, d) for n, d in per.items()}
     single_name = next(iter(per)) if len(per) == 1 else None
@@ -748,12 +753,10 @@ def recency_guard(answer: str, package: dict) -> tuple:
                 continue
         else:
             # Bare "most recent session": one exercise in scope → its latest;
-            # a purely program-level answer → the global latest; a multi-exercise
-            # answer → the exercise named nearest BEFORE the predicate.
+            # a multi-exercise answer → the exercise named nearest BEFORE the
+            # predicate. (No program-wide fallback — see recency_truth.)
             if single_name is not None:
                 correct, scope_name = per[single_name], single_name
-            elif not per and global_latest:
-                correct, scope_name = global_latest, "overall"
             else:
                 head, best_pos = answer[: pm.start()], -1
                 for nk, (nm, d) in norm_per.items():
@@ -891,9 +894,17 @@ def _held_claim_repair(exercise: str, muscle: str, primary: list) -> str:
     grammatical and always says exactly what the graph says.
     """
     low = muscle.lower()
-    tail = (f" — the {low} hold the load while your "
-            f"{_join_names(primary)} do the work." if primary
-            else f" — the {low} hold the load without being trained by it.")
+
+    def plural(names: list) -> bool:
+        # "the grip holds", "the biceps hold"; "your Chest does", "your Lats do".
+        # The verbs used to be fixed in the plural: "the grip hold the load".
+        return len(names) > 1 or str(names[0]).lower().endswith("s")
+
+    hold = "hold" if plural([muscle]) else "holds"
+    tail = (f" — the {low} {hold} the load while your "
+            f"{_join_names(primary)} {'do' if plural(primary) else 'does'} the work."
+            if primary
+            else f" — the {low} {hold} the load without being trained by it.")
     return f"Your {exercise} does not train your {muscle}{tail}"
 
 
@@ -1020,29 +1031,161 @@ _WEEKDAY_RE = re.compile(
     + r")\b", re.I)
 
 
+# ── Did the user ASK for a plan? ──────────────────────────────────────────────
+#
+# plan_guard judges a plan the coach BUILT. It ran on every analysis answer, so a
+# recap of the user's own week was reported as a scheduling error. The question
+# decides. A request pairs a making verb with a NEW thing and a plan noun:
+# "plan me a week", "give me a 4 day split", "make me a one week plan". A bare
+# noun is not enough — "how was my back ROM split", "Should I take a deload
+# week?" — and a linking word before the noun means the thing already exists:
+# "give me a summary OF my week".
+_PLAN_VERB = (r"(?:build|make|give|create|design|write|draft|set\s+up|lay\s+out|"
+              r"put\s+together|map\s+out|come\s+up\s+with|plan|program|schedule|"
+              r"suggest|recommend)")
+_PLAN_NEW = (r"(?:an?|one|new|next|my\s+next|the\s+next|this\s+coming|[0-9]+|"
+             r"one|two|three|four|five|six|seven)")
+_PLAN_MODIFIERS = r"(?:[\s-]+(?!(?:of|from|about|on|in|for)\b)[a-z0-9]+){0,3}?"
+_PLAN_NOUN = r"(?:week|plan|split|routine|program(?:me)?|schedule|session|workout)s?"
+_PLAN_REQUEST_RE = re.compile(
+    rf"\b{_PLAN_VERB}\b(?:\s+[a-z]+){{0,2}}?\s+{_PLAN_NEW}{_PLAN_MODIFIERS}[\s-]+{_PLAN_NOUN}\b",
+    re.I)
+# The user may WANT the same muscle on back-to-back days. Then there is nothing
+# to correct.
+_CONSECUTIVE_REQUEST_RE = re.compile(
+    r"\b(?:every\s*day|daily|each\s+day|back[\s-]+to[\s-]+back|consecutive\s+days?|"
+    r"(?:two|2|three|3)?\s*days?\s+in\s+a\s+row)\b", re.I)
+
+
+def is_plan_request(question: str) -> bool:
+    """True when the user's own words ask the coach to build a plan."""
+    return bool(question and _PLAN_REQUEST_RE.search(question))
+
+
+def asks_for_consecutive(question: str) -> bool:
+    """True when the user asks for the same work on back-to-back days."""
+    return bool(question and _CONSECUTIVE_REQUEST_RE.search(question))
+
+
+_HEADING_LINE_RE = re.compile(r"^[ \t]*(#{1,6})[ \t]")
+_BULLET_LINE_RE = re.compile(r"^[ \t]*(?:[-*+•]|\d+[.)])[ \t]")
+_RULE_LINE_RE = re.compile(r"^[ \t]*(?:[-*_][ \t]*){3,}$")
+# "Saturday/Sunday", "Sat & Sun": one day slot named by more than one weekday.
+_WEEKDAY_JOIN_RE = re.compile(
+    r"(?:[ \t]*(?:/|&|-|–|\band\b)[ \t]*(?:"
+    + "|".join(sorted(_WEEKDAYS, key=len, reverse=True)) + r")\b)+", re.I)
+_DATE_RES = (_ISO_DATE_RE, _MFIRST_DATE_RE, _DFIRST_DATE_RE)
+
+
+def _indent(line: str) -> int:
+    return len(line) - len(line.lstrip(" \t"))
+
+
+def _day_block_end(text: str, line_start: int, line_end: int) -> int:
+    """Where the block a day label opens ends — THE PLAN'S LAYOUT decides.
+
+    A table row is its own line. A heading runs to the next heading of the same
+    or higher level. A bullet or plain line runs over what hangs off it (indented
+    lines, and for a plain line the bullets after it), and ends at a heading, at
+    unindented prose, or at a blank line not followed by more of the same day.
+    """
+    line = text[line_start:line_end]
+    if line.lstrip().startswith("|"):
+        return line_end
+    lines = text[line_end + 1:].split("\n") if line_end < len(text) else []
+    heading = _HEADING_LINE_RE.match(line)
+    offset = line_end + 1
+    if heading:
+        level = len(heading.group(1))
+        for ln in lines:
+            h = _HEADING_LINE_RE.match(ln)
+            if h and len(h.group(1)) <= level:
+                return offset
+            offset += len(ln) + 1
+        return len(text)
+    is_bullet = bool(_BULLET_LINE_RE.match(line))
+    own = _indent(line)
+    for k, ln in enumerate(lines):
+        if _HEADING_LINE_RE.match(ln):
+            return offset
+        if not ln.strip():
+            after = next((x for x in lines[k + 1:] if x.strip()), None)
+            continues = after is not None and (
+                _indent(after) > own or (not is_bullet and _BULLET_LINE_RE.match(after)))
+            if not continues:
+                return offset
+        elif is_bullet and _indent(ln) <= own and not _BULLET_LINE_RE.match(ln):
+            return offset
+        offset += len(ln) + 1
+    return len(text)
+
+
 def _plan_days(answer: str) -> list:
-    """[(day_number, text_of_that_day)] — a plan's rows, in order.
+    """The plans in an answer: [[(day_number, label, text_of_that_day), ...], ...].
 
     A day is the literal word "Day N", a weekday name, or a table row starting
     with a bare number IN A TABLE THAT DECLARES A DAY COLUMN. Requiring one of
     those is what separates a training plan from a numbered list.
+
+    A DAY ENDS WHERE THE PLAN'S LAYOUT ENDS, not at the next day label. The last
+    day used to run to the end of the answer, so the explanation every plan must
+    give ("EXPLAIN THE STRUCTURE") was read as that day's exercises: a Saturday
+    of arm work became hamstrings "on day 5 and day 6" (live re-check, 2026-09-16).
+
+    A PLAN IS ONE CONTIGUOUS RUN OF DAYS; only a run of two or more is returned.
+    A weekday opening a line of prose after the plan is not the plan's next day.
+
+    A DAY LABEL CARRYING A DATE IS LOGGED TRAINING, not a plan: "Monday
+    (2026-09-07)" is what the user did, and it is not the coach's to judge.
     """
     text = answer or ""
-    hits = [(int(m.group(1)), m.start(), m.end())
+    hits = [(int(m.group(1)), f"Day {m.group(1)}", m.start(), m.end())
             for m in _DAY_WORD_RE.finditer(text)]
-    hits += [(_WEEKDAYS[m.group(1).lower()], m.start(), m.end())
-             for m in _WEEKDAY_RE.finditer(text)]
+    for m in _WEEKDAY_RE.finditer(text):
+        joined = _WEEKDAY_JOIN_RE.match(text, m.end())
+        end = joined.end() if joined else m.end()
+        hits.append((_WEEKDAYS[m.group(1).lower()], text[m.start(1):end], m.start(), end))
     if _DAY_HEADER_RE.search(text):
-        hits += [(int(m.group(1)), m.start(), m.end())
+        hits += [(int(m.group(1)), f"Day {m.group(1)}", m.start(), m.end())
                  for m in _DAY_CELL_RE.finditer(text)]
-    hits.sort(key=lambda h: h[1])
-    if len(hits) < 2:
-        return []
-    out = []
-    for i, (day, _s, e) in enumerate(hits):
-        end = hits[i + 1][1] if i + 1 < len(hits) else len(answer)
-        out.append((day, answer[e:end]))
-    return out
+    hits.sort(key=lambda h: h[2])
+
+    days = []                              # (day, label, start, content_start, block_end)
+    for day, label, start, content in hits:
+        if days and start < days[-1][3]:
+            continue                       # the same label matched twice
+        line_start = text.rfind("\n", 0, content) + 1
+        line_end = text.find("\n", content)
+        line_end = len(text) if line_end < 0 else line_end
+        if any(r.search(text[line_start:line_end]) for r in _DATE_RES):
+            continue                       # logged training, not a plan day
+        days.append((day, label, start, content,
+                     _day_block_end(text, line_start, line_end)))
+
+    runs, run, prev_end = [], [], None
+    for i, (day, label, start, content, block_end) in enumerate(days):
+        seg_end = min(block_end, days[i + 1][2]) if i + 1 < len(days) else block_end
+        if run and any(g.strip() and not _RULE_LINE_RE.match(g)
+                       for g in text[prev_end:start].split("\n")):
+            runs.append(run)
+            run = []
+        run.append((day, label, text[content:seg_end]))
+        prev_end = seg_end
+    if run:
+        runs.append(run)
+    return [r for r in runs if len(r) >= 2]
+
+
+def _exercise_vocab(ontology: dict) -> tuple:
+    """({normalised name: exercise id}, names longest first). Closed vocabulary:
+    canonical names plus every logged alias, longest first so "Seated Machine
+    Curl" wins over "Machine Curl". Shared by every check that reads a plan."""
+    vocab = {}
+    for eid, ex in (ontology.get("exercises") or {}).items():
+        vocab.setdefault(_norm_name(ex["canonical_name"]), eid)
+    for db_name, eid in (ontology.get("aliases") or {}).items():
+        vocab.setdefault(_norm_name(db_name), eid)
+    return vocab, sorted(vocab, key=len, reverse=True)
 
 
 def plan_guard(answer: str, ontology: dict) -> tuple:
@@ -1061,20 +1204,13 @@ def plan_guard(answer: str, ontology: dict) -> tuple:
     """
     if not answer or not ontology or not ontology.get("edges_by_exercise"):
         return [], [], []
-    days = _plan_days(answer)
-    if len(days) < 2:
+    plans = _plan_days(answer)
+    if not plans:
         return [], [], []
 
     muscles = ontology.get("muscles", {})
     exercises = ontology.get("exercises", {})
-    # Closed vocabulary: canonical names plus every logged alias, longest first
-    # so "Seated Machine Curl" wins over "Machine Curl".
-    vocab = {}
-    for eid, ex in exercises.items():
-        vocab.setdefault(_norm_name(ex["canonical_name"]), eid)
-    for db_name, eid in (ontology.get("aliases") or {}).items():
-        vocab.setdefault(_norm_name(db_name), eid)
-    names = sorted(vocab, key=len, reverse=True)
+    vocab, names = _exercise_vocab(ontology)
 
     def worked(segment: str, role: str) -> dict:
         """{muscle_id: exercise_name} for muscles hit in this ROLE here.
@@ -1108,8 +1244,10 @@ def plan_guard(answer: str, ontology: dict) -> tuple:
                         if edge["role"] != role:
                             continue
                         if edge["muscle_id"] in muscles:
+                            # Named as the USER names it — the note is read by them.
                             found.setdefault(edge["muscle_id"],
-                                             exercises[eid]["canonical_name"])
+                                             _user_exercise_name(ontology, eid)
+                                             or exercises[eid]["canonical_name"])
                 at = seg.find(nm, at + 1)
         return found
 
@@ -1130,15 +1268,19 @@ def plan_guard(answer: str, ontology: dict) -> tuple:
                     out.append((a, b))
         return out
 
-    by_day = [(d, worked(text, "primary"), worked(text, "secondary"))
-              for d, text in days]
     def label(mid):
         return muscles[mid]["name"]
 
+    # Only neighbours inside ONE plan are compared; days are named as the plan
+    # names them ("Friday", "Saturday/Sunday", "Day 5").
+    pairs = []
+    for plan in plans:
+        by_day = [(d, name, worked(text, "primary"), worked(text, "secondary"))
+                  for d, name, text in plan]
+        pairs += list(zip(by_day, by_day[1:]))
+
     violations, concerns, flags = [], [], []
-    for i in range(len(by_day) - 1):
-        d1, p1, s1 = by_day[i]
-        d2, p2, s2 = by_day[i + 1]
+    for (d1, n1, p1, s1), (d2, n2, p2, s2) in pairs:
         if d2 != d1 + 1:
             continue                      # not adjacent days
 
@@ -1150,12 +1292,13 @@ def plan_guard(answer: str, ontology: dict) -> tuple:
                 continue
             seen.add(key)
             same = label(a) if a == b else f"{label(a)} / {label(b)}"
-            detail = (f"{p1[a]} on day {d1} and {p2[b]} on day {d2} both train "
+            detail = (f"{p1[a]} on {n1} and {p2[b]} on {n2} both train "
                       f"{same} directly")
             violations.append(detail)
             flags.append({
                 "kind": "plan_consecutive_days", "severity": "violation",
                 "muscle": same, "day_a": d1, "day_b": d2,
+                "label_a": n1, "label_b": n2,
                 "exercise_a": p1[a], "exercise_b": p2[b],
                 "reason": detail + "; direct work needs a day between",
             })
@@ -1172,16 +1315,169 @@ def plan_guard(answer: str, ontology: dict) -> tuple:
                 continue
             seen_soft.add(key)
             same = label(b)
-            detail = (f"{s1[a]} on day {d1} already works {same} as a secondary "
-                      f"muscle, and {p2[b]} targets it directly on day {d2}")
+            detail = (f"{s1[a]} on {n1} already works {same} as a secondary "
+                      f"muscle, and {p2[b]} targets it directly on {n2}")
             concerns.append(detail)
             flags.append({
                 "kind": "plan_secondary_interference", "severity": "concern",
                 "muscle": same, "day_a": d1, "day_b": d2,
+                "label_a": n1, "label_b": n2,
                 "exercise_a": s1[a], "exercise_b": p2[b],
                 "reason": detail + "; space them or say why it still works",
             })
     return violations, flags, concerns
+
+
+def plan_requirements(flags: list) -> list:
+    """Facts for a plan retry, from plan_guard's flags, in the user's exercise
+    names. A clash is stated as a scheduling fact, not as a complaint about a
+    draft — the retry never sees the draft."""
+    out = []
+    for f in flags or []:
+        a, b, muscle = f.get("exercise_a"), f.get("exercise_b"), f.get("muscle")
+        if f.get("severity") == "violation":
+            fact = (f"{a} trains {muscle} directly — never put it on consecutive days."
+                    if a == b else
+                    f"{a} and {b} both train {muscle} directly — never put them on "
+                    f"consecutive days.")
+        else:
+            fact = (f"{a} works {muscle} as a secondary muscle; if {b}, which trains it "
+                    f"directly, is on the next day, say why that order still works.")
+        if fact not in out:
+            out.append(fact)
+    return out
+
+
+# ── F6 · a plan keeps every other muscle group at maintenance ─────────────────
+#
+# "plan me a week that brings up my hamstrings…" came back with Arms at 6 sets a
+# week against the user's current 19.9 and Back at 12 against 18.0 (live
+# re-check, 2026-09-16). Holding the rest at maintenance is the DEFAULT — nobody
+# trains only the muscle they want bigger — so every plan is checked, and only
+# an explicit "arms only / nothing else / drop the rest" switches it off.
+
+_MAINTENANCE_SHARE = 0.8        # below 80% of the current weekly figure is a cut
+_MAINTENANCE_MIN = 2.0          # groups trained under 2 sets a week are not judged
+_PLAN_WORDS = (r"(?:plan|week|split|day|days|workout|workouts|routine|program|programme|"
+               r"session|sessions|training)")
+_REDUCE_CUE = (r"(?:reduce|reducing|less|fewer|cut(?:s|ting)?\s+back(?:\s+on)?|"
+               r"cut(?:s|ting)?\s+down(?:\s+on)?|lower|deload|back\s+off(?:\s+on)?|"
+               r"decrease|ease\s+off(?:\s+on)?)")
+# One exercise per piece: lines, table cells and lists ("A (4), B (3)", "A and B").
+_PIECE_SPLIT_RE = re.compile(r"[\n,;|&+]|\band\b", re.I)
+_PIECE_SETS_RE = re.compile(r"\b(\d+)\s*(?:sets?\b|[x×]\s*\d+)|\((\d+)\)", re.I)
+
+
+def _muscle_alternation(ontology: dict) -> str:
+    bodies = [b for b in (_word_name_pattern(str(m.get("name", "")))
+                          for m in (ontology.get("muscles") or {}).values()) if b]
+    return "(?:" + "|".join(sorted(bodies, key=len, reverse=True)) + ")"
+
+
+def asks_to_drop_the_rest(question: str, ontology: dict) -> bool:
+    """The user EXPLICITLY wants nothing but the focus: "arms only", "just biceps
+    and triceps", "nothing else", "drop the rest". "only / just" counts only when
+    a muscle name follows — "I only have 4 days" is about days — and "not just my
+    arms" is the opposite of an opt-out."""
+    if not question or not ontology or not ontology.get("muscles"):
+        return False
+    muscle = _muscle_alternation(ontology)
+    return bool(re.search(
+        r"\bnothing\s+else\b"
+        r"|\bno\s+other\s+(?:muscles?|groups?|body\s*parts?|work|training|exercises?)\b"
+        r"|\b(?:drop|skip|ignore|exclude|leave\s+out|cut\s+out)\s+(?:everything\s+else|"
+        r"(?:all\s+)?the\s+rest|other\s+(?:muscles?|groups?|body\s*parts?))\b"
+        r"|(?<!not\s)\b(?:only|just|purely|exclusively)\s+(?:(?:my|the|on|train|trains|"
+        rf"training|work|working|hit|hitting)\s+)*{muscle}\b"
+        rf"|\b{muscle}[\s-]only(?=\s+{_PLAN_WORDS}\b|\s*[,.!?]|\s*$)",
+        question, re.I))
+
+
+def asks_to_reduce(question: str, muscle: str) -> bool:
+    """The user asks for LESS of this muscle ("less back work", "deload my
+    shoulders", "cuts back on chest") — so a cut there is what they asked for."""
+    body = _word_name_pattern(muscle or "")
+    if not question or body is None:
+        return False
+    return bool(re.search(
+        rf"\b{_REDUCE_CUE}\b(?:\s+(?:my|the|on|work|training|volume|sets|for|of))*\s+{body}\b"
+        rf"|\b{body}\b\s+(?:work\s+|volume\s+|training\s+)?(?:down|lower|less)\b",
+        question, re.I))
+
+
+def plan_volume_shortfalls(answer: str, ontology: dict, package: dict, question: str) -> list:
+    """[{group, current, planned}] for every top-level muscle group the plan cuts
+    below maintenance: planned primary sets under 80% of the user's current
+    weekly figure. Counted the way the package counts — an exercise's sets once
+    per group, primary role only. Not judged: groups trained under 2 sets a week,
+    groups the user asks to reduce, groups reached by an exercise with no readable
+    set count (unknown is not zero), and any plan the user asked to keep to the
+    focus only."""
+    if not answer or not ontology or not ontology.get("edges_by_exercise"):
+        return []
+    if asks_to_drop_the_rest(question or "", ontology):
+        return []
+    plans = _plan_days(answer)
+    if not plans:
+        return []                                  # no week (e.g. a single session)
+    plan = max(plans, key=len)
+    muscles = ontology.get("muscles") or {}
+    ancestors = ontology.get("ancestors") or {}
+    groups = {mid: m["name"] for mid, m in muscles.items() if m.get("parent_id") is None}
+    vocab, names = _exercise_vocab(ontology)
+
+    planned: dict = {}
+    unknown: set = set()
+    for _day, _label, text in plan:
+        for piece in _PIECE_SPLIT_RE.split(text):
+            norm = _norm_name(piece)
+            name = next((n for n in names if n and n in norm), None)
+            if name is None:
+                continue
+            reached = set()
+            for edge in ontology["edges_by_exercise"].get(vocab[name], []):
+                if edge["role"] == "primary":
+                    reached |= set(ancestors.get(edge["muscle_id"], ())) | {edge["muscle_id"]}
+            in_groups = reached & set(groups)      # a set counts ONCE per group
+            if not in_groups:
+                continue
+            count = _PIECE_SETS_RE.search(piece)
+            if not count:
+                unknown |= in_groups
+                continue
+            sets = int(count.group(1) or count.group(2))
+            for gid in in_groups:
+                planned[gid] = planned.get(gid, 0) + sets
+
+    current_by_name = {r["muscle"]: _num(r.get("primary_sets_per_week"))
+                       for r in _muscle_rows(package)}
+    descendants = ontology.get("descendants") or {}
+    out = []
+    for gid, name in sorted(groups.items(), key=lambda kv: kv[1]):
+        current = current_by_name.get(name)
+        if current is None or current < _MAINTENANCE_MIN or gid in unknown:
+            continue
+        subtree = [muscles[d]["name"] for d in descendants.get(gid, {gid}) if d in muscles]
+        if any(asks_to_reduce(question, n) for n in subtree):
+            continue
+        got = planned.get(gid, 0)
+        if got < _MAINTENANCE_SHARE * current:
+            out.append({"group": name, "current": current, "planned": got})
+    return out
+
+
+def volume_requirements(shortfalls: list) -> list:
+    """Facts for a plan retry: each cut group's REAL weekly figure. The draft's
+    number is not repeated — the retry never sees the draft."""
+    return [f"{s['group']}: the user currently does {_fmt(s['current'])} primary sets a "
+            f"week — the plan must keep it at least there." for s in shortfalls or []]
+
+
+def volume_note(shortfalls: list) -> str:
+    return "".join(
+        f"\n\nNote: this plan gives {s['group']} {_fmt(s['planned'])} sets a week against "
+        f"your current {_fmt(s['current'])} — add sets there to keep it steady."
+        for s in shortfalls or [])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1232,6 +1528,41 @@ def _fmt(value) -> str:
     return str(int(v)) if v == int(v) else f"{v:g}"
 
 
+def _without_bold(text: str) -> tuple:
+    """(plain, positions): `text` with every ** removed, and for each plain
+    character its index in `text` (plus a final entry for the end).
+
+    Key figures are bold by instruction ("**bold** for key figures"), and a guard
+    that matches "25 sets" never sees "**25** sets": an invented count, a set
+    rate called sessions and a plan figure missing its target all slipped past
+    (live re-check follow-up, 2026-09-17). Guards match on `plain` and map their
+    edits back, so the user's bold stays where it was."""
+    plain, positions, i = [], [], 0
+    while i < len(text):
+        if text.startswith("**", i):
+            i += 2
+            continue
+        plain.append(text[i])
+        positions.append(i)
+        i += 1
+    positions.append(len(text))
+    return "".join(plain), positions
+
+
+def _original_span(text: str, positions: list, start: int, end: int) -> tuple:
+    """Map a [start, end) span of the plain text back onto `text`. A span that
+    would cut a bold pair in half takes the stray marker with it, so an edit
+    never leaves an unpaired ** behind."""
+    s = positions[start]
+    e = positions[end - 1] + 1 if end > start else s
+    if text[s:e].count("**") % 2:
+        if s >= 2 and text[s - 2:s] == "**":
+            s -= 2
+        elif text[e:e + 2] == "**":
+            e += 2
+    return s, e
+
+
 def _splice(answer: str, edits: list) -> str:
     """Apply (start, end, replacement) edits right-to-left, one per span."""
     unique = {(s, e): r for s, e, r in edits}
@@ -1256,36 +1587,92 @@ _SESSIONS_PER_WEEK_RE = re.compile(
 _FREQUENCY_WORD_RE = re.compile(r"\bfrequency\b", re.I)
 
 
+def _word_name_pattern(name: str):
+    """The regex body for a name, the plural optional on its last word: "Legs"
+    matches "leg", "Mid Traps" matches "mid trap". None for an empty name."""
+    words = [w for w in re.split(r"[^A-Za-z0-9]+", name) if w]
+    if not words:
+        return None
+    last = words[-1]
+    lw = last.lower()
+    base = last[:-1] if lw.endswith("s") and not lw.endswith(("ss", "us", "is")) else last
+    parts = [re.escape(w) for w in words[:-1]] + [re.escape(base) + "s?"]
+    return r"[\s\-]+".join(parts)
+
+
+def _word_name_re(name: str):
+    """A whole-word, case-insensitive pattern for a name (see _word_name_pattern)."""
+    body = _word_name_pattern(name)
+    if body is None:
+        return None
+    return re.compile(r"(?<![A-Za-z0-9])" + body + r"(?![A-Za-z0-9])", re.I)
+
+
 def sets_as_sessions_guard(answer: str, package: dict) -> tuple:
     """
-    "5.3 sessions per week" where 5.3 is a muscle's SETS per week and not the
-    user's real session rate → "5.3 sets per week"; a "frequency" earlier in the
-    same sentence becomes "volume". A number that IS the real session rate, or
-    that matches no set rate, is left alone. Returns (answer, flags).
+    "leg training frequency is low at 5.3 sessions per week", where 5.3 is the
+    Legs SETS rate → "5.3 sets per week"; a "frequency" earlier in the same
+    sentence becomes "volume". Returns (answer, flags).
+
+    A NUMBER ALONE IS NOT EVIDENCE. A real package holds ~50 muscle set rates
+    spread from 0.2 to 20 and a real SESSION rate for every exercise; about half
+    the exercises collide with some muscle's set rate, and matching on the number
+    turned a true "Lat Pulldown about 1.2 sessions per week" into "1.2 sets" (the
+    Wrist Extensors' rate). So all four must hold, within the number's sentence:
+      1. a muscle is named;
+      2. the number is THAT muscle's own sets-per-week figure;
+      3. no named exercise has the number as its real session rate;
+      4. the number is not the user's overall session rate.
     """
     if not answer or not answer.strip():
         return answer, []
-    per_week = [v for r in _muscle_rows(package)
-                for v in (r.get("primary_sets_per_week"), r.get("secondary_sets_per_week"))
-                if _num(v)]
-    if not per_week:
+    pkg = package or {}
+    muscles = []                          # (name pattern, that muscle's set rates)
+    for r in _muscle_rows(pkg):
+        rates = [v for v in (r.get("primary_sets_per_week"), r.get("secondary_sets_per_week"))
+                 if _num(v)]
+        pattern = _word_name_re(str(r["muscle"]))
+        if rates and pattern is not None:
+            muscles.append((pattern, rates))
+    if not muscles:
         return answer, []
-    real = ((package or {}).get("training_frequency") or {}).get("sessions_per_week")
+    real = (pkg.get("training_consistency") or {}).get("sessions_per_week")
+    exercise_rates = []                   # (name pattern, that exercise's session rate)
+    for ex in pkg.get("exercises") or []:
+        if not isinstance(ex, dict) or not ex.get("name"):
+            continue
+        rate = (ex.get("training_frequency") or {}).get("sessions_per_week")
+        if _num(rate) is None:
+            continue
+        name = str(ex["name"])
+        # The exact store spelling always counts — "Seated Machine Curl (Kg)" has
+        # brackets the tolerant pattern cannot span — plus the tolerant variants.
+        exercise_rates.append((re.compile(re.escape(name), re.I), rate))
+        pattern = _tolerant_name_re(name) or _word_name_re(name)
+        if pattern is not None:
+            exercise_rates.append((pattern, rate))
 
+    plain, positions = _without_bold(answer)      # match past **bold** figures
     edits, flags = [], []
-    for m in _SESSIONS_PER_WEEK_RE.finditer(answer):
+    for m in _SESSIONS_PER_WEEK_RE.finditer(plain):
         n = m.group("num")
         if real is not None and _close(n, real):
-            continue                      # it IS the real session rate
-        if not any(_close(n, v) for v in per_week):
-            continue                      # no set rate either — not ours to judge
+            continue                      # 4. it IS the real session rate
+        end = _BOUNDARY_RE.search(plain, m.end())
+        sentence = plain[_sentence_start(plain, m.start()): end.start() if end else len(plain)]
+        if not any(p.search(sentence) and any(_close(n, v) for v in rates)
+                   for p, rates in muscles):
+            continue                      # 1+2. no named muscle has this set rate
+        if any(_close(n, rate) and p.search(sentence) for p, rate in exercise_rates):
+            continue                      # 3. a named exercise's real session rate
         singular = m.group("noun").strip().lower().endswith("session")
         noun = " set" if singular else " sets"
-        edits.append((m.start("noun"), m.end("noun"), noun))
-        s0 = _sentence_start(answer, m.start())
-        for f in _FREQUENCY_WORD_RE.finditer(answer, s0, m.start()):
+        edits.append((*_original_span(answer, positions, m.start("noun"), m.end("noun")), noun))
+        s0 = _sentence_start(plain, m.start())
+        for f in _FREQUENCY_WORD_RE.finditer(plain, s0, m.start()):
             word = f.group(0)
-            edits.append((f.start(), f.end(), "Volume" if word[0].isupper() else "volume"))
+            edits.append((*_original_span(answer, positions, f.start(), f.end()),
+                          "Volume" if word[0].isupper() else "volume"))
         flags.append({
             "kind": "sets_as_sessions",
             "original": m.group(0).strip(),
@@ -1316,14 +1703,17 @@ def window_label_guard(answer: str, package: dict) -> tuple:
     if days is None:
         return answer, []
 
+    # Matched without bold markers: "**90-day** recovery" was missed, and a **
+    # before the phrase read as a sentence start ("**Recovery trends…").
+    plain, positions = _without_bold(answer)
     edits, flags = [], []
-    for m in _WINDOW_BODY_RE.finditer(answer):
+    for m in _WINDOW_BODY_RE.finditer(plain):
         if int(m.group("n")) != int(days):
             continue
         repl = f"{m.group('noun')}{m.group('tail') or ''} over the last {m.group('n')} days"
-        if _AT_SENTENCE_START_RE.search(answer[:m.start()]):
+        if _AT_SENTENCE_START_RE.search(plain[:m.start()]):
             repl = repl[0].upper() + repl[1:]
-        edits.append((m.start(), m.end(), repl))
+        edits.append((*_original_span(answer, positions, m.start(), m.end()), repl))
         flags.append({
             "kind": "window_label",
             "original": m.group(0),
@@ -1355,21 +1745,74 @@ def _tolerant_name_re(name: str):
         else:
             base = w
         parts.append(re.escape(base) + r"(?:e?s)?")
-    return re.compile(r"(?<![A-Za-z0-9])" + r"[\s\-]*".join(parts)
+    # Brackets are part of real names ("Seated Machine Curl (Kg)", "Running
+    # (Outdoor)"). Stopping at one matched only "Seated Machine Curls", and the
+    # "(Kg)" already in the text followed the correction: "…Curl (Kg) (Kg)".
+    closing = r"\)?" if name.rstrip().endswith(")") else ""
+    return re.compile(r"(?<![A-Za-z0-9])" + r"[\s\-()]*".join(parts) + closing
                       + r"(?![A-Za-z0-9])", re.I)
+
+
+def _user_exercise_name(ontology: Optional[dict], exercise_id) -> Optional[str]:
+    """How the USER names a graph exercise: their one logged spelling, or the
+    graph's name when they have none, several, or theirs differs only in capitals
+    ("dumbbell skull crusher" → "Dumbbell Skull Crusher"). One rule, shared by
+    every place an answer names an exercise."""
+    ont = ontology or {}
+    canonical = ((ont.get("exercises") or {}).get(exercise_id) or {}).get("canonical_name")
+    aliases = ont.get("aliases") or {}
+    mine = [str(s) for key, s in (ont.get("alias_names") or {}).items()
+            if aliases.get(key) == exercise_id]
+    if len(mine) == 1 and not (canonical and mine[0].lower() == str(canonical).lower()):
+        return mine[0]
+    return str(canonical) if canonical else None
 
 
 def exercise_name_guard(answer: str, package: dict, ontology: Optional[dict] = None) -> tuple:
     """
-    A near-miss of a store exercise name is rewritten to the exact store name.
-    The vocabulary is CLOSED: the package's exercises and suggestable_exercises,
-    plus the graph's canonical names. Longest name wins its span, so "Incline
-    Smith Machine Press" is never read as "Smith Machine Press". A span that
-    already is a store name, in any case, is left alone. Returns (answer, flags).
+    A near-miss of a store exercise name is rewritten to the exact name. The
+    vocabulary is CLOSED: the user's own spellings (every alias, not only the
+    exercises in this package), the package's exercises and suggestable_exercises,
+    and the graph's canonical names. A span that already is one of those, in any
+    case, is left alone. Longest name wins its span, so "Incline Smith Machine
+    Press" is never read as "Smith Machine Press". Returns (answer, flags).
+
+    THE USER'S SPELLING IS NEVER A NEAR-MISS. Reading only the package's names,
+    a hamstring plan "corrected" the user's logged "Reverse Cable Curls" and
+    "T Bar Barbell Row" to the graph's names, because that package did not hold
+    them (live re-check, 2026-09-16); "Reverse Zig Zag Barbell Curls" even lost
+    the "s" of the "Barbell Curls" inside it. A real near-miss is corrected to
+    how the USER spells that exercise — or to the graph's capitals when the
+    user's spelling differs only in case ("dumbbell skull crusher").
     """
     if not answer or not answer.strip():
         return answer, []
     pkg = package or {}
+    ont = ontology or {}
+    graph = ont.get("exercises") or {}
+    aliases = ont.get("aliases") or {}
+    canonical_of = {eid: str(ex["canonical_name"]) for eid, ex in graph.items()
+                    if isinstance(ex, dict) and ex.get("canonical_name")}
+    id_by_canonical = {}
+    for eid, canonical in canonical_of.items():
+        id_by_canonical.setdefault(canonical.lower(), eid)
+    user_spellings: dict = {}             # exercise id → how the user spells it
+    for key, spelling in (ont.get("alias_names") or {}).items():
+        if aliases.get(key) is not None:
+            user_spellings.setdefault(aliases[key], []).append(str(spelling))
+
+    def exercise_id(name):
+        key = name.lower()
+        return aliases.get(key, id_by_canonical.get(key))
+
+    def corrected(name):
+        """The spelling a near-miss of `name` is rewritten to — decided by the
+        EXERCISE, so whichever of its names matched, the answer is the same."""
+        eid = exercise_id(name)
+        if eid is None:
+            return name                   # not in the graph: its own spelling
+        return _user_exercise_name(ont, eid) or name
+
     names = set()
     for ex in pkg.get("exercises") or []:
         if isinstance(ex, dict) and ex.get("name"):
@@ -1378,15 +1821,15 @@ def exercise_name_guard(answer: str, package: dict, ontology: Optional[dict] = N
         n = s.get("name") if isinstance(s, dict) else s
         if n:
             names.add(str(n))
-    for ex in ((ontology or {}).get("exercises") or {}).values():
-        if isinstance(ex, dict) and ex.get("canonical_name"):
-            names.add(str(ex["canonical_name"]))
+    names.update(canonical_of.values())
+    for spellings in user_spellings.values():
+        names.update(spellings)
     if not names:
         return answer, []
     exact = {n.lower() for n in names}
 
     taken, edits, flags = [], [], []
-    for name in sorted(names, key=len, reverse=True):
+    for name in sorted(names, key=lambda n: (-len(n), n)):   # deterministic ties
         pattern = _tolerant_name_re(name)
         if pattern is None:
             continue
@@ -1398,11 +1841,12 @@ def exercise_name_guard(answer: str, package: dict, ontology: Optional[dict] = N
             found = m.group(0)
             if found.lower() in exact:
                 continue                  # already a real store name
-            edits.append((start, end, name))
+            target = corrected(name)
+            edits.append((start, end, target))
             flags.append({
                 "kind": "exercise_name",
                 "original": found,
-                "corrected": name,
+                "corrected": target,
                 "reason": "exercise names are copied exactly from the store",
             })
     return (_splice(answer, edits), flags) if edits else (answer, [])
@@ -1486,6 +1930,8 @@ def set_count_guard(answer: str, package: dict) -> tuple:
     truth = _set_count_truth(package)
     if not truth:
         return [], []
+    # Detection only, so it simply reads past **bold**: "**25** sets" was invisible.
+    answer, _positions = _without_bold(answer)
 
     alt = "|".join(re.escape(t["label"])
                    for t in sorted(truth.values(), key=lambda t: -len(t["label"])))
@@ -1526,6 +1972,22 @@ def set_count_guard(answer: str, package: dict) -> tuple:
     return violations, flags
 
 
+def set_count_requirements(flags: list, package: dict) -> list:
+    """Facts for a set-count retry: each named muscle's REAL figures. The wrong
+    number is deliberately not repeated — the model gets what is true, not a
+    draft to argue with."""
+    truth = _set_count_truth(package)
+    out, seen = [], set()
+    for f in flags or []:
+        t = truth.get(str(f.get("name", "")).lower())
+        if not t or t["label"] in seen:
+            continue
+        seen.add(t["label"])
+        out.append(f"{t['label']}: use only these figures from the user's data — "
+                   + "; ".join(t["facts"]))
+    return out
+
+
 # ── B4 · a sets-per-week figure in a plan comes with its target ───────────────
 
 _TARGET_RANGE_RE = re.compile(
@@ -1546,7 +2008,7 @@ def target_guard(answer: str, package: dict) -> tuple:
     """
     if not answer or not answer.strip() or _TARGET_RANGE_RE.search(answer):
         return answer, []
-    if len(_plan_days(answer)) < 2 and not _IMPROVE_CUE_RE.search(answer):
+    if not _plan_days(answer) and not _IMPROVE_CUE_RE.search(answer):
         return answer, []
     rows = [(r["muscle"], r.get("primary_sets_per_week")) for r in _muscle_rows(package)]
     if not rows:
@@ -1554,7 +2016,8 @@ def target_guard(answer: str, package: dict) -> tuple:
     lo, hi = SETS_PER_WEEK_TARGET
     clause = f" (the usual target is {lo}–{hi} sets a week per muscle)"
 
-    for sm in _NUM_SENTENCE_RE.finditer(answer):
+    plain, positions = _without_bold(answer)      # "**1.8** sets" is still a figure
+    for sm in _NUM_SENTENCE_RE.finditer(plain):
         sentence = sm.group(0)
         for m in _PER_WEEK_FIGURE_RE.finditer(sentence):
             n = m.group("n") or m.group("n2")
@@ -1564,7 +2027,9 @@ def target_guard(answer: str, package: dict) -> tuple:
                           None)
             if muscle is None:
                 continue
-            at = sm.start() + m.end()
+            at = positions[sm.start() + m.end() - 1] + 1
+            if answer[at:at + 2] == "**" and answer[:at].count("**") % 2:
+                at += 2                   # after the closing **, not inside the bold
             return (answer[:at] + clause + answer[at:],
                     [{"kind": "sets_per_week_target", "muscle": muscle,
                       "original": m.group(0), "corrected": m.group(0) + clause,

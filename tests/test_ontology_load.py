@@ -337,6 +337,28 @@ def test_unsourced_edge_is_rejected(tmp_path, monkeypatch):
     assert any("no source" in e for e in o["errors"])
 
 
+def test_alias_spelling_is_kept_as_written(tmp_path, monkeypatch):
+    """`aliases` is keyed lowercase for lookup, which threw away how the user
+    actually spells the exercise. The answer name guard needs that spelling to
+    leave "T Bar Barbell Row" alone instead of "correcting" it to the graph name."""
+    _write_store(
+        tmp_path,
+        muscles=[(1, "Back", "", "large")],
+        exercises=[(1, "T-Bar Barbell Row", "barbell", "horizontal pull")],
+        edges=[(1, 1, "primary", "test")],
+        aliases=[("T Bar Barbell Row", 1)],
+    )
+    monkeypatch.setenv("ONTOLOGY_DIR", str(tmp_path))
+    o = load_ontology(force=True)
+    assert o["aliases"] == {"t bar barbell row": 1}
+    assert o["alias_names"] == {"t bar barbell row": "T Bar Barbell Row"}
+
+
+def test_empty_store_has_no_alias_names(tmp_path, monkeypatch):
+    monkeypatch.setenv("ONTOLOGY_DIR", str(tmp_path / "nope"))
+    assert load_ontology(force=True)["alias_names"] == {}
+
+
 def test_comment_rows_are_ignored(tmp_path, monkeypatch):
     _write_store(
         tmp_path,

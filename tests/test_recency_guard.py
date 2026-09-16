@@ -59,25 +59,41 @@ def _pkg_multi():
     }
 
 
-def _pkg_global():
-    """Program-level package: no per-exercise breakdown, only a global latest."""
-    return {"training_frequency": {"last_session_date": LATEST}}
+def _pkg_out_of_window():
+    """The REAL shape of a package with no exercises: the user asked about an
+    exercise with nothing logged in the window. training_consistency is computed
+    from every training date, so it still carries the user's overall last
+    session — which is NOT that exercise's last session."""
+    return {"exercises": [], "training_consistency": {"last_session": LATEST}}
+
+
+def _pkg_cardio():
+    """A cardio exercise as a real package holds it: the date is top-level
+    `last_session_date`; its progression has no session date. The sessions list
+    here deliberately stops earlier, so reading the field and falling back to
+    the list give different answers."""
+    return {"exercises": [{"name": "Walking", "progression": {},
+                           "last_session_date": LATEST,
+                           "sessions": [{"date": SALIENT}]}]}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # recency_truth
 # ══════════════════════════════════════════════════════════════════════════════
 
-def test_truth_per_exercise_and_global():
+def test_truth_per_exercise():
     t = C.recency_truth(_pkg_single())
-    assert t["per_exercise"]["Sumo Squats"] == LATEST
-    assert t["global"] == LATEST                      # max across exercises
+    assert t == {"per_exercise": {"Sumo Squats": LATEST}}
+
+
+def test_truth_reads_the_cardio_date_field():
+    assert C.recency_truth(_pkg_cardio())["per_exercise"]["Walking"] == LATEST
 
 
 def test_truth_none_tolerant():
     # No KeyError / no crash on empty, None, or minimal shapes.
-    assert C.recency_truth({})   == {"per_exercise": {}, "global": None}
-    assert C.recency_truth(None) == {"per_exercise": {}, "global": None}
+    assert C.recency_truth({})   == {"per_exercise": {}}
+    assert C.recency_truth(None) == {"per_exercise": {}}
     # Exercise with no progression: falls back to max(session dates).
     t = C.recency_truth({"exercises": [{"name": "X",
                                         "sessions": [{"date": "2026-01-02"},
@@ -117,11 +133,15 @@ def test_corrects_invented_date_no_salient_gating():
     assert len(flags) == 1 and flags[0]["original"] == "2020-01-01"
 
 
-def test_corrects_global_program_level():
-    ans = "Your most recent session was on 2020-01-01."
-    out, flags = C.recency_guard(ans, _pkg_global())
-    assert out == f"Your most recent session was on {LATEST}."
-    assert flags and flags[0]["exercise"] == "overall"
+def test_out_of_window_exercise_date_is_left_alone():
+    """There is no program-wide correction, and there must not be one. The only
+    real package with no exercises is a question about an exercise with nothing
+    in the window; its answer quotes THAT exercise's older date, which is right.
+    Correcting it to the overall last session would make it wrong (re-check,
+    2026-09-16: Close Grip Smith Machine Bench Press 2026-06-13 → 2026-09-10)."""
+    ans = ("You haven't done Deadlift in the last 90 days. "
+           "Your most recent session was on 2026-03-01.")
+    assert C.recency_guard(ans, _pkg_out_of_window()) == (ans, [])
 
 
 def test_multi_exercise_scopes_to_nearest_named_before():
@@ -310,6 +330,29 @@ def test_non_month_word_not_mistaken_for_date():
 def sumo_pkg():
     return prepare_analysis_package(
         query_period_days=90, exercise_names=["Sumo Squats"], include_phase2=True)
+
+
+def test_live_out_of_window_exercise_date_is_left_alone():
+    """The same case on a real package: an exercise last trained before the
+    window, picked from the DB rather than hard-coded, so it survives new logs."""
+    import datetime
+    import sqlite3
+    start = (datetime.date.today() - datetime.timedelta(days=90)).isoformat()
+    con = sqlite3.connect(f"file:{os.environ['FITNOTES_DB_PATH']}?mode=ro", uri=True)
+    try:
+        row = con.execute(
+            "SELECT e.name, MAX(t.date) AS d FROM training_log t "
+            "JOIN exercise e ON e._id = t.exercise_id "
+            "GROUP BY e.name HAVING d < ? ORDER BY d DESC LIMIT 1", (start,)).fetchone()
+    finally:
+        con.close()
+    if row is None:
+        pytest.skip("every logged exercise was trained inside the window")
+    name, last = row
+    pkg = prepare_analysis_package(query_period_days=90, exercise_names=[name])
+    assert pkg["exercises"] == [] and pkg["training_consistency"]["last_session"] != last
+    ans = f"You haven't done {name} in the last 90 days. Your most recent session was on {last}."
+    assert C.recency_guard(ans, pkg) == (ans, [])
 
 
 def test_live_truth_matches_package_field(sumo_pkg):

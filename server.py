@@ -356,6 +356,9 @@ _state: dict = {
     # executes deterministically via session.call_tool; anything else keeps the
     # sibling allow_execute + agent re-prompt path.
     "pending_execute_kind": None,
+    # The confirmation panel exactly as last shown ({preview, preview_source}),
+    # so a page reloaded while a staged write waits can show it again.
+    "panel": None,
     "pending_upload_path": None,
     "pending_upload_contents": None,
     # Stage-3 #12: a decomposed turn's merged non-write answer, stashed while
@@ -589,8 +592,66 @@ async def checkpoint_status():
     })
 
 
+# ── Chat history: every accepted turn, recorded the moment it starts ─────────
+#
+# A turn used to reach history only when it FINISHED, and only some kinds did
+# (analytical here, operational inside the agent). A page reloaded mid-answer
+# lost the prompt and the "…"; recall answers, refusals, greetings, errors and
+# "✅ logged" confirmations were never recorded at all (live re-check,
+# 2026-09-16). Now the server is the one writer: an accepted turn adds the
+# prompt and a blank assistant entry marked `pending` at once, and the entry is
+# filled when the turn ends. A page that loads mid-turn sees `pending` and waits.
+
+_TURN_FAILED_TEXT = "Something went wrong while answering that. Please try again."
+
+
+def _history_begin(user_text: str | None) -> dict | None:
+    history = getattr(session, "chat_history", None) if session is not None else None
+    if history is None:
+        return None
+    now = datetime.datetime.now().isoformat()
+    if user_text:
+        history.append({"role": "user", "text": user_text, "timestamp": now})
+    entry = {"role": "assistant", "text": "", "pending": True, "timestamp": now}
+    history.append(entry)
+    return entry
+
+
+def _history_end(entry: dict | None, response: JSONResponse | None) -> None:
+    """Fill the turn's pending entry from what the user was actually shown.
+    `response` None means the turn raised."""
+    history = getattr(session, "chat_history", None) if session is not None else None
+    if entry is None or history is None:
+        return
+    at = next((i for i, m in enumerate(history) if m is entry), None)
+    if at is None:
+        return
+    # Anything added during the turn (the agent records its own) is replaced by
+    # this one entry, so a turn is never recorded twice.
+    del history[at + 1:]
+    entry.pop("pending", None)
+    if response is None:
+        entry.update(text=_TURN_FAILED_TEXT, kind="error")
+        return
+    try:
+        body = json.loads(response.body.decode())
+    except Exception:
+        body = {}
+    if body.get("type") in ("disambiguation_required", "confirmation_required"):
+        del history[at]            # the panel is the reply; it has its own restore
+        return
+    if body.get("type") == "error" or body.get("error") or response.status_code >= 400:
+        entry.update(text=body.get("text") or body.get("message") or _TURN_FAILED_TEXT,
+                     kind="error")
+        if body.get("checkpoint_saved"):
+            entry["resumable"] = True      # a reloaded page offers Resume again
+        return
+    entry["text"] = body.get("text", "")
+
+
 async def _process_turn(message: str = "", *,
-                        disambiguate_selections: list | None = None) -> JSONResponse:
+                        disambiguate_selections: list | None = None,
+                        record_prompt: bool = True) -> JSONResponse:
     """
     Shared turn handler for /chat, /resume, and /disambiguate — same guards,
     locking, history recording, and response shape. /resume passes a
@@ -600,6 +661,10 @@ async def _process_turn(message: str = "", *,
     of routing a fresh message, then shares the exact same write-path tail
     (verify → confirm panel → #12 merged-answer stash) — one seam, never a
     second divergent copy of the panel logic.
+
+    A turn rejected here records nothing. An accepted one is in chat history
+    from its first moment (see _history_begin); a button action (/resume,
+    /disambiguate) adds no user bubble.
     """
     # A chat turn can reach an execute_* MCP tool and write the DB file that
     # upload+replay is mid-way through replacing. Reject with a clear message
@@ -621,6 +686,20 @@ async def _process_turn(message: str = "", *,
             status_code=429,
             content={"error": "Agent is busy, please wait"},
         )
+    # No await between the busy check above and _run_turn taking the lock.
+    entry = _history_begin(
+        message if record_prompt and disambiguate_selections is None else None)
+    try:
+        response = await _run_turn(message, disambiguate_selections)
+    except BaseException:
+        _history_end(entry, None)
+        raise
+    _history_end(entry, response)
+    return response
+
+
+async def _run_turn(message: str, disambiguate_selections: list | None) -> JSONResponse:
+    """The body of an accepted turn (guards already passed)."""
     async with agent_lock:
         if disambiguate_selections is not None:
             # /disambiguate: resolve the pending slot with the panel's picks and
@@ -646,6 +725,7 @@ async def _process_turn(message: str = "", *,
             _state["allow_execute"] = False
             _state["staging_preview"] = ""
             _state["pending_execute_kind"] = None
+            _state["panel"] = None
             # A fresh turn always starts clean — an abandoned panel's stashed
             # answer must never leak into an unrelated later confirm.
             _state["decomposed_answer"] = ""
@@ -678,12 +758,7 @@ async def _process_turn(message: str = "", *,
                 "type": "disambiguation_required",
                 "groups": result["disambiguation"]["groups"],
             })
-        # Analytical turns bypass session.answer(), so they are not recorded in
-        # session.chat_history automatically.  Mirror the same shape agent.py writes.
-        if result.get("route") == "analytical" and session is not None:
-            _now = datetime.datetime.now().isoformat()
-            session.chat_history.append({"role": "user",      "text": message,                    "timestamp": _now})
-            session.chat_history.append({"role": "assistant", "text": result.get("answer", ""),   "timestamp": _now})
+        # (Chat history is recorded by _process_turn for every kind of turn.)
         # Write-path restore (resume of a quota-interrupted /log turn): the
         # coordinator restored the checkpointed staged batch into the MCP slot
         # and signals it here — the server arms the confirm panel DIRECTLY (the
@@ -746,6 +821,7 @@ async def _process_turn(message: str = "", *,
                           file=sys.stderr)
                 if slot_list == []:
                     _state["pending_execute_kind"] = None
+                    _state["panel"] = None
                     print("[server] ghost confirmation suppressed — "
                           "log_workout was called but staged nothing",
                           file=sys.stderr)
@@ -814,6 +890,7 @@ async def _process_turn(message: str = "", *,
                     # that FAILs must not be restorable again); it never
                     # touches a non-staged (analytical) checkpoint.
                     _state["pending_execute_kind"] = None
+                    _state["panel"] = None
                     try:
                         await session.call_tool("discard_staged_writes", {})
                         await session.call_tool("record_workout_verify", verdict)
@@ -879,6 +956,7 @@ async def _process_turn(message: str = "", *,
                 if result.get("decomposed"):
                     _state["decomposed_answer"] = (
                         result.get("decomposed_nonwrite_answer") or "")
+                _state["panel"] = {"preview": preview, "preview_source": preview_source}
                 return JSONResponse(content={
                     "type": "confirmation_required",
                     "preview": preview,
@@ -913,7 +991,7 @@ async def chat(body: ChatRequest):
 async def resume():
     # The "Resume" button calls this. Reuse the Coordinator's continue-intent
     # path: load the slot → _resume, or the nothing-to-resume notice if empty.
-    return await _process_turn("continue")
+    return await _process_turn("continue", record_prompt=False)
 
 
 @app.post("/disambiguate")
@@ -946,6 +1024,18 @@ async def pending_disambiguation():
     payload = (coordinator._disambiguation_payload()
                if coordinator is not None else None)
     return JSONResponse(content={"groups": payload["groups"] if payload else None})
+
+
+@app.get("/pending-confirmation")
+async def pending_confirmation():
+    # Reload persistence for the confirmation panel, the twin of
+    # /pending-disambiguation. A staged write waiting for the user survives a
+    # page reload server-side; without this the page lost its Confirm/Cancel
+    # buttons and showed a "staged" message nobody could act on. Read-only.
+    panel = _state.get("panel")
+    if _state.get("pending_execute_kind") and panel:
+        return JSONResponse(content=dict(panel))
+    return JSONResponse(content={})
 
 
 def _with_decomposed_answer(outcome_text: str) -> str:
@@ -1049,10 +1139,25 @@ async def confirm(body: ConfirmRequest):
             status_code=429,
             content={"error": "Agent is busy, please wait"},
         )
+    # Recorded like any turn (no user bubble — the panel's button is the action),
+    # so "✅ logged" and a cancel reply survive a reload. No await before the lock.
+    entry = _history_begin(None)
+    try:
+        response = await _run_confirm(body)
+    except BaseException:
+        _history_end(entry, None)
+        raise
+    _history_end(entry, response)
+    return response
+
+
+async def _run_confirm(body: ConfirmRequest) -> JSONResponse:
+    """The body of an accepted /confirm (guards already passed)."""
     async with agent_lock:
         pending_kind = _state["pending_execute_kind"]
         _state["pending_confirmation"] = False
         _state["pending_execute_kind"] = None
+        _state["panel"] = None             # the panel is answered — nothing to restore
         # Clear-on-cancel: a cancelled batch must be discarded immediately so it can't be
         # carried into a later execute (closes the window before the next /chat turn clears
         # it). The confirm path leaves the staged batch intact for execute. Deterministic
