@@ -28,7 +28,7 @@ id,canonical_name,equipment,movement_pattern
 27,Dumbbell Pullover,dumbbell,pullover
 28,Leg Press,machine,squat
 29,Walking,bodyweight,cardio
-30,Overhead Press,barbell,vertical push
+30,Overhead Press,dumbbell,vertical push
 31,Deadlift,barbell,hinge
 32,Reverse EZ-Bar Curl,ez-bar,elbow flexion
 33,Farmers Walk,dumbbell,carry

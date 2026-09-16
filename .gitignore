@@ -32,3 +32,7 @@ data/user_articles/
 # Ontology review queue (generated; rows here are NOT in the graph yet)
 pending_review.csv
 ontology/review_cuts.csv
+# Names this user logs that are not training ("Morning", "Society"). PER-USER by
+# nature — a journal habit is not a fact about anatomy — while exercises.csv,
+# aliases.csv and exercise_muscle.csv are the universal graph everyone shares.
+ontology/not_exercises.csv

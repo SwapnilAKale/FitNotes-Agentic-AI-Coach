@@ -29,7 +29,7 @@ import re
 
 from src.db import get_connection
 from src.data_agent.fetch import (
-    load_user_context, DB_PATH, EXCLUDED_CATEGORY_IDS,
+    load_user_context, DB_PATH, excluded_names_clause,
 )
 # Shared leaf primitives — the SINGLE source of truth for the headline weight
 # math, identical to the analytical package, get_weekly_volume, and the
@@ -339,7 +339,11 @@ def _resolve_cat_id(category: str):
     if not canon:
         return None, None
     cat_id = {v: k for k, v in CATEGORY_NAMES.items()}.get(canon)
-    if cat_id is None or cat_id in EXCLUDED_CATEGORY_IDS:
+    # No category-id exclusion here any more. CATEGORY_NAMES maps ids 1-9 only,
+    # so the old `cat_id in EXCLUDED_CATEGORY_IDS` test was unreachable — and
+    # under the name-based list a CATEGORY is never excluded, only individual
+    # dismissed exercises, which the queries below filter out.
+    if cat_id is None:
         return canon, None
     return canon, cat_id
 
@@ -364,15 +368,16 @@ def get_category_session(category: str, target: str = "recent") -> dict:
         return _empty_category(canon, category)
 
     conn = get_connection(DB_PATH)
-    _excl = ", ".join(str(c) for c in EXCLUDED_CATEGORY_IDS)
+    _excl, _excl_params = excluded_names_clause("e")
 
     if target is None or target == "recent":
         row = conn.execute(
             f"""SELECT MAX(tl.date) AS d
                 FROM training_log tl
                 JOIN exercise e ON tl.exercise_id = e._id
-                WHERE e.category_id = ? AND e.category_id NOT IN ({_excl})""",
-            (cat_id,),
+                WHERE e.category_id = ?
+                  {_excl}""",
+            (cat_id, *_excl_params),
         ).fetchone()
         target_date = row["d"] if row else None
     else:
@@ -454,14 +459,15 @@ def _prior_category_date(category: str, before_date: str):
     if cat_id is None:
         return None
     conn = get_connection(DB_PATH)
-    _excl = ", ".join(str(c) for c in EXCLUDED_CATEGORY_IDS)
+    _excl, _excl_params = excluded_names_clause("e")
     row = conn.execute(
         f"""SELECT MAX(tl.date) AS d
             FROM training_log tl
             JOIN exercise e ON tl.exercise_id = e._id
-            WHERE e.category_id = ? AND e.category_id NOT IN ({_excl})
-              AND tl.date < ?""",
-        (cat_id, before_date),
+            WHERE e.category_id = ?
+              AND tl.date < ?
+              {_excl}""",
+        (cat_id, before_date, *_excl_params),
     ).fetchone()
     return row["d"] if row and row["d"] else None
 

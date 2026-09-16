@@ -35,6 +35,11 @@ from src import coordinator as coordinator_mod          # noqa: E402
 from src.coordinator import Coordinator                 # noqa: E402
 from src.data_agent import match_muscle_group, MUSCLE_GROUP_NAMES  # noqa: E402
 
+# Exclusion comes from the ONE shared source, never a re-hardcoded copy of
+# category ids: this test recomputes an expectation independently, so it must
+# exclude exactly what production excludes or it checks a different number.
+from src.data_agent.fetch import excluded_names_clause
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # match_muscle_group — the canonical category matcher (pure)
@@ -236,15 +241,16 @@ def test_raw_volume_demoted_under_crosscheck_value_unchanged():
 
     conn = sqlite3.connect(f"file:{os.environ['FITNOTES_DB_PATH']}?mode=ro", uri=True)
     try:
+        _x, _xp = excluded_names_clause("e")
         indep_lbs = conn.execute(
             "SELECT SUM(tl.metric_weight * 2.2046 * tl.reps) v FROM training_log tl "
             "JOIN exercise e ON tl.exercise_id = e._id "
-            f"WHERE e.category_id NOT IN (10, 11, 12) AND NOT {kg_pred}"
+            f"WHERE NOT {kg_pred} {_x}", tuple(_xp)
         ).fetchone()[0]
         indep_kg = conn.execute(
             "SELECT SUM(tl.metric_weight * 2.2046 * tl.reps) v FROM training_log tl "
             "JOIN exercise e ON tl.exercise_id = e._id "
-            f"WHERE e.category_id NOT IN (10, 11, 12) AND {kg_pred}"
+            f"WHERE {kg_pred} {_x}", tuple(_xp)
         ).fetchone()[0]
     finally:
         conn.close()

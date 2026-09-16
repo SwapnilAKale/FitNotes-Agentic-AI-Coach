@@ -107,23 +107,30 @@ def test_cardio_exercises_carry_no_edges(store):
             assert is_unattributed(store, eid) is True
 
 
-def test_every_logged_exercise_is_aliased(store):
+def test_every_logged_exercise_is_mapped_queued_or_dismissed(store):
     """
     The whole point of the bridge: a logged exercise with no alias has its sets
-    silently excluded from muscle maths. Reads the user's DB directly.
+    excluded from muscle maths. It may legitimately be in one of three states —
+    MAPPED into the graph, QUEUED for review, or DISMISSED as not-an-exercise —
+    but never none of them, which is how `Incline Barbell Bench Press` sat
+    unmapped AND unqueued through 18 sets.
+
+    Reads the candidate set from logged_exercise_names(), the SAME function the
+    upload seam uses. They used to hold separate opinions (this test excluded
+    category ids 10/11/12; reconciliation diffed the exercise table), and that
+    gap is exactly what let the state above exist.
     """
-    import sqlite3
-    db = os.environ.get("FITNOTES_DB_PATH", "data/FitNotes_Backup.fitnotes")
-    conn = sqlite3.connect(f"file:{db.replace(os.sep, '/')}?mode=ro", uri=True)
-    try:
-        rows = conn.execute(
-            """SELECT DISTINCT e.name FROM training_log tl
-                 JOIN exercise e ON e._id = tl.exercise_id
-                WHERE e.category_id NOT IN (10, 11, 12)""").fetchall()
-    finally:
-        conn.close()
-    missing = [r[0] for r in rows if resolve_db_exercise(store, r[0]) is None]
-    assert not missing, f"logged but unaliased: {missing}"
+    from src import ontology_reconcile as rec
+
+    logged = rec.logged_exercise_names()          # already minus dismissed
+    queued = {(r.get("db_exercise_name") or "").lower() for r in rec.load_pending()}
+
+    stranded = [n for n in logged
+                if resolve_db_exercise(store, n) is None
+                and n.lower() not in queued]
+    assert not stranded, (
+        f"logged but neither mapped nor queued: {stranded} — "
+        f"run `python scripts/review_pending.py --sweep`")
 
 
 # ── Rollup and reachability ───────────────────────────────────────────────────

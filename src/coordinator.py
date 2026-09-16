@@ -371,13 +371,12 @@ def _is_transient_server_error(exc: Exception) -> bool:
     surface as google.genai ServerError (4xx, incl. 429, are ClientError), so the
     isinstance check disambiguates 503 from 500 via .code/.status; the string
     fallback covers cases where the genai types are unavailable.
+
+    The rule itself lives once, in src/checkpoint.py (the ontology proposer uses
+    it too). This module's own _GenaiServerError is passed in at call time, so a
+    test that patches it here still steers the isinstance branch.
     """
-    if _GenaiServerError is not None and isinstance(exc, _GenaiServerError):
-        code   = getattr(exc, "code", None)
-        status = (getattr(exc, "status", "") or "").upper()
-        return code == 503 or status == "UNAVAILABLE"   # ServerError(500) → False
-    msg = str(exc)
-    return "503" in msg or "UNAVAILABLE" in msg          # "500" not matched
+    return _ckpt.is_transient_server_error(exc, _GenaiServerError)
 
 
 def _normalize_cardio_lock(raw: Optional[dict]) -> Optional[dict]:

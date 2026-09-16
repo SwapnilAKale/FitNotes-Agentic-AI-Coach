@@ -1234,12 +1234,29 @@ def _exercise_context(path: str) -> tuple:
         return {}, {}
 
 
-def _reconcile_new_exercises(new_exercises: list) -> dict:
+def _reconcile_new_exercises(new_exercises: list = None) -> dict:
     """
     Stage 1 of ontology reconciliation, run on EVERY path that replaces the DB
     file. Deterministic and offline — no LLM, no network — so an upload can
     never fail or hang on this. The web-search proposal happens later, when the
     user runs scripts/review_pending.py.
+
+    CANDIDATES COME FROM WHAT WAS TRAINED, not from what is newly DEFINED.
+    This used to receive the diff of the exercise TABLE between uploads, which
+    is a proxy — and wrong in both directions. A FitNotes stock exercise has sat
+    in that table since install, so training it for the first time triggered
+    nothing and its sets went uncounted (`Incline Barbell Bench Press`, 18 sets,
+    reached the graph only via a manual sweep). And a first upload has no prior
+    table to diff, so every defined exercise looked new — 66 of them never
+    trained, all queued for a review the user never asked for.
+
+    `logged_exercise_names` is the single definition, shared with
+    test_every_logged_exercise_is_aliased, so the seam and the test can never
+    hold different opinions about what needs mapping again.
+
+    The `new_exercises` argument is ignored for reconciliation and kept only so
+    existing callers need no change; it still drives the user-facing "new
+    exercises detected" notice, which IS a table-diff question.
 
     Auto-aliases only categorical matches (spelling/spacing/word-order variants
     of an exercise the graph already has). Everything else is queued, and its
@@ -1247,14 +1264,20 @@ def _reconcile_new_exercises(new_exercises: list) -> dict:
 
     Never raises: a reconciliation problem must not cost the user their upload.
     """
-    if not new_exercises:
-        return {"auto_aliased": [], "pending": [], "already_known": []}
     try:
         from src import ontology_reconcile as _rec
         from src.ontology import load_ontology as _load
 
+        # Everything TRAINED, minus names dismissed as not-an-exercise.
+        # detect_new already skips anything the graph knows, and merge_pending
+        # never resets a reviewed row — so passing the full logged set every
+        # upload is correct and idempotent by construction.
+        candidates = _rec.logged_exercise_names(DB_PATH)
+        if not candidates:
+            return {"auto_aliased": [], "pending": [], "already_known": []}
+
         counts, cats = _exercise_context(DB_PATH)
-        result = _rec.detect_new(new_exercises, _load(force=True),
+        result = _rec.detect_new(candidates, _load(force=True),
                                  set_counts=counts, categories=cats)
         if result.auto_aliased:
             _rec.write_auto_aliases(result.auto_aliased)

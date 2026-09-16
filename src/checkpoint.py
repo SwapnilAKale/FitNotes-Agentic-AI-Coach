@@ -32,8 +32,10 @@ PRUNE_MARKER          = "[truncated for resume]"
 try:
     from google.genai import errors as _genai_errors
     _GenaiClientError = _genai_errors.ClientError
+    _GenaiServerError = _genai_errors.ServerError
 except (ImportError, AttributeError):
     _GenaiClientError = None  # type: ignore[assignment]
+    _GenaiServerError = None  # type: ignore[assignment]
 
 try:
     from google.api_core.exceptions import ResourceExhausted as _ResourceExhausted
@@ -50,6 +52,22 @@ def is_rate_limit(exc: Exception) -> bool:
             return True
     msg = str(exc)
     return "429" in msg or "RESOURCE_EXHAUSTED" in msg
+
+
+def is_transient_server_error(exc: Exception,
+                              server_error_type=_GenaiServerError) -> bool:
+    """True ONLY for a 503 / UNAVAILABLE model-overload error (retryable).
+
+    The ONE copy of this rule: coordinator._is_transient_server_error delegates
+    here, passing its own module-level error type so a test that patches the
+    coordinator's type still steers it. A 500 may be a genuine bug and is
+    deliberately not matched."""
+    if server_error_type is not None and isinstance(exc, server_error_type):
+        code = getattr(exc, "code", None)
+        status = (getattr(exc, "status", "") or "").upper()
+        return code == 503 or status == "UNAVAILABLE"
+    msg = str(exc)
+    return "503" in msg or "UNAVAILABLE" in msg
 
 
 def _error_text(exc: Exception) -> str:

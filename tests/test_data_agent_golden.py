@@ -445,10 +445,15 @@ def test_G_ALLTIME_alltime_summary():
     conn = _ro_conn()
     try:
         # Excluded strength scope — drives the boundary dates.
+        # Exclusion comes from the ONE shared source, never a re-hardcoded copy
+        # of category ids: this recomputes an expectation independently, so it
+        # must exclude exactly what production excludes.
+        from src.data_agent.fetch import excluded_names_clause
+        _x, _xp = excluded_names_clause("e")
         r = conn.execute(
             "SELECT MIN(tl.date) mn, MAX(tl.date) mx "
             "FROM training_log tl JOIN exercise e ON tl.exercise_id = e._id "
-            "WHERE e.category_id NOT IN (10, 11, 12)"
+            f"WHERE 1=1 {_x}", tuple(_xp)
         ).fetchone()
         # All-category attendance scope — drives the training-day count.
         all_days = conn.execute(

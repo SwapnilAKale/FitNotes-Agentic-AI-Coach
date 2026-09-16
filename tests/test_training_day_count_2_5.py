@@ -28,6 +28,11 @@ os.environ.setdefault("USER_CONTEXT_PATH", "data/user_context.json")
 from src.data_agent import collect  # noqa: E402
 from src.data_agent.process import _compute_alltime_summary  # noqa: E402
 
+# Exclusion comes from the ONE shared source, never a re-hardcoded copy of
+# category ids: this test recomputes an expectation independently, so it must
+# exclude exactly what production excludes or it checks a different number.
+from src.data_agent.fetch import excluded_names_clause
+
 
 def _ro_conn() -> sqlite3.Connection:
     """Independent read-only connection — ground truth shares no logic with the code."""
@@ -53,10 +58,11 @@ def test_training_day_count_includes_time_place_neck():
             "SELECT COUNT(DISTINCT tl.date) "
             "FROM training_log tl JOIN exercise e ON tl.exercise_id = e._id"
         ).fetchone()[0]
+        _x, _xp = excluded_names_clause("e")
         excl_days = conn.execute(
             "SELECT COUNT(DISTINCT tl.date) "
             "FROM training_log tl JOIN exercise e ON tl.exercise_id = e._id "
-            "WHERE e.category_id NOT IN (10, 11, 12)"
+            f"WHERE 1=1 {_x}", tuple(_xp)
         ).fetchone()[0]
     finally:
         conn.close()
@@ -77,10 +83,11 @@ def test_volume_strength_scope_unchanged_excludes_time_place_neck():
 
     conn = _ro_conn()
     try:
+        _x, _xp = excluded_names_clause("e")
         excl_sets = conn.execute(
             "SELECT COUNT(*) "
             "FROM training_log tl JOIN exercise e ON tl.exercise_id = e._id "
-            "WHERE e.category_id NOT IN (10, 11, 12)"
+            f"WHERE 1=1 {_x}", tuple(_xp)
         ).fetchone()[0]
     finally:
         conn.close()

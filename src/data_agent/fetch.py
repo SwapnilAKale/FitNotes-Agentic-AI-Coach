@@ -84,11 +84,39 @@ def _weight_aggregate_reason(sql: str) -> Optional[str]:
 DB_PATH           = os.environ.get("FITNOTES_DB_PATH",  "data/FitNotes_Backup.fitnotes")
 USER_CONTEXT_PATH = os.environ.get("USER_CONTEXT_PATH", "data/user_context.json")
 
-# ── Category exclusion ─────────────────────────────────────────────────────────
-# Categories 10, 11, 12 are excluded from all queries.
-# Keep in sync with CATEGORY_NAMES in process.py.
-EXCLUDED_CATEGORY_IDS = (10, 11, 12)
-_EXCL_SQL = f"({', '.join(str(c) for c in EXCLUDED_CATEGORY_IDS)})"
+# ── Not-an-exercise exclusion ─────────────────────────────────────────────────
+# Some people log journal markers as exercises ("Morning", "Society") to note
+# when or where they trained. They are not training and must stay out of every
+# volume, session and muscle number.
+#
+# This WAS `EXCLUDED_CATEGORY_IDS = (10, 11, 12)` — one user's category ids,
+# hardcoded here and copied into eight other places. Another person's database
+# numbers its categories differently, so the skip silently stopped working for
+# them. It is now ONE user-local list of names, written when the user dismisses
+# something in the review queue, and read here on behalf of the whole system.
+#
+# There is no automatic test: "Morning" logs reps=1, indistinguishable from a
+# real bodyweight set. A human says so once.
+
+
+def _excluded_names() -> list:
+    """Lowercased dismissed names. Imported lazily — fetch.py is the I/O
+    boundary and must not take a module-import dependency on reconciliation."""
+    try:
+        from src.ontology_reconcile import not_exercise_names
+        return sorted(not_exercise_names())
+    except Exception:                      # never break a read on this
+        return []
+
+
+def excluded_names_clause(alias: str = "e") -> tuple:
+    """(sql_fragment, params) excluding dismissed names. Parameterised — the
+    names are user data and must never be interpolated into SQL."""
+    names = _excluded_names()
+    if not names:
+        return "", []
+    holes = ", ".join("?" for _ in names)
+    return f"AND LOWER({alias}.name) NOT IN ({holes})", names
 
 
 # ── Connection ──────────────────────────────────────────────────────────────────
@@ -120,6 +148,7 @@ def _fetch_all_sets_in_period(conn: sqlite3.Connection,
     Single bulk query: ALL sets for ALL exercises in [start_date, end_date].
     LEFT JOIN Comment — comment = None = unremarkable set, valid data.
     """
+    _excl, _excl_params = excluded_names_clause("e")
     cur = conn.cursor()
     cur.execute(f"""
         SELECT
@@ -136,13 +165,14 @@ def _fetch_all_sets_in_period(conn: sqlite3.Connection,
         JOIN exercise e ON tl.exercise_id = e._id
         LEFT JOIN Comment c ON c.owner_id = tl._id
         WHERE tl.date >= ? AND tl.date <= ?
-          AND e.category_id NOT IN {_EXCL_SQL}
+          {_excl}
         ORDER BY tl.date ASC, tl._id ASC
-    """, (start_date, end_date))
+    """, (start_date, end_date, *_excl_params))
     return [dict(row) for row in cur.fetchall()]
 
 
 def _fetch_exercise_lifecycle(conn: sqlite3.Connection) -> list:
+    _excl, _excl_params = excluded_names_clause("e")
     cur = conn.cursor()
     cur.execute(f"""
         SELECT e.name AS exercise_name, e.category_id,
@@ -151,10 +181,11 @@ def _fetch_exercise_lifecycle(conn: sqlite3.Connection) -> list:
                COUNT(DISTINCT tl.date) AS total_sessions
         FROM training_log tl
         JOIN exercise e ON tl.exercise_id = e._id
-        WHERE e.category_id NOT IN {_EXCL_SQL}
+        WHERE 1=1
+          {_excl}
         GROUP BY e._id, e.name, e.category_id
         ORDER BY e.category_id, e.name
-    """)
+    """, tuple(_excl_params))
     return [dict(row) for row in cur.fetchall()]
 
 
@@ -198,14 +229,16 @@ def _fetch_goals(conn: sqlite3.Connection) -> list:
 
 
 def _fetch_all_training_dates(conn: sqlite3.Connection) -> list:
+    _excl, _excl_params = excluded_names_clause("e")
     cur = conn.cursor()
     cur.execute(f"""
         SELECT DISTINCT tl.date
         FROM training_log tl
         JOIN exercise e ON tl.exercise_id = e._id
-        WHERE e.category_id NOT IN {_EXCL_SQL}
+        WHERE 1=1
+          {_excl}
         ORDER BY tl.date ASC
-    """)
+    """, tuple(_excl_params))
     return [row["date"] for row in cur.fetchall()]
 
 

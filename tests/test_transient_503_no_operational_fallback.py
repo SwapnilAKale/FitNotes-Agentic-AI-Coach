@@ -124,6 +124,20 @@ def test_predicate_isinstance_branch(monkeypatch):
     assert f(FakeServerError(500, "INTERNAL")) is False     # 500 → not transient
 
 
+def test_coordinator_uses_the_shared_503_rule(monkeypatch):
+    """One copy of the rule, in src/checkpoint.py. The coordinator passes its own
+    error type, which is why the patched-type test above still works."""
+    seen = []
+
+    def spy(exc, server_error_type=None):
+        seen.append((exc, server_error_type))
+        return "shared rule"
+
+    monkeypatch.setattr(coordinator_mod._ckpt, "is_transient_server_error", spy)
+    assert coordinator_mod._is_transient_server_error(ERR_503) == "shared rule"
+    assert seen == [(ERR_503, coordinator_mod._GenaiServerError)]
+
+
 # ── 2. Bounded retry in _call_with_per_minute_retry ─────────────────────────────
 
 def test_retry_503_then_success(coord, monkeypatch):

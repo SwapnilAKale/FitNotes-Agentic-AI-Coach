@@ -16,9 +16,10 @@ Two modes:
                 • muscles with no incoming edge at all
                 • the two known-miscategorised lifts, called out by name
 
-Categories 10/11/12 (Time / Place / Neck) are excluded, matching
-EXCLUDED_CATEGORY_IDS in src/data_agent/fetch.py — "Morning" and "Society" are
-not exercises and must never appear in the ontology.
+Names the user has dismissed as not-an-exercise are excluded, read from the ONE
+shared list (ontology/not_exercises.csv via ontology_reconcile.not_exercise_names)
+rather than re-hardcoding category ids here — "Morning" and "Society" are not
+exercises and must never appear in the ontology.
 
 Run:
     python scripts/draft_ontology_edges.py
@@ -56,14 +57,17 @@ def logged_exercises() -> list:
     conn = sqlite3.connect(f"file:{normalized}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     try:
+        from src.data_agent.fetch import excluded_names_clause
+        _excl, _excl_params = excluded_names_clause("e")
         rows = conn.execute(
-            """SELECT e.name AS name, c.name AS category, COUNT(*) AS sets
+            f"""SELECT e.name AS name, c.name AS category, COUNT(*) AS sets
                  FROM training_log tl
                  JOIN exercise e  ON e._id = tl.exercise_id
                  JOIN Category c  ON c._id = e.category_id
-                WHERE e.category_id NOT IN (10, 11, 12)
+                WHERE 1=1
+                  {_excl}
              GROUP BY e.name
-             ORDER BY COUNT(*) DESC""").fetchall()
+             ORDER BY COUNT(*) DESC""", tuple(_excl_params)).fetchall()
         return [(r["name"], r["category"], r["sets"]) for r in rows]
     finally:
         conn.close()

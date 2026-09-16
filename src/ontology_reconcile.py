@@ -45,13 +45,36 @@ PENDING_COLUMNS = (
     "db_exercise_name",   # exact FitNotes name — the alias key
     "logged_sets",        # how much this actually moves the numbers
     "fitnotes_category",  # hint only; may be blank or a custom category
-    "decision",           # pending | alias | new | unsure   (filled by propose)
+    "decision",           # pending | alias | new | not_exercise | unsure
     "alias_of",           # canonical name, when decision == alias
     "muscles",            # "Lats:primary|Biceps:secondary"
     "evidence",           # one or two sentences from the proposer
     "sources",            # space-separated URLs
     "approved",           # y | n | (blank = undecided)  <- THE GATE
+    "movement_pattern",   # from the graph's patterns, when decision == new.
+                          # LAST, so a queue written before it still loads.
 )
+
+# ── Things the user logs that are not training ────────────────────────────────
+#
+# Some people log journal markers as exercises — "Morning", "Society" — to note
+# when or where they trained. They are not exercises and must stay out of every
+# volume, session and muscle number.
+#
+# This used to be EXCLUDED_CATEGORY_IDS = (10, 11, 12) in fetch.py: one user's
+# category ids, hardcoded, and copied into eight other places. Another person's
+# database numbers its categories differently, so that skip silently stops
+# working for them — the same single-user assumption that let newly-trained
+# stock exercises slip past reconciliation.
+#
+# There is no automatic test available: "Morning" logs reps=1, which is
+# indistinguishable from a real bodyweight set. A human says so ONCE, here.
+#
+# USER-LOCAL, like pending_review.csv — a journal habit is personal, while
+# exercises.csv / aliases.csv / exercise_muscle.csv are the universal graph that
+# every user shares. This file must never be committed.
+NOT_EXERCISES_FILE = "not_exercises.csv"
+NOT_EXERCISES_COLUMNS = ("db_exercise_name", "dismissed_on", "note")
 
 _DEFAULT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                             "ontology")
@@ -63,6 +86,121 @@ def _dir() -> str:
 
 def _pending_path() -> str:
     return os.path.join(_dir(), PENDING_FILE)
+
+
+def _not_exercises_path() -> str:
+    return os.path.join(_dir(), NOT_EXERCISES_FILE)
+
+
+# ── The "not an exercise" list — ONE source, read system-wide ─────────────────
+
+def not_exercise_names() -> frozenset:
+    """Lowercased names the user has dismissed as not being training.
+
+    Never raises: a missing or damaged list degrades to "nothing is dismissed",
+    which shows the user too much rather than silently hiding their training.
+    """
+    path = _not_exercises_path()
+    if not os.path.exists(path):
+        return frozenset()
+    try:
+        with open(path, encoding="utf-8-sig", newline="") as fh:
+            return frozenset((r.get("db_exercise_name") or "").strip().lower()
+                             for r in csv.DictReader(fh)
+                             if (r.get("db_exercise_name") or "").strip())
+    except (OSError, csv.Error) as exc:
+        logger.error("[ontology] not-exercises list unreadable (%s) — "
+                     "treating as empty", exc)
+        return frozenset()
+
+
+def _load_not_exercise_rows() -> list:
+    path = _not_exercises_path()
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, encoding="utf-8-sig", newline="") as fh:
+            return [r for r in csv.DictReader(fh)
+                    if (r.get("db_exercise_name") or "").strip()]
+    except (OSError, csv.Error):
+        return []
+
+
+def dismiss_as_not_exercise(names, note: str = "") -> int:
+    """Add names to the dismissal list. Idempotent; returns how many were new.
+
+    Written through _atomic_write like the pending queue, NOT _append_rows:
+    that path asserts WRITABLE_FILES, which guards the universal graph (R7) and
+    correctly refuses a file that is not part of it. This list is user-local.
+    """
+    have = not_exercise_names()
+    rows = _load_not_exercise_rows()
+    seen = set()
+    added = 0
+    for raw in names or []:
+        name = (raw or "").strip()
+        key = name.lower()
+        if not name or key in have or key in seen:
+            continue
+        seen.add(key)
+        rows.append({"db_exercise_name": name,
+                     "dismissed_on": time.strftime("%Y-%m-%d"),
+                     "note": note})
+        added += 1
+    if added:
+        _atomic_write(_not_exercises_path(), NOT_EXERCISES_COLUMNS, rows)
+        # A dismissed name must also LEAVE the review queue. Otherwise it is
+        # dismissed system-wide and still sitting there asking to be mapped —
+        # the user would be asked about something they already answered.
+        dismissed = {r["db_exercise_name"].lower() for r in rows}
+        queue = load_pending()
+        kept = [q for q in queue
+                if (q.get("db_exercise_name") or "").lower() not in dismissed]
+        if len(kept) != len(queue):
+            save_pending(kept)
+    return added
+
+
+# ── What actually needs a muscle mapping ──────────────────────────────────────
+
+def logged_exercise_names(db_path: Optional[str] = None) -> list:
+    """Every exercise with at least one LOGGED SET, minus dismissed non-exercises.
+
+    THE definition of "needs a mapping", and the single source both the upload
+    seam and the test suite read — they must never hold separate opinions again.
+
+    Reconciliation used to ask a different question: "which names are new in the
+    exercise TABLE since the last upload?" That is a proxy, and it is wrong in
+    both directions. A FitNotes stock exercise has been in the table since
+    install, so training it for the first time triggered nothing and its sets
+    went uncounted. And on a first upload there is no prior table to diff, so
+    every defined exercise looked new — 66 of them never trained, all queued for
+    review the user never asked for.
+
+    An exercise earns a mapping by being TRAINED. Nothing else.
+    """
+    import sqlite3
+
+    path = db_path or os.environ.get("FITNOTES_DB_PATH",
+                                     "data/FitNotes_Backup.fitnotes")
+    try:
+        conn = sqlite3.connect(
+            f"file:{str(path).replace(os.sep, '/')}?mode=ro", uri=True)
+        try:
+            rows = conn.execute(
+                """SELECT DISTINCT e.name
+                     FROM training_log tl
+                     JOIN exercise e ON e._id = tl.exercise_id""").fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        logger.error("[ontology] could not read logged exercises (%s)", exc)
+        return []
+
+    dismissed = not_exercise_names()
+    return sorted(r[0] for r in rows
+                  if (r[0] or "").strip()
+                  and r[0].strip().lower() not in dismissed)
 
 
 # ── Normalisation ─────────────────────────────────────────────────────────────
@@ -317,6 +455,16 @@ def promote(ontology: Optional[dict] = None) -> PromoteResult:
             continue
 
         decision = (row.get("decision") or "").strip().lower()
+
+        # NOT AN EXERCISE — a journal marker, not training. It leaves the queue
+        # for good (asked once, ever) and enters the user-local dismissal list.
+        # Nothing is written to the shared graph: "Morning" is this person's
+        # logging habit, not a fact about anatomy.
+        if decision in ("not_exercise", "not-exercise", "not an exercise"):
+            dismiss_as_not_exercise([name], note="dismissed via review queue")
+            promoted.append({"name": name, "as": "not_exercise", "target": ""})
+            continue
+
         source = (row.get("sources") or "").strip() or "user-approved"
         evidence = (row.get("evidence") or "").strip()
         provenance = f"{evidence} [{source}]" if evidence else source
@@ -353,7 +501,12 @@ def promote(ontology: Optional[dict] = None) -> PromoteResult:
             continue
 
         new_ex_rows.append({"id": next_id, "canonical_name": name,
-                            "equipment": "", "movement_pattern": ""})
+                            "equipment": "",
+                            # Saved blank, every promoted exercise fell out of
+                            # its movement group — the group the proposer maps
+                            # the next uncommon exercise from.
+                            "movement_pattern": (row.get("movement_pattern")
+                                                 or "").strip()})
         new_alias_rows.append({"db_exercise_name": name, "exercise_id": next_id})
         for mid in ids:
             role = roles.get(ont["muscles"][mid]["name"].lower(), "secondary")

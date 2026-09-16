@@ -232,6 +232,48 @@ def test_promote_writes_a_new_exercise_with_its_edges(store, tmp_path):
     assert rec.load_pending() == []            # dequeued once written
 
 
+def test_promote_keeps_a_limiting_role(store, tmp_path):
+    """The proposer can now say a muscle is HELD, not trained. Promote must write
+    it as `limiting` — never quietly as training volume."""
+    _queue(store, decision="new", muscles="Lats:primary|Biceps:limiting",
+           evidence="Held grip", sources="https://example.org/pendlay", approved="y")
+    result = rec.promote(store)
+    assert result.skipped == []
+    o = ont_mod.load_ontology(force=True)
+    eid = ont_mod.resolve_db_exercise(o, "Pendlay Row")
+    got = {(o["muscles"][e["muscle_id"]]["name"], e["role"])
+           for e in o["edges_by_exercise"][eid]}
+    assert got == {("Lats", "primary"), ("Biceps", "limiting")}
+
+
+def test_promote_writes_the_movement_pattern(store, tmp_path):
+    """Saved blank, a promoted exercise drops out of its movement group — the
+    group the proposer maps the next uncommon exercise from."""
+    _queue(store, decision="new", muscles="Lats:primary",
+           sources="https://example.org/x", movement_pattern="horizontal pull",
+           approved="y")
+    assert rec.promote(store).skipped == []
+    o = ont_mod.load_ontology(force=True)
+    eid = ont_mod.resolve_db_exercise(o, "Pendlay Row")
+    assert o["exercises"][eid]["movement_pattern"] == "horizontal pull"
+
+
+def test_old_queue_without_pattern_column_still_loads(store, tmp_path):
+    """A queue written before the column existed must load, save and promote."""
+    old_cols = [c for c in rec.PENDING_COLUMNS if c != "movement_pattern"]
+    with open(tmp_path / rec.PENDING_FILE, "w", encoding="utf-8", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(old_cols)
+        w.writerow(["Pendlay Row", "40", "", "new", "", "Lats:primary",
+                    "found it", "https://example.org/x", "y"])
+    rows = rec.load_pending()
+    assert rows[0]["db_exercise_name"] == "Pendlay Row"
+    rec.save_pending(rows)
+    assert rec.promote(store).skipped == []
+    o = ont_mod.load_ontology(force=True)
+    assert ont_mod.resolve_db_exercise(o, "Pendlay Row") is not None
+
+
 def test_promote_writes_an_alias_without_creating_an_exercise(store, tmp_path):
     ex_before = _digest(tmp_path, "exercises.csv")
     edges_before = _digest(tmp_path, "exercise_muscle.csv")
