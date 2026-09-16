@@ -262,7 +262,12 @@ const esc = s => String(s ?? '').replace(/[&<>"]/g, c =>
 
 /* ── persisted UI state ────────────────────────────────────────────── */
 const UI_KEY = 'muscle-ontology-ui-v1';
-const DEC_KEY = 'muscle-ontology-review-v1';
+// v2: bumped when the reviewed store was promoted. persist() re-posts the
+// browser's whole decision set over review_cuts.csv, so a stale copy would have
+// silently reverted the Overhead Press -> Triceps ruling on the next click.
+// Orphaning the old key makes review_cuts.csv authoritative again on load (see
+// the re-seed from DATA.cuts at boot) with no manual clearing, on any machine.
+const DEC_KEY = 'muscle-ontology-review-v2';
 const UI = Object.assign({
   mode:'explore', filter:'all', theme:null, sel:null, rail:'on',
   showAll:false, showBody:true, cam:null, auditIdx:0, level:2,
@@ -563,11 +568,18 @@ function shares(aId, bId){
 }
 
 function edgeShown(l){
-  if (mode === 'audit') return QUEUE.indexOf(l) !== -1;
+  // Audit mode pins the whole queue on screen, ignoring the selection — that is
+  // the point while there are still calls to make. Once every call is answered
+  // it becomes a trap: the mode is remembered across reloads, so a FINISHED
+  // audit left the edges permanently drawn and unresponsive to clicks. A
+  // complete queue falls through to normal selection behaviour.
+  if (mode === 'audit' && QUEUE.some(l => !decisions[l.key]))
+    return QUEUE.indexOf(l) !== -1;
   if (sel) return sel.kind === 'muscle' ? shares(sel.id, l.m) : l.ex === sel.id;
   if (!UI.showAll) return false;
   if (UI.filter === 'primary')   return l.role === 'primary';
   if (UI.filter === 'secondary') return l.role === 'secondary';
+  if (UI.filter === 'limiting')  return l.role === 'limiting';
   if (UI.filter === 'cut')       return decisions[l.key] === 'cut';
   return true;
 }
@@ -815,7 +827,7 @@ function introHTML(){
   const done = QUEUE.filter(l => decisions[l.key]).length;
   return `
     <div class="filters" role="group" aria-label="Filter edges">
-      ${['all','primary','secondary','queue','cut'].map(f =>
+      ${['all','primary','secondary','limiting','queue','cut'].map(f =>
         `<button data-filter="${f}" aria-pressed="${UI.filter===f}">${f==='queue'?'needs review':f}</button>`).join('')}
     </div>
     <div class="rail-empty">
@@ -829,19 +841,25 @@ function introHTML(){
       judgement calls. <b class="mono">${done}</b> reviewed so far.</p>
     </div>`;
 }
-function rowsFor(rows){
+/* showSets=false leaves the count column EMPTY, not a dash. A dash reads as "a
+   number belongs here and is missing"; blank reads as "this column does not
+   apply". Limiting rows must not carry a per-lift set count at all — printing
+   266 next to Smith Machine Shrug on Grip is exactly the false volume the role
+   exists to remove. The aggregate lives in the summary line, labelled. */
+function rowsFor(rows, showSets = true){
   return rows.map(r => {
     const e = X.get(r.ex), cut = rowCut(r);
     return `<li class="go ${cut?'cut':''}" data-go="exercise:${e.id}">
       <span class="role ${r.role}"></span><span class="nm">${esc(e.name)}</span>
       ${r.via ? `<span class="via">via ${esc(r.via)}</span>` : ''}
-      <span class="ct">${e.sets ? e.sets.toLocaleString() : '—'}</span></li>`;
+      <span class="ct">${showSets ? (e.sets ? e.sets.toLocaleString() : '—') : ''}</span></li>`;
   }).join('');
 }
 function muscleHTML(m){
   const all = rolled(m.id).slice().sort((a,b) => X.get(b.ex).sets - X.get(a.ex).sets);
   const prim = all.filter(r => r.role === 'primary');
   const sec  = all.filter(r => r.role === 'secondary');
+  const lim  = all.filter(r => r.role === 'limiting');
   const kids = kidsOf.get(m.id) || [];
   const sum = a => a.reduce((n, r) => n + rowSets(r), 0);
   const inherited = all.some(r => r.via);
@@ -854,6 +872,8 @@ function muscleHTML(m){
       <dt>Size</dt><dd>${m.size || '— grouping node'}</dd>
       <dt>Targeted</dt><dd class="mono">${sum(prim).toLocaleString()} sets · ${prim.length} lifts</dd>
       <dt>Assisting</dt><dd class="mono">${sum(sec).toLocaleString()} sets · ${sec.length} lifts</dd>
+      ${lim.length ? `<dt>Held by</dt><dd class="mono">${lim.length} lifts ·
+        ${sum(lim).toLocaleString()} sets held</dd>` : ''}
     </dl>
     ${inherited ? `<p class="note">Counts include everything beneath this muscle in
       the tree — a lift attached to a sub-part is marked <span class="via">via …</span>.
@@ -866,7 +886,12 @@ function muscleHTML(m){
     ${prim.length ? `<div class="sec"><span class="eyebrow">Targets it — primary</span>
       <ul class="list">${rowsFor(prim)}</ul></div>` : ''}
     ${sec.length ? `<div class="sec"><span class="eyebrow">Assists it — secondary</span>
-      <ul class="list">${rowsFor(sec)}</ul></div>` : ''}`;
+      <ul class="list">${rowsFor(sec)}</ul></div>` : ''}
+    ${lim.length ? `<div class="sec"><span class="eyebrow">Holds the load — limiting</span>
+      <ul class="list">${rowsFor(lim, false)}</ul>
+      <p class="note">These lifts depend on this muscle but do not train it. Their
+      sets are counted under the muscles they do train, and never here — which is
+      why no number sits beside them.</p></div>` : ''}`;
 }
 function exerciseHTML(e){
   const ls = byExercise.get(e.id) || [];

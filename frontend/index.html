@@ -12,6 +12,29 @@
     #chat::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
     .bubble-user { background: #1d4ed8; }
     .bubble-agent { background: #1e293b; white-space: pre-wrap; }
+    /* md() decorates in place and keeps pre-wrap, so these style single lines
+       rather than block elements — no margins, or the layout of a verbatim
+       [DISPLAY] set block would shift. */
+    .bubble-agent strong { color: #fff; font-weight: 600; }
+    .md-h  { display: inline-block; color: #fff; font-weight: 600;
+             font-size: 0.95rem; padding-top: 0.15rem; }
+    .md-li { display: inline; }
+    .md-code { background: #0f172a; border-radius: 3px; padding: 0 4px;
+               font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+               font-size: 0.85em; color: #e2e8f0; }
+    /* A wide week-plan must scroll inside its own box rather than stretch the
+       bubble. white-space:normal is required — the bubble is pre-wrap, which
+       would otherwise keep the source line breaks inside every cell. */
+    .md-table-wrap { overflow-x: auto; margin: 6px 0; }
+    .md-table { border-collapse: collapse; white-space: normal; font-size: 0.9em; }
+    .md-table th, .md-table td {
+      border: 1px solid #334155; padding: 5px 9px; vertical-align: top; }
+    .md-table th { background: #0f172a; color: #fff; font-weight: 600; }
+    .md-table tbody tr:nth-child(even) { background: rgba(148,163,184,0.06); }
+    /* Set blocks: no header row, so lean on spacing rather than heavy borders. */
+    .md-sets td { border-color: #1e293b; }
+    .md-set-n { color: #94a3b8; white-space: nowrap; }
+    .md-set-note { color: #94a3b8; font-style: italic; }
     .bubble-error { background: #7f1d1d; color: #fca5a5; }
     #attach-menu {
       display: none;
@@ -324,6 +347,139 @@ function esc(s) {
 // esc() requires a string; coerce any value (numbers, null) before escaping.
 function escv(v) { return esc(String(v == null ? '' : v)); }
 
+// ── md(): the coach's markdown, finally rendered ─────────────────────────────
+// The analysis prompt has always told the model to use **bold**, "### " headers
+// and "- " bullets to make an answer scannable. Nothing here ever rendered them,
+// so they reached the user as literal asterisks and hashes for the entire life
+// of the app.
+//
+// SAFETY IS THE ORDERING: esc() FIRST, decorate the already-escaped string
+// SECOND. Every tag below is built from our own literals, never from user or
+// model text, so no input can introduce markup. Never reorder these two steps.
+//
+// DECORATE IN PLACE, NEVER RE-FLOW. The bubble keeps `white-space: pre-wrap`, so
+// pre-formatted [DISPLAY] set lines ("Set 2 (Warmup): 60 kg x 8 reps") keep
+// their exact layout — the display-fidelity rules require them character-for-
+// character, and a paragraph re-flow would quietly break that.
+//
+// NO SINGLE-* OR _UNDERSCORE_ ITALICS, DELIBERATELY. Set comments are free text
+// and contain stray asterisks and underscores; one of those must never silently
+// italicise half an answer. Low value, real risk.
+// TABLES ARE THE ONE EXCEPTION to decorate-in-place. A real <table> cannot be
+// built inside `white-space: pre-wrap` line-by-line output, so a table is
+// detected as a BLOCK and replaced wholesale; every other line takes the
+// unchanged path above it. A week-plan table used to reach the user as raw pipes
+// and dashes because md() had no concept of one.
+//
+// A [DISPLAY] set line cannot be captured: "Set 2 (Warmup): 60 kg x 8 reps" does
+// not start with "|". The separator row is required too, so a sentence that
+// merely contains a pipe is never mistaken for a table.
+const _ROW_RE = /^\s*\|.*\|?\s*$/;
+const _SEP_RE = /^\s*\|[\s:|-]*\|?\s*$/;
+
+// A [DISPLAY] set block, rendered as a table. The TEXT is untouched — the
+// verbatim contract and enforce_display_fidelity both compare the answer
+// string, and this only changes how it is drawn. A drop set arrives as one
+// entry carrying an embedded newline ("Set 3: 174.1 lbs x 4 reps\n    134.1 lbs
+// x 8 reps"), which in a pre-wrap bubble looked like a broken fourth set.
+const _SET_RE  = /^\s*Set\s+(\d+)([^:]*):\s*(.*)$/;
+const _SETHEAD_RE = /^\s*\S.*\(\d+\s+sets?\):\s*$/;
+
+function _setRow(line) {
+  const m = line.match(_SET_RE);
+  if (!m) return null;
+  // "154.1 lbs x 12 reps (comment)" -> work + note
+  const rest = m[3];
+  const open = rest.indexOf('(');
+  const note = open !== -1 && rest.trim().endsWith(')')
+    ? rest.slice(open + 1, rest.lastIndexOf(')')) : '';
+  const work = open !== -1 && rest.trim().endsWith(')')
+    ? rest.slice(0, open).trim() : rest.trim();
+  // `extra` holds drop-set continuation lines, kept RAW so decoration is
+  // applied once, at render time, to every piece alike.
+  return { label: 'Set ' + m[1] + (m[2] || ''), work: work, note: note, extra: [] };
+}
+
+function _cells(line) {
+  let t = line.trim();
+  if (t.startsWith('|')) t = t.slice(1);
+  if (t.endsWith('|')) t = t.slice(0, -1);
+  return t.split('|').map(c => c.trim());
+}
+
+function _align(sepCells) {
+  return sepCells.map(c => {
+    const l = c.startsWith(':'), r = c.endsWith(':');
+    return r && !l ? 'right' : (l && r ? 'center' : 'left');
+  });
+}
+
+function md(s) {
+  const lines = esc(String(s == null ? '' : s)).split('\n');
+  const out = [];
+  for (let i = 0; i < lines.length; i++) {
+    // A table needs a header row AND a separator row directly beneath it.
+    if (_ROW_RE.test(lines[i]) && i + 1 < lines.length
+        && _SEP_RE.test(lines[i + 1]) && lines[i + 1].indexOf('-') !== -1) {
+      const head = _cells(lines[i]);
+      const al = _align(_cells(lines[i + 1]));
+      const body = [];
+      let j = i + 2;
+      while (j < lines.length && _ROW_RE.test(lines[j])) { body.push(_cells(lines[j])); j++; }
+      const th = head.map((c, k) =>
+        '<th style="text-align:' + (al[k] || 'left') + '">' + inline(c) + '</th>').join('');
+      const tr = body.map(r => '<tr>' + r.map((c, k) =>
+        '<td style="text-align:' + (al[k] || 'left') + '">' + inline(c) + '</td>').join('') + '</tr>').join('');
+      out.push('<div class="md-table-wrap"><table class="md-table"><thead><tr>'
+               + th + '</tr></thead><tbody>' + tr + '</tbody></table></div>');
+      i = j - 1;
+      continue;
+    }
+    // A set block: an optional "DATE — Exercise (N sets):" header followed by
+    // consecutive "Set N: …" lines. Continuation lines (a drop set) attach to
+    // the row above rather than becoming a row of their own.
+    if (_SET_RE.test(lines[i])
+        || (_SETHEAD_RE.test(lines[i]) && i + 1 < lines.length && _SET_RE.test(lines[i + 1]))) {
+      const head = _SET_RE.test(lines[i]) ? '' : lines[i].trim();
+      let j = _SET_RE.test(lines[i]) ? i : i + 1;
+      const rows = [];
+      while (j < lines.length) {
+        const row = _setRow(lines[j]);
+        if (row) { rows.push(row); j++; continue; }
+        // indented, non-empty, and we already have a row → drop-set continuation
+        if (rows.length && /^\s+\S/.test(lines[j]) && lines[j].trim()) {
+          rows[rows.length - 1].extra.push(lines[j].trim());
+          j++; continue;
+        }
+        break;
+      }
+      if (rows.length) {
+        const body = rows.map(r =>
+          '<tr><td class="md-set-n">' + inline(r.label) + '</td><td>'
+          + [r.work].concat(r.extra).map(inline).join('<br>')
+          + '</td><td class="md-set-note">' + inline(r.note) + '</td></tr>').join('');
+        out.push((head ? '<span class="md-h">' + head + '</span>\n' : '')
+                 + '<div class="md-table-wrap"><table class="md-table md-sets">'
+                 + '<tbody>' + body + '</tbody></table></div>');
+        i = j - 1;
+        continue;
+      }
+    }
+    const h = lines[i].match(/^\s*#{1,6}\s+(.*)$/);
+    if (h) { out.push('<span class="md-h">' + h[1] + '</span>'); continue; }
+    const li = lines[i].match(/^(\s*)[-*]\s+(.*)$/);
+    if (li) { out.push(li[1] + '<span class="md-li">• ' + inline(li[2]) + '</span>'); continue; }
+    out.push(inline(lines[i]));
+  }
+  return out.join('\n');
+
+  function inline(t) {
+    return t
+      .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+      .replace(/`([^`]+)`/g, '<code class="md-code">$1</code>');
+  }
+}
+
 // Display-only seconds → M:SS (or H:MM:SS when >= 1h). No weight/other arithmetic.
 function mmss(s) {
   s = Math.max(0, Math.round(Number(s) || 0));
@@ -592,7 +748,7 @@ function renderResumeNotice(message) {
         addMsg('error', esc(data.text || 'An error occurred.'));
         setBusy(false);
       } else {
-        addMsg('agent', esc(data.text || ''));
+        addMsg('agent', md(data.text || ''));
         setBusy(false);
       }
     } catch (e) {
@@ -723,7 +879,7 @@ async function sendMessage(forcedText) {
       addMsg('error', esc(data.text || 'An error occurred.'));
       setBusy(false);
     } else {
-      addMsg('agent', esc(data.text || ''));
+      addMsg('agent', md(data.text || ''));
       setBusy(false);
     }
   } catch (err) {
@@ -752,9 +908,9 @@ async function sendConfirm(confirmed) {
       showToast('Database is updating — your confirmation was not sent. Try again in a moment.', true);
       return;
     }
-    if (data.type === 'answer') addMsg('agent', esc(data.text || ''));
+    if (data.type === 'answer') addMsg('agent', md(data.text || ''));
     else if (data.type === 'error') addMsg('error', esc(data.text || 'Error.'));
-    else addMsg('agent', esc(data.text || ''));
+    else addMsg('agent', md(data.text || ''));
   } catch {
     removeThinking();
     addMsg('error', 'Could not reach the server.');
@@ -843,7 +999,7 @@ async function submitDisambiguation() {
     } else if (data.type === 'error') {
       addMsg('error', esc(data.text || 'Error.')); setBusy(false);
     } else {
-      addMsg('agent', esc(data.text || '')); setBusy(false);
+      addMsg('agent', md(data.text || '')); setBusy(false);
     }
   } catch {
     removeThinking();
@@ -856,7 +1012,7 @@ async function cancelDisambiguation() {
   try {
     const data = await fetch(`${API}/disambiguate/cancel`, {method: 'POST'})
       .then(r => r.json());
-    addMsg('agent', esc(data.text || 'Okay — set aside.'));
+    addMsg('agent', md(data.text || 'Okay — set aside.'));
   } catch { addMsg('error', 'Could not reach the server.'); }
   setBusy(false);
 }
@@ -878,7 +1034,7 @@ document.getElementById('db-input').addEventListener('change', async (e) => {
       waitForReady().then(() => {
         if (data.new_exercises && data.new_exercises.length > 0) {
           const list = data.new_exercises.join(', ');
-          addMsg('agent', esc(`New exercises detected: ${list}. Would you like to add any quirks for how these should be interpreted?`));
+          addMsg('agent', md(`New exercises detected: ${list}. Would you like to add any quirks for how these should be interpreted?`));
         }
       });
     } else if (data.status === 'ok') {

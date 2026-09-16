@@ -385,3 +385,120 @@ def test_no_sessions_still_produces_a_usable_coverage_answer(ont):
     assert set(r["zero_coverage"]) == {"Arms", "Triceps", "Long Head", "Chest",
                                        "Legs", "Quads", "Glutes", "Calves"}
     assert r["unmapped_sets"] == 0
+
+
+# ── never trained vs merely paused ───────────────────────────────────────────
+#
+# A live balance answer listed five muscles under "Muscles with Zero Coverage".
+# Two of them had real history — Calves 28 sets (last 2026-04-16), Lower Traps
+# 45 (last 2026-04-04) — they simply had nothing in the 90-day window. Under that
+# heading a reader takes "zero coverage" to mean NEVER, so a pause was reported
+# as a structural gap.
+#
+# The summary could not have done better: sessions outside the window and the
+# prior window were dropped before counting, so the package had no all-time
+# figure to distinguish them with.
+
+_LONG_AGO = ("2024-03-01", 9)      # outside BOTH the window and the prior window
+_IN_WINDOW = ("2026-05-01", 3)
+
+
+def test_alltime_counts_include_sessions_outside_both_windows(ont):
+    """The discarded-history bug, pinned directly. Bench -> Chest from a session
+    two years before the window must still reach the all-time column."""
+    r = _run(ont, {"Bench Press": _sessions(_LONG_AGO)})
+    chest = _row(r, "Chest")
+    assert chest["primary_sets"] == 0            # nothing in the window
+    assert chest["prior_primary_sets"] == 0      # nor the prior window
+    assert chest["alltime_primary_sets"] == 9    # but it did happen
+
+
+def test_a_muscle_trained_only_long_ago_is_dormant_not_never(ont):
+    """The exact conflation the user caught."""
+    r = _run(ont, {"Bench Press": _sessions(_LONG_AGO)})
+    assert "Chest" in r["zero_coverage"]      # correct: none in the window
+    assert "Chest" in r["dormant"]            # trained before — a pause
+    assert "Chest" not in r["never_trained"]  # NOT a structural gap
+
+
+def test_a_muscle_never_trained_is_never_not_dormant(ont):
+    """The other direction: nothing anywhere, ever."""
+    r = _run(ont, {"Bench Press": _sessions(_IN_WINDOW)})
+    assert "Calves" in r["never_trained"]
+    assert "Calves" not in r["dormant"]
+
+
+def test_never_and_dormant_partition_zero_coverage(ont):
+    """The three lists must not drift apart — every windowed-zero muscle is in
+    exactly one of the two, so neither list can silently lose a muscle."""
+    r = _run(ont, {"Bench Press": _sessions(_LONG_AGO, _IN_WINDOW),
+                   "Squat": _sessions(_LONG_AGO)})
+    assert sorted(r["never_trained"] + r["dormant"]) == sorted(r["zero_coverage"])
+    assert not set(r["never_trained"]) & set(r["dormant"])
+
+
+def test_last_trained_alltime_survives_a_long_gap(ont):
+    """A dormant claim needs a date, and the windowed last_trained_date is None
+    precisely when the muscle is dormant — which is when the date is wanted."""
+    r = _run(ont, {"Bench Press": _sessions(_LONG_AGO)})
+    chest = _row(r, "Chest")
+    assert chest["last_trained_date"] is None          # window-scoped, unchanged
+    assert chest["last_trained_alltime"] == _LONG_AGO[0]
+
+
+def test_a_muscle_only_ever_held_is_never_trained(ont):
+    """Coverage means TRAINED, all-time as well as in-window. A muscle whose only
+    edges are 'limiting' has never been trained no matter how many sets held it —
+    266 sets of shrugs do not train the grip."""
+    r = _run(ont, {"Bench Press": _sessions(_IN_WINDOW)})
+    # Triceps is Bench's SECONDARY here, so it is trained and must NOT be listed.
+    assert "Triceps" not in r["never_trained"]
+    assert _row(r, "Triceps")["alltime_secondary_sets"] == 3
+
+
+def test_windowed_columns_are_unchanged_by_the_alltime_addition(ont):
+    """Regression: adding an all-time bucket must not disturb the numbers the
+    rest of the package and every existing answer already depend on."""
+    r = _run(ont, {"Bench Press": _sessions(("2026-05-01", 3), ("2026-02-15", 7))})
+    chest = _row(r, "Chest")
+    assert chest["primary_sets"] == 3
+    assert chest["prior_primary_sets"] == 7
+    assert chest["alltime_primary_sets"] == 10
+
+
+# ── Sets per week ────────────────────────────────────────────────────────────
+#
+# Every muscle figure was a window total, and `weekly_volumes` was the only
+# per-week view in the whole package — which is probably why answers kept
+# reaching for volume. Training decisions are made in sets per week, and the
+# 10-20 sets/week guidance is uncheckable without it.
+
+def test_sets_per_week_matches_the_window(ont):
+    r = _run(ont, {"Bench Press": _sessions(("2026-05-01", 26))})
+    weeks = r["weeks_in_window"]
+    assert weeks == round(91 / 7.0, 2)          # 90-day span, both ends counted
+    chest = _row(r, "Chest")
+    assert chest["primary_sets"] == 26
+    assert chest["primary_sets_per_week"] == round(26 / weeks, 1)
+
+
+def test_sets_per_week_covers_secondary_too(ont):
+    r = _run(ont, {"Bench Press": _sessions(("2026-05-01", 13))})
+    tri = _row(r, "Triceps")                    # Bench -> Triceps is secondary
+    assert tri["secondary_sets"] == 13
+    assert tri["secondary_sets_per_week"] == round(13 / r["weeks_in_window"], 1)
+
+
+def test_sets_per_week_is_zero_for_an_untrained_muscle(ont):
+    r = _run(ont, {"Bench Press": _sessions(("2026-05-01", 5))})
+    assert _row(r, "Calves")["primary_sets_per_week"] == 0.0
+
+
+def test_prior_and_alltime_columns_have_no_weekly_twin(ont):
+    """Only the CURRENT window gets a per-week figure. A per-week number over a
+    prior or all-time span would need a different divisor and would silently
+    invite comparison against the window's."""
+    r = _run(ont, {"Bench Press": _sessions(("2026-05-01", 5))})
+    keys = _row(r, "Chest").keys()
+    assert "prior_primary_sets_per_week" not in keys
+    assert "alltime_primary_sets_per_week" not in keys

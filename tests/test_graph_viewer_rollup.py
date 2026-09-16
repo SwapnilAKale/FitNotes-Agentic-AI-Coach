@@ -25,6 +25,8 @@ from pathlib import Path
 
 import pytest
 
+from src.ontology import ROLE_PRECEDENCE
+
 _ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -88,7 +90,14 @@ def test_no_exercise_is_both_primary_and_secondary_on_one_muscle(payload):
 
 
 def test_primary_wins_when_a_lift_reaches_a_muscle_both_ways(payload, ont):
-    """Recompute the effective role independently and compare, for every pair."""
+    """Recompute the effective role independently and compare, for every pair.
+
+    The precedence is the full three-role one — primary > secondary > limiting.
+    This recomputation used to collapse to `primary else secondary`, which was
+    indistinguishable from the real rule only while the store carried no
+    'limiting' edges. A lift that merely HOLDS a muscle must not be reported as
+    assisting it, so the fallback is 'limiting', never 'secondary'.
+    """
     desc = {str(mid): {str(d) for d in ds}
             for mid, ds in ont["descendants"].items()}
     by_ex = {}
@@ -101,9 +110,38 @@ def test_primary_wins_when_a_lift_reaches_a_muscle_both_ways(payload, ont):
         for eid, ls in by_ex.items():
             hits = [l for l in ls if l["m"] in desc[mid]]
             if hits:
-                want[eid] = ("primary" if any(l["role"] == "primary" for l in hits)
-                             else "secondary")
+                want[eid] = next(r for r in ROLE_PRECEDENCE
+                                 if any(l["role"] == r for l in hits))
         assert got == want, f"muscle {mid} rollup disagrees with the rule"
+
+
+def test_rollup_emits_limiting_rows(payload):
+    """The muscle panel can only render what the rollup sends it.
+
+    Before the reviewed store was promoted this payload carried no 'limiting'
+    row at all, so the panel's missing third list was invisible. Both directions
+    on one muscle: the lift that HOLDS the grip and the lift that TRAINS it.
+    """
+    grip = {r["ex"]: r["role"] for r in _rows(payload, "Grip")}
+    by_name = {e["name"]: e["id"] for e in payload["exercises"]}
+
+    assert grip[by_name["Smith Machine Shrug"]] == "limiting"
+    assert grip[by_name["Hand Gripper"]] == "primary"
+
+
+def test_a_limiting_lift_is_never_reported_as_assisting(payload):
+    """The negative that matters: 'limiting' must not collapse into 'secondary'.
+
+    The rollup's fallback used to be 'secondary', which would have re-credited
+    every held muscle as assistance volume — the exact false number the role
+    was invented to remove.
+    """
+    held = {(mid, r["ex"]) for mid, rows in payload["rollup"].items()
+            for r in rows if r["role"] == "limiting"}
+    assert held, "no limiting rows at all — this test would prove nothing"
+    for mid, ex in held:
+        roles = {r["role"] for r in payload["rollup"][mid] if r["ex"] == ex}
+        assert roles == {"limiting"}, f"{ex} on muscle {mid} reported as {roles}"
 
 
 def test_deadlift_reaches_back_as_primary_only(payload):

@@ -2680,6 +2680,13 @@ def _compute_muscle_ontology_summary(
         "primary_sets": 0, "secondary_sets": 0, "limiting_sets": 0,
         "prior_primary_sets": 0, "prior_secondary_sets": 0,
         "prior_limiting_sets": 0,
+        # ALL-TIME, spanning the user's whole history rather than the window.
+        # Without these the package could not answer "have I EVER trained this",
+        # so a muscle untouched for 90 days and one never trained in the user's
+        # life collapsed into a single "zero coverage" list. Those are different
+        # facts: one is a pause, the other is a structural gap.
+        "alltime_primary_sets": 0, "alltime_secondary_sets": 0,
+        "last_trained_alltime": None,
         "exercises": set(), "last_trained_date": None,
     })
     unmapped: dict     = {}   # db name -> working sets in window
@@ -2719,6 +2726,24 @@ def _compute_muscle_ontology_summary(
                 continue
             in_window = start_str <= date_str <= end_str
             in_prior  = prior_start <= date_str <= prior_end
+
+            # ── ALL-TIME first, BEFORE the window filter ──────────────────────
+            # This block used to sit after `continue`, so every session outside
+            # the window and prior window was discarded and the package could
+            # not tell "never trained" from "not trained lately". Coverage means
+            # TRAINED, so limiting sets are excluded here exactly as they are
+            # from the windowed columns — 266 sets of shrugs do not train grip.
+            if eid is not None:
+                for mid in primary_ids:
+                    counts[mid]["alltime_primary_sets"] += sets
+                for mid in secondary_ids:
+                    counts[mid]["alltime_secondary_sets"] += sets
+                for mid in primary_ids | secondary_ids:
+                    bucket = counts[mid]
+                    if (bucket["last_trained_alltime"] is None
+                            or date_str > bucket["last_trained_alltime"]):
+                        bucket["last_trained_alltime"] = date_str
+
             if not (in_window or in_prior):
                 continue
 
@@ -2757,7 +2782,12 @@ def _compute_muscle_ontology_summary(
     pending = {n: s for n, s in unmapped.items() if n in pending_names}
     unmapped = {n: s for n, s in unmapped.items() if n not in pending_names}
 
-    rows, zero_coverage = [], []
+    # Weeks the window spans, for the per-week columns below. `span` is
+    # end - start in days; +1 counts both endpoints, matching the inclusive
+    # date filter used everywhere above.
+    weeks = max((span + 1) / 7.0, 1.0 / 7.0)
+
+    rows, zero_coverage, never_trained, dormant = [], [], [], []
     for mid in reachable:
         m = muscles[mid]
         c = counts.get(mid)
@@ -2771,8 +2801,23 @@ def _compute_muscle_ontology_summary(
             "prior_primary_sets":   c["prior_primary_sets"]   if c else 0,
             "prior_secondary_sets": c["prior_secondary_sets"] if c else 0,
             "prior_limiting_sets":  c["prior_limiting_sets"]  if c else 0,
+            "alltime_primary_sets":   c["alltime_primary_sets"]   if c else 0,
+            "alltime_secondary_sets": c["alltime_secondary_sets"] if c else 0,
             "exercise_count":       len(c["exercises"])       if c else 0,
+            # SETS PER WEEK — the metric training decisions are actually made
+            # in. Everything else here is a window total, and volume was the
+            # only figure with any weekly view at all, which is why answers kept
+            # reaching for volume. Established dose guidance ("10-20 hard sets
+            # per muscle per week") is uncheckable without this.
+            "primary_sets_per_week":
+                round((c["primary_sets"] if c else 0) / weeks, 1) if weeks else 0.0,
+            "secondary_sets_per_week":
+                round((c["secondary_sets"] if c else 0) / weeks, 1) if weeks else 0.0,
             "last_trained_date":    c["last_trained_date"]    if c else None,
+            # Window-independent, so a "you last trained this on X" claim about a
+            # dormant muscle has a date to cite. last_trained_date above stays
+            # window-scoped — deliberately unchanged.
+            "last_trained_alltime": c["last_trained_alltime"] if c else None,
         }
         rows.append(row)
         # Coverage asks whether the muscle was TRAINED. Sets that merely leaned
@@ -2780,6 +2825,16 @@ def _compute_muscle_ontology_summary(
         # still untouched — 266 sets of shrugs do not train the grip.
         if row["primary_sets"] == 0 and row["secondary_sets"] == 0:
             zero_coverage.append(m["name"])
+            # NEVER vs MERELY PAUSED — the distinction the old single list lost.
+            # A muscle nothing has ever trained is a structural gap in the
+            # programme; one trained for a year and dropped three months ago is a
+            # change. Reporting the second under "zero coverage" reads as the
+            # first, which is what the user objected to.
+            if (row["alltime_primary_sets"] == 0
+                    and row["alltime_secondary_sets"] == 0):
+                never_trained.append(m["name"])
+            else:
+                dormant.append(m["name"])
 
     rows.sort(key=lambda r: (-r["primary_sets"], -r["secondary_sets"], r["muscle"]))
 
@@ -2790,10 +2845,22 @@ def _compute_muscle_ontology_summary(
 
     return {
         "window":       {"start": start_str, "end": end_str, "days": span},
+        # The divisor behind every *_sets_per_week column, so a per-week claim
+        # can be checked rather than taken on trust.
+        "weeks_in_window": round(weeks, 2),
         "prior_window": {"start": prior_start, "end": prior_end,
                          "complete": prior_complete},
         "muscles":       rows,
+        # THREE LISTS, and the relationship between them is the point:
+        #   zero_coverage = no sets IN THIS WINDOW  (never_trained ∪ dormant)
+        #   never_trained = no sets EVER            — a structural gap
+        #   dormant       = trained before, nothing in this window — a change
+        # "Zero coverage" reads to a human as "never", so the never/dormant split
+        # is what stops a paused muscle being reported as one the user has never
+        # touched. Each muscle's last_trained_alltime dates the pause.
         "zero_coverage": sorted(zero_coverage),
+        "never_trained": sorted(never_trained),
+        "dormant":       sorted(dormant),
         # Every in-window exercise lands in EXACTLY ONE of these four lists.
         # That is what invariant G7 checks, and it is why a curation gap can
         # never hide: an exercise missing from the map is named, not dropped.
@@ -2818,6 +2885,112 @@ def _resolve_alias(ontology: dict, db_exercise_name: str):
     if not db_exercise_name:
         return None
     return ontology.get("aliases", {}).get(db_exercise_name.strip().lower())
+
+
+def _compute_suggestable_exercises(
+    ontology:               dict,
+    alltime_sessions_by_ex: dict,
+) -> list:
+    """Canonical names of graph exercises the user has NEVER logged.
+
+    The permitted pool for "what could I add". Live, the coach proposed "Face
+    Pulls", "Standing Calf Raises" and "Rear Delt Flys" — real movements the
+    store already holds as `Cable Face Pull`, `Calf Raise` and
+    `Rear Delt Machine Fly`. It invented labels for exercises sitting right
+    there, because nothing in the package told it what the catalogue contains.
+
+    The graph is that catalogue and grows to cover the well-known movements, so
+    a suggestion drawn from here is both real and already mapped to muscles.
+    Names only, and only the ones the user lacks — bounded, and it shrinks as
+    they log more.
+    """
+    if not ontology or not ontology.get("exercises"):
+        return []
+    logged = {str(n).strip().lower() for n in (alltime_sessions_by_ex or {})}
+    trained_ids = {eid for name, eid in (ontology.get("aliases") or {}).items()
+                   if name in logged}
+    return sorted(ex["canonical_name"]
+                  for eid, ex in ontology["exercises"].items()
+                  if eid not in trained_ids)
+
+
+def _compute_exercise_muscle_map(
+    ontology:               dict,
+    exercise_names:         Optional[list],
+    alltime_sessions_by_ex: dict,
+) -> dict:
+    """
+    Which muscles each NAMED exercise reaches, per role — read straight off the
+    ontology graph.
+
+    WINDOW-INDEPENDENT, DELIBERATELY. "Does a lat pulldown train my biceps?" is a
+    question about the exercise, not about what the user did in the last 90 days.
+    Every other muscle field here is a count over a window; this one is not, and
+    that is the point. Sourcing it from the graph means a scoping miss, a long
+    layoff, or an exercise the user has never performed can no longer turn the
+    question into a guess.
+
+    It exists because the package previously carried per-muscle counts and an
+    `exercise_count` INTEGER — the exercise names behind each muscle were
+    dropped. So nothing in the payload could answer "does X train Y", and the
+    agent answered it anyway, from aggregate counts belonging to other lifts.
+
+    `in_store` / `ever_logged` are reported separately on purpose: they are
+    different facts and the honest answer differs. An exercise can be in the
+    graph but never trained (answerable), or trained but absent from the graph
+    (a curation gap that must be admitted, never guessed around).
+
+    Bounded by construction: only the exercises the caller NAMED are included,
+    so the payload stays O(names) and never O(graph).
+    """
+    if not ontology or not ontology.get("muscles") or not exercise_names:
+        return {}
+
+    muscles = ontology["muscles"]
+    # Recover the user's exact DB spelling so the map keys match the rest of the
+    # package rather than the classifier's capitalisation.
+    logged = {n.lower(): n for n in (alltime_sessions_by_ex or {})}
+
+    out: dict = {}
+    for raw in exercise_names:
+        name = str(raw or "").strip()
+        if not name:
+            continue
+        display = logged.get(name.lower(), name)
+        eid = _resolve_alias(ontology, display)
+        if eid is None:
+            eid = _resolve_alias(ontology, name)
+
+        entry = {
+            "primary": [], "secondary": [], "limiting": [],
+            "in_store":    eid is not None,
+            "ever_logged": name.lower() in logged,
+        }
+        if eid is not None:
+            for edge in ontology.get("edges_by_exercise", {}).get(eid, []):
+                muscle = muscles.get(edge["muscle_id"])
+                if muscle is not None and edge["role"] in entry:
+                    entry[edge["role"]].append(muscle["name"])
+            for role in ("primary", "secondary", "limiting"):
+                entry[role] = sorted(set(entry[role]))
+
+        # ── The question, answered as a field ────────────────────────────────
+        # `trains` is primary + secondary; `holds_only` is limiting. Named after
+        # the question so the model never has to reason from a role label to a
+        # verb — a step it demonstrably got wrong, writing "your Lat Pulldowns
+        # DO TRAIN your biceps; the biceps act as a limiting muscle" while
+        # citing `limiting` correctly. The citation gate proves which field was
+        # read, never what the sentence around it means.
+        #
+        # This merge is the ONE that is safe, because it is the merge that
+        # EXCLUDES limiting: a held muscle is absent from `trains` by
+        # construction, so the affirmative claim has no leaf to cite. Merging
+        # all three would be the opposite — see the citation view's guard test.
+        # The three roles stay separately reported; nothing is lost.
+        entry["trains"]     = sorted(set(entry["primary"]) | set(entry["secondary"]))
+        entry["holds_only"] = list(entry["limiting"])
+        out[display] = entry
+    return out
 
 
 def _compute_rankings(exercise_results: list) -> dict:
@@ -2912,14 +3085,29 @@ def process_data(
     period_bw_entries = [e for e in all_bw_entries if start_str <= e["date"] <= end_str]
 
     # ── Filter rows ────────────────────────────────────────────────────────────
+    # THE TWO FILTERS ARE NOT COMBINED. When the caller named specific exercises,
+    # that IS the scope; a muscle group named in the same breath is the SUBJECT of
+    # the question, not a second narrowing.
+    #
+    # ANDing them produced an empty set for the single most important question
+    # this project answers. "Do my lat pulldowns train my biceps?" yields
+    # exercise_names=['Lat Pulldown'] + muscle_groups=['Biceps'], and FitNotes
+    # files Lat Pulldown under BACK — so "Lat Pulldown AND filed-under-Biceps" was
+    # empty BY CONSTRUCTION, for every window and every user. The package then
+    # fell back to broad scope and the agent invented an answer about an exercise
+    # with 366 logged sets, reporting it as absent from the history entirely.
+    #
+    # The sharp edge: one-category-per-exercise is the exact FitNotes limitation
+    # the muscle ontology exists to work around, and the cross-category question
+    # was being killed BY that category before the ontology was ever consulted.
     filtered_rows = all_period_rows
-    if muscle_groups:
-        cat_map     = {v: k for k, v in CATEGORY_NAMES.items()}
-        allowed_ids = {cat_map[g] for g in muscle_groups if g in cat_map}
-        filtered_rows = [r for r in filtered_rows if r["category_id"] in allowed_ids]
     if exercise_names:
         lower_names   = {n.lower() for n in exercise_names}
         filtered_rows = [r for r in filtered_rows if r["exercise_name"].lower() in lower_names]
+    elif muscle_groups:
+        cat_map     = {v: k for k, v in CATEGORY_NAMES.items()}
+        allowed_ids = {cat_map[g] for g in muscle_groups if g in cat_map}
+        filtered_rows = [r for r in filtered_rows if r["category_id"] in allowed_ids]
 
     # ── Warmup eligibility and per-exercise alltime maxima ────────────────────
     # Both are derived from alltime_rows in a single pass so they are available
@@ -3258,6 +3446,14 @@ def process_data(
         # while this one is set COUNTS keyed by actual muscle. A missing or
         # broken ontology store degrades to {} here and nothing else changes.
         "muscle_ontology_summary":  _safe_compute(_compute_muscle_ontology_summary, _alltime_sessions_by_ex, _ontology, start_str, end_str, all_training_dates[0] if all_training_dates else None, bundle.get("pending_review") or frozenset(), default={}, label="muscle_ontology"),
+        # Graph lookup, NOT a windowed count — see _compute_exercise_muscle_map.
+        # This is what makes "does X train Y" answerable from data instead of
+        # inferred from counts that belong to other exercises.
+        "exercise_muscle_map":      _safe_compute(_compute_exercise_muscle_map, _ontology, exercise_names, _alltime_sessions_by_ex, default={}, label="exercise_muscle_map"),
+        # The ONLY pool a new-exercise suggestion may be drawn from — see
+        # _compute_suggestable_exercises. Names only; nothing outside the graph
+        # may be invented.
+        "suggestable_exercises":    _safe_compute(_compute_suggestable_exercises, _ontology, _alltime_sessions_by_ex, default=[], label="suggestable_exercises"),
         "training_consistency":     _safe_compute(_compute_training_consistency, all_training_dates, start_str, end_str,   default={},  label="training_consistency"),
         "day_of_week_patterns":     _safe_compute(_compute_day_of_week_patterns, all_training_dates, start_str, end_str,   default={},  label="dow_patterns"),
         "seasonal_patterns":        _safe_compute(_compute_seasonal_patterns,    all_training_dates,                       default=[],  label="seasonal_patterns"),

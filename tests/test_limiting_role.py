@@ -139,6 +139,17 @@ def test_the_targeted_muscle_is_unaffected(ont):
 
 
 def test_no_field_holds_the_three_columns_summed(ont):
+    """No field may expose primary+secondary+limiting added together — a blended
+    total would be citable, and the whole point of three columns is that they
+    are never summed.
+
+    SCOPED TO THIS WINDOW'S FIELDS. The check is a value collision, so it has to
+    compare like with like: `prior_*` and `alltime_*` measure DIFFERENT PERIODS
+    and can equal this window's sum by pure coincidence. They did — a muscle
+    whose only session is in-window has alltime_primary_sets == the window sum,
+    which is arithmetic, not a blend. Comparing across periods made this test
+    fire on a correct change.
+    """
     r = _run(ont, {"Smith Machine Shrug": _sessions(("2026-05-01", 100))})
     for row in r["muscles"]:
         total = row["primary_sets"] + row["secondary_sets"] + row["limiting_sets"]
@@ -146,6 +157,7 @@ def test_no_field_holds_the_three_columns_summed(ont):
             continue
         others = [v for k, v in row.items()
                   if isinstance(v, int)
+                  and not k.startswith(("prior_", "alltime_"))
                   and k not in ("primary_sets", "secondary_sets", "limiting_sets")]
         assert total not in others, f"{row['muscle']} exposes a blended total"
 

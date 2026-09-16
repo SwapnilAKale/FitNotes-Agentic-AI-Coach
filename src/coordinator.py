@@ -379,6 +379,30 @@ def _is_transient_server_error(exc: Exception) -> bool:
     return _ckpt.is_transient_server_error(exc, _GenaiServerError)
 
 
+def _run_rewrite_guards(answer: str, pkg: dict, ontology) -> tuple:
+    """The deterministic REWRITE guards for the live-verification defects:
+    exact exercise names (B3), sets never called sessions (B1), and no window
+    label fused onto a physiological claim (B5). Each runs in isolation — one
+    guard failing can never break the answer or skip the others."""
+    flags: list = []
+    guards = (
+        ("exercise-name",    lambda a: _cite.exercise_name_guard(a, pkg, ontology)),
+        ("sets-as-sessions", lambda a: _cite.sets_as_sessions_guard(a, pkg)),
+        ("window-label",     lambda a: _cite.window_label_guard(a, pkg)),
+    )
+    for name, guard in guards:
+        try:
+            answer, found = guard(answer)
+        except Exception as exc:
+            logger.warning("[coordinator] %s guard skipped (%s)", name, exc)
+            continue
+        for f in found:
+            logger.warning("[coordinator] %s guard: '%s' → '%s'",
+                           name, f.get("original"), f.get("corrected"))
+        flags += found
+    return answer, flags
+
+
 def _normalize_cardio_lock(raw: Optional[dict]) -> Optional[dict]:
     """
     Deterministic unit normalization for a cardio PR lock (6b) — NOT the LLM.
@@ -3100,6 +3124,49 @@ class Coordinator:
                 f.get("original"), f.get("corrected"),
                 f.get("exercise"), f.get("muscle"))
 
+        # ── Rewrite guards for the live-verification defects (B1/B3/B5) ───────
+        # Exact exercise names, a set rate never called a session rate, and no
+        # window label fused onto a physiological claim. Prompt rules for all
+        # three existed and did not hold in the 2026-08-06 live check.
+        try:
+            from src.ontology import load_ontology as _load_guard_ont
+            _guard_ont = _load_guard_ont()
+        except Exception:
+            _guard_ont = None
+        answer, rewrite_flags = _run_rewrite_guards(answer, pkg, _guard_ont)
+
+        # ── Set-count guard (deterministic check, ONE re-prompt) — B2 ─────────
+        # "You currently perform 25 sets for Chest" when the data says 120: the
+        # number exists nowhere in the package and grounding let it through.
+        # Code cannot know which real figure was meant, so — like the plan guard
+        # — re-prompt once with the real figures named, then say so plainly.
+        count_flags: list = []
+        try:
+            count_violations, count_flags = _cite.set_count_guard(answer, pkg)
+            if count_violations:
+                logger.warning("[coordinator] set-count guard: %s",
+                               "; ".join(count_violations))
+                fix_context = list(conversation_context or []) + [
+                    {"role": "assistant", "content": answer},
+                    {"role": "user", "content": "These set counts do not match my "
+                     "data: " + "; ".join(count_violations) + ". Use the real "
+                     "figures. Keep the same focus, coverage and format."},
+                ]
+                retried = _cite.strip_tags(await self._call_with_per_minute_retry(
+                    analysis_agent.analyze, pkg, scoped_question, research,
+                    memories, fix_context, custom_query))
+                retried, _ = _run_rewrite_guards(retried, pkg, _guard_ont)
+                still, count_flags2 = _cite.set_count_guard(retried, pkg)
+                if still:
+                    logger.warning("[coordinator] set-count guard: re-prompt did "
+                                   "not resolve %s", "; ".join(still))
+                    retried += ("\n\nNote: some set counts above do not match your "
+                                "data — " + "; ".join(still) + ".")
+                    count_flags = count_flags2
+                answer = retried
+        except Exception as exc:                       # never break an answer
+            logger.warning("[coordinator] set-count guard skipped (%s)", exc)
+
         # ── Plan guard (deterministic check, ONE re-prompt) ───────────────────
         # A muscle must not get DIRECT work on consecutive days of a plan. Live,
         # a week plan put Barbell Curl on day 4 and Seated Machine Curl on day 5;
@@ -3139,6 +3206,7 @@ class Coordinator:
                 retried = _cite.strip_tags(await self._call_with_per_minute_retry(
                     analysis_agent.analyze, pkg, scoped_question, research,
                     memories, fix_context, custom_query))
+                retried, _ = _run_rewrite_guards(retried, pkg, _ont)
                 # Only a VIOLATION blocks; a concern the coach has now been asked
                 # to justify is allowed to stand.
                 still, plan_flags2, _ = _cite.plan_guard(retried, _ont)
@@ -3155,7 +3223,19 @@ class Coordinator:
         except Exception as exc:                       # never break an answer
             logger.warning("[coordinator] plan guard skipped (%s)", exc)
 
-        recency_flags = recency_flags + limiting_flags + plan_flags
+        # ── Target guard (deterministic insert) — B4 ──────────────────────────
+        # A plan quoted 1.8 sets a week and never said what to raise it to.
+        target_flags: list = []
+        try:
+            answer, target_flags = _cite.target_guard(answer, pkg)
+            for f in target_flags:
+                logger.warning("[coordinator] target guard: added the target after "
+                               "'%s' (%s)", f.get("original"), f.get("muscle"))
+        except Exception as exc:                       # never break an answer
+            logger.warning("[coordinator] target guard skipped (%s)", exc)
+
+        recency_flags = (recency_flags + limiting_flags + rewrite_flags
+                         + count_flags + plan_flags + target_flags)
 
         # Prefix answer when requested exercises produced no rows. The window
         # comes from the same persisted params this stage's other scope fields

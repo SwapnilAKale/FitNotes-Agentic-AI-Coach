@@ -38,14 +38,24 @@ async def open_browser():
     webbrowser.open("http://localhost:3000")
 
 
+# Both pages are hand-edited HTML with the app's JS inlined, so a cached copy is
+# indistinguishable from code that did not change. That is not hypothetical: a
+# live check reported the chat's new markdown renderer as "still broken" while
+# the server was demonstrably serving it — the browser was replaying an old
+# index.html. Revalidate every load; these are two small local files.
+_NO_CACHE = {"Cache-Control": "no-cache, must-revalidate"}
+
+
 @app.get("/")
 async def index():
-    return FileResponse(str(FRONTEND_DIR / "index.html"), media_type="text/html")
+    return FileResponse(str(FRONTEND_DIR / "index.html"), media_type="text/html",
+                        headers=_NO_CACHE)
 
 
 @app.get("/graph")
 async def graph_page():
-    return FileResponse(str(FRONTEND_DIR / "graph.html"), media_type="text/html")
+    return FileResponse(str(FRONTEND_DIR / "graph.html"), media_type="text/html",
+                        headers=_NO_CACHE)
 
 
 @app.get("/vendor/{name}")

@@ -150,6 +150,49 @@ def test_review_endpoint_never_writes_the_graph():
             f"/ontology-review must not touch {forbidden} — use apply_review_cuts.py"
 
 
+# ── the third role reaches the UI ─────────────────────────────────────────────
+#
+# These three are TEXT-LEVEL guards, not behavioural tests: there is no JS
+# runner in this project, so they catch a deletion or a rename and nothing more.
+# What they defend is a gap that really happened — `limiting` was wired into the
+# 3D lines, the colours, the legend and the audit console, but the muscle panel
+# built only a primary and a secondary list, so 16 promoted edges would have
+# drawn on the body while being absent from the rail beside it.
+
+def test_muscle_panel_renders_limiting():
+    js = _module_script()
+    assert "r.role === 'limiting'" in js, \
+        "muscleHTML builds no limiting list — promoted edges would be invisible in the rail"
+    assert "rowsFor(lim, false)" in js, \
+        "limiting rows must render with an EMPTY count column, never a set number"
+
+
+def test_limiting_rows_carry_no_per_lift_set_count():
+    """The count column is what would re-introduce the false volume: printing
+    266 beside Smith Machine Shrug on Grip claims exactly the training the role
+    exists to deny. The aggregate belongs in the summary line, labelled."""
+    js = _module_script()
+    assert "function rowsFor(rows, showSets = true)" in js
+    assert "sets held" in js, "the aggregate must be labelled 'sets held', not 'sets'"
+
+
+def test_limiting_filter_is_offered():
+    js = _module_script()
+    m = re.search(r"\[([^\]]*)\]\.map\(f =>", js)
+    assert m and "'limiting'" in m.group(1), "no limiting filter button"
+    assert "UI.filter === 'limiting'" in js, \
+        "the filter button has no matching edgeShown branch — it would draw nothing"
+
+
+def test_a_finished_audit_does_not_pin_edges():
+    """Audit mode ignores the selection by design, and the mode is remembered
+    across reloads. With every call answered that left the whole queue drawn
+    permanently and unresponsive to clicks."""
+    js = _module_script()
+    assert "mode === 'audit' && QUEUE.some(l => !decisions[l.key])" in js, \
+        "a complete audit queue must fall through to normal selection behaviour"
+
+
 def test_apply_script_is_the_only_path_that_edits_edges():
     """The counterpart: the graph edit lives in a script that defaults to a dry
     run, and it still never opens muscles.csv."""

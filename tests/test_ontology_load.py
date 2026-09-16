@@ -13,8 +13,8 @@ import os
 import pytest
 
 from src import ontology as ont_mod
-from src.ontology import (CARDIO_PATTERN, is_unattributed, load_ontology,
-                          resolve_db_exercise, subtree)
+from src.ontology import (CARDIO_PATTERN, ROLE_PRECEDENCE, is_unattributed,
+                          load_ontology, resolve_db_exercise, subtree)
 
 _STORE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                       "ontology")
@@ -76,7 +76,11 @@ def test_every_edge_resolves_and_is_sourced(store):
     for e in store["edges"]:
         assert e["exercise_id"] in store["exercises"], e
         assert e["muscle_id"] in store["muscles"], e
-        assert e["role"] in ("primary", "secondary"), e
+        # Derived from the product constant, not restated. This assertion listed
+        # ("primary", "secondary") by hand and stayed green only because the live
+        # store happened to carry no 'limiting' edges yet; promoting the reviewed
+        # store turned it red.
+        assert e["role"] in ROLE_PRECEDENCE, e
         assert e["source"].strip(), e
 
 
@@ -210,6 +214,67 @@ def test_user_ruling_r2_edges_are_present(store):
     assert "Front Delts" not in decline
     deadlift = _muscles_for(store, "Deadlift", "primary")
     assert {"Hamstrings", "Glutes", "Erectors"} <= deadlift
+
+
+def test_overhead_press_trains_triceps(store):
+    """User ruling 2026-08-04, overturning the audit's 'limiting' call.
+
+    The audit demoted Overhead Press -> Triceps to 'limiting' while Seated
+    Dumbbell Press -> Triceps stayed 'secondary'. Both are vertical presses and
+    the interference runs both ways in both, so they must agree. Pinned here
+    because the contradiction survived a 75-call review unnoticed.
+    """
+    assert "Triceps" in _muscles_for(store, "Overhead Press", "secondary")
+    assert "Triceps" in _muscles_for(store, "Seated Dumbbell Press", "secondary")
+    # Negative, and the actual point: neither may be recorded as merely held.
+    assert "Triceps" not in _muscles_for(store, "Overhead Press", "limiting")
+    assert "Triceps" not in _muscles_for(store, "Seated Dumbbell Press", "limiting")
+
+
+def test_lat_pulldown_trains_biceps(store):
+    """User ruling 2026-08-04, overturning the audit's 'limiting' call.
+
+    The audit demoted Lat Pulldown -> Biceps while keeping every reverse-grip
+    variant as 'secondary'. Same movement, same elbow flexion; the grip changes
+    the degree, not whether the biceps are trained at all. 366 sets ride on it.
+
+    HELD BACK ON PURPOSE UNTIL 2026-08-05. Applying it earlier would have made
+    the analysis agent's buggy answer to "do my lat pulldowns train my biceps?"
+    accidentally correct — the agent reached that answer without consulting
+    this edge at all, and a right-looking sentence would have hidden the defect.
+    It was applied only after the agent was shown live to read the edge and
+    answer from it.
+    """
+    assert "Biceps" in _muscles_for(store, "Lat Pulldown", "secondary")
+    assert "Biceps" not in _muscles_for(store, "Lat Pulldown", "limiting")
+    # The variants it was made consistent with.
+    for variant in ("Narrow Reverse Grip Lat Pulldown", "Reverse Grip Lat Pulldown"):
+        assert "Biceps" in _muscles_for(store, variant, "secondary")
+
+
+def test_reviewed_demotions_are_applied(store):
+    """A sample of the 16 edges the review moved to 'limiting'.
+
+    Both directions, because the role only means something if it discriminates:
+    the lift that HOLDS the muscle is limiting, the lift that TRAINS the same
+    muscle is not. Grip is the case that forced the role to exist.
+    """
+    # Held, not trained: 266 sets of shrugs stop counting as grip training.
+    assert "Grip" in _muscles_for(store, "Smith Machine Shrugs", "limiting")
+    assert "Grip" not in _muscles_for(store, "Smith Machine Shrugs", "secondary")
+    # Same muscle, genuinely trained — the role still discriminates.
+    assert "Grip" in _muscles_for(store, "Hand Gripper", "primary")
+
+    # The pulls that were inflating biceps volume. NOT Lat Pulldown — the user
+    # overturned that one on 2026-08-04; see test_lat_pulldown_trains_biceps.
+    assert "Biceps" in _muscles_for(store, "Wide Grip Cable Row", "limiting")
+    assert "Biceps" not in _muscles_for(store, "Wide Grip Cable Row", "secondary")
+    assert "Biceps" in _muscles_for(store, "Barbell Upright Row", "limiting")
+    # Curls still train biceps — the demotion was scoped to pulling, not to the muscle.
+    assert "Biceps" in _muscles_for(store, "Barbell Curl", "primary")
+
+    # Wrist extensors on reverse curls: held by the pronated grip, not worked.
+    assert "Wrist Extensors" in _muscles_for(store, "Reverse Cable Curls", "limiting")
 
 
 # ── Never raises ──────────────────────────────────────────────────────────────
