@@ -88,11 +88,13 @@ def _fn(src: str, name: str) -> str:
 
 def _run(functions: list, call: str, script: dict, setup: str = "") -> dict:
     src = INDEX.read_text(encoding="utf-8")
-    # The shared busy helper every request uses (absent on an old page → the
-    # tests fail on behaviour, not on a harness error).
+    # The shared helpers every request uses (absent on an old page → the tests
+    # fail on behaviour, not on a harness error). demoRefusal is checked on
+    # every response, demo or not, so leaving it out is a ReferenceError.
     busy_text = re.search(r"const BUSY_TEXT = [^\n]*", src)
-    helpers = (busy_text.group(0) if busy_text else "") + "\n" + (
-        _fn(src, "isBusy") if "function isBusy(" in src else "")
+    helpers = (busy_text.group(0) if busy_text else "") + "\n" + "\n".join(
+        _fn(src, name) for name in ("isBusy", "demoRefusal")
+        if f"function {name}(" in src)
     code = ("\n".join(re.search(p, src).group(0) for p in _MD_PARTS) + "\n"
             + _PRELUDE + helpers + "\n" + "\n".join(_fn(src, f) for f in functions) + "\n"
             + setup + "\n"

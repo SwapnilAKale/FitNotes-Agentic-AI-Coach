@@ -1,0 +1,41 @@
+# Keep the build context (and the image) free of personal data, secrets and
+# dev clutter. corpus/raw/ IS needed: the RAG index is built from it.
+
+# VCS / editors / caches
+.git
+.gitignore
+.github
+.vscode
+.idea
+**/__pycache__
+**/*.pyc
+.pytest_cache
+.venv
+venv
+*.egg-info
+dist
+
+# Secrets — the container gets its keys from docker-compose environment
+.env
+.env.*
+!.env.example
+
+# Personal / runtime data (the container's data/ is a named volume)
+data/
+*.fitnotes
+personal_lessons.md
+lessons.md
+pending_review.csv
+ontology/review_cuts.csv
+ontology/not_exercises.csv
+
+# Evals (ground truth contains personal workout data) and their results
+evals/
+tests/
+docs/
+fix5_prompt.md
+=0.2.2
+
+# Deployment files that are not needed inside the image
+docker-compose.yml
+DEPLOY.md

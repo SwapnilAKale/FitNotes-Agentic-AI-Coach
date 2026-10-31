@@ -27,6 +27,8 @@ REVIEW_CUTS = ONTOLOGY_DIR / "review_cuts.csv"
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from src import demo_mode  # noqa: E402  (needs REPO_ROOT on sys.path)
+
 app = FastAPI()
 
 
@@ -34,6 +36,8 @@ app = FastAPI()
 async def open_browser():
     if os.environ.get("LAUNCHED_BY_MAIN"):
         return  # Main server handles browser open
+    if not demo_mode.open_browser_allowed():
+        return  # DEMO_MODE / OPEN_BROWSER=0: headless server or container
     await asyncio.sleep(0.5)
     webbrowser.open("http://localhost:3000")
 
@@ -280,6 +284,11 @@ async def ontology_review(request: Request):
     deliberate step, so the change to exercise_muscle.csv stays a reviewable
     diff. muscles.csv is unreachable from here by construction (R7).
     """
+    refusal = demo_mode.check(request.method, request.url.path,
+                              request.client.host if request.client else None,
+                              request.headers.get("x-forwarded-for"))
+    if refusal is not None:                      # DEMO_MODE: shared, read-only graph
+        return JSONResponse(status_code=refusal[0], content=refusal[1])
     body = await request.json()
     rows = body.get("decisions") or []
     ONTOLOGY_DIR.mkdir(parents=True, exist_ok=True)
@@ -310,6 +319,10 @@ async def ontology_review(request: Request):
 # port. Every request that isn't one of the frontend's own routes above is
 # forwarded to the real backend, on this machine, over plain localhost.
 BACKEND_URL = "http://localhost:8000"
+# A single agent turn can take minutes (several Gemini calls, retries on 503).
+# The read timeout must outlast it or the browser gets an error for an answer
+# that is still being produced. Default unchanged; the container raises it.
+PROXY_TIMEOUT = float(os.environ.get("FRONTEND_PROXY_TIMEOUT", "300"))
 _HOP_BY_HOP = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailers", "transfer-encoding", "upgrade", "content-length", "host",
@@ -323,7 +336,7 @@ _http_client: httpx.AsyncClient | None = None
 @app.on_event("startup")
 async def _open_backend_client():
     global _http_client
-    _http_client = httpx.AsyncClient(base_url=BACKEND_URL, timeout=300.0)
+    _http_client = httpx.AsyncClient(base_url=BACKEND_URL, timeout=PROXY_TIMEOUT)
 
 
 @app.on_event("shutdown")
@@ -337,6 +350,13 @@ async def proxy_to_backend(path: str, request: Request):
     body = await request.body()
     headers = {k: v for k, v in request.headers.items()
                if k.lower() not in _HOP_BY_HOP}
+    # Standard proxy behaviour: append the address that connected to us, so the
+    # backend can tell visitors apart (DEMO_MODE's per-IP rate limit) instead
+    # of seeing every request come from this proxy on localhost.
+    if request.client and request.client.host:
+        prior = request.headers.get("x-forwarded-for")
+        headers["x-forwarded-for"] = (f"{prior}, {request.client.host}"
+                                      if prior else request.client.host)
     try:
         resp = await _http_client.request(
             request.method, f"/{path}", params=request.query_params,
@@ -345,6 +365,10 @@ async def proxy_to_backend(path: str, request: Request):
     except httpx.ConnectError:
         return JSONResponse(status_code=502,
                             content={"detail": "Backend (port 8000) unreachable"})
+    except httpx.TimeoutException:
+        return JSONResponse(status_code=504, content={
+            "type": "error",
+            "text": "The coach took too long to answer. Please try again."})
     out_headers = {k: v for k, v in resp.headers.items()
                    if k.lower() not in _HOP_BY_HOP}
     return Response(content=resp.content, status_code=resp.status_code,

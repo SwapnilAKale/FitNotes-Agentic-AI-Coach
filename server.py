@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, UploadFile
+from fastapi import FastAPI, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -35,6 +35,7 @@ from src.agent import EXECUTE_TOOLS, AgentSession
 from src.coordinator import Coordinator, MSG_VERIFY_RESTATE, format_verify_fail_message
 from src import checkpoint as _ckpt
 from src import settings, wal
+from src import demo_mode
 import confab
 
 DB_PATH = os.environ.get("FITNOTES_DB_PATH", "./data/FitNotes_Backup.fitnotes")
@@ -446,7 +447,9 @@ async def lifespan(app: FastAPI):
             sys.executable, str(FRONTEND_SERVER),
             env={**os.environ, "LAUNCHED_BY_MAIN": "1"},
         )
-        webbrowser.open("http://localhost:3000")
+        # Off in DEMO_MODE and when OPEN_BROWSER=0 (containers, servers).
+        if demo_mode.open_browser_allowed():
+            webbrowser.open("http://localhost:3000")
     except Exception as exc:
         print(f"Warning: could not launch frontend: {exc}", file=sys.stderr)
 
@@ -478,6 +481,21 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def _demo_mode_gates(request: Request, call_next):
+    # Public-demo safety (src/demo_mode.py): a 403 for endpoints that overwrite
+    # or wipe the shared state, a per-IP rate limit on turn-running endpoints.
+    # check() is always None unless DEMO_MODE=1, so local runs are untouched.
+    refusal = demo_mode.check(
+        request.method, request.url.path,
+        request.client.host if request.client else None,
+        request.headers.get("x-forwarded-for"))
+    if refusal is not None:
+        status_code, body, headers = refusal
+        return JSONResponse(status_code=status_code, content=body, headers=headers)
+    return await call_next(request)
 
 
 class ChatRequest(BaseModel):
@@ -563,6 +581,7 @@ async def status():
     return JSONResponse(content={
         "ready": agent_ready,
         "message": "Initializing fitness coach..." if not agent_ready else "Ready",
+        "demo_mode": demo_mode.enabled(),
     })
 
 
@@ -985,10 +1004,15 @@ async def _run_turn(message: str, disambiguate_selections: list | None) -> JSONR
 
 @app.post("/chat")
 async def chat(body: ChatRequest):
-    t = confab.turn(body.message, agent="fitnotes-coach")                 # line 1: message arrived
+    # Confab (read-aloud) runs only on the developer's PC; CONFAB_ENABLED=0
+    # (set by docker-compose.yml) skips it entirely. Default on.
+    use_confab = demo_mode.confab_enabled()
+    if use_confab:
+        t = confab.turn(body.message, agent="fitnotes-coach")             # line 1: message arrived
     response = await _process_turn(body.message)
-    confab.speak(json.loads(response.body).get("text", ""),              # line 2: answer ready
-                 agent="fitnotes-coach", turn_id=t["turnId"])
+    if use_confab:
+        confab.speak(json.loads(response.body).get("text", ""),          # line 2: answer ready
+                     agent="fitnotes-coach", turn_id=t["turnId"])
     return response
 
 
@@ -1685,4 +1709,6 @@ async def list_articles():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("server:app", host="0.0.0.0", port=8000)
+    # BACKEND_HOST=127.0.0.1 in the container: only the frontend proxy (same
+    # container) reaches the API; nothing else on the Docker network can.
+    uvicorn.run("server:app", host=os.environ.get("BACKEND_HOST", "0.0.0.0"), port=8000)
