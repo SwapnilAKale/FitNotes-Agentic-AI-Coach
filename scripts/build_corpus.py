@@ -6,6 +6,12 @@ Run from project root:
     python scripts/build_corpus.py
 
 Resumable: documents already in ChromaDB are skipped.
+
+    python scripts/build_corpus.py --offline   (or CORPUS_OFFLINE=1)
+
+builds the index from the tracked corpus/raw/*.json files only, with no
+network calls at all — used by the Dockerfile so an image build never
+depends on PubMed or Wikipedia being reachable.
 """
 
 import html
@@ -87,7 +93,7 @@ def _fetch_url(url: str) -> bytes | None:
 # PubMed
 # ---------------------------------------------------------------------------
 
-def fetch_pubmed_abstracts(query: str) -> list[dict]:
+def fetch_pubmed_abstracts(query: str, offline: bool = False) -> list[dict]:
     slug = _slug(query)
     cache_file = CORPUS_RAW_DIR / f"pubmed_{slug}.json"
 
@@ -95,6 +101,9 @@ def fetch_pubmed_abstracts(query: str) -> list[dict]:
         print(f"  [cache] {cache_file.name}")
         with open(cache_file, encoding="utf-8") as f:
             return json.load(f)
+    if offline:
+        print(f"  [offline] no cache for {query!r} -- skipped")
+        return []
 
     # ESearch -- get PMIDs
     search_params = urlencode({
@@ -274,6 +283,10 @@ def fetch_wikipedia_sections(title: str) -> list[dict]:
 def main() -> None:
     from dotenv import load_dotenv
     load_dotenv()
+    offline = ("--offline" in sys.argv[1:]
+               or os.environ.get("CORPUS_OFFLINE", "").strip().lower() in ("1", "true", "yes"))
+    if offline:
+        print("Offline mode: building from corpus/raw/ only, no network calls.\n")
 
     CORPUS_RAW_DIR.mkdir(parents=True, exist_ok=True)
     Path(CHROMA_DB_PATH).mkdir(parents=True, exist_ok=True)
@@ -302,29 +315,36 @@ def main() -> None:
     print("--- Fetching PubMed abstracts ---")
     for query in PUBMED_QUERIES:
         print(f"Query: {query!r}")
-        docs = fetch_pubmed_abstracts(query)
+        docs = fetch_pubmed_abstracts(query, offline=offline)
         print(f"  -> {len(docs)} abstracts\n")
         all_docs.extend(docs)
 
-    print("--- Fetching Wikipedia articles ---")
-    wiki_docs: list[dict] = []
-
-    for title in WIKIPEDIA_ARTICLES:
-        doc = fetch_wikipedia_summary(title)
-        if doc:
-            wiki_docs.append(doc)
-            print(f"  -> Summary: {title}")
-
-    print()
-    for title in WIKIPEDIA_SECTION_ARTICLES:
-        sections = fetch_wikipedia_sections(title)
-        wiki_docs.extend(sections)
-        print(f"  -> {len(sections)} sections from: {title}")
-
     wiki_cache = CORPUS_RAW_DIR / "wikipedia.json"
-    with open(wiki_cache, "w", encoding="utf-8") as f:
-        json.dump(wiki_docs, f, indent=2, ensure_ascii=False)
-    print(f"\nWikipedia raw data saved to {wiki_cache}")
+    wiki_docs: list[dict] = []
+    if offline:
+        print("--- Wikipedia articles (cached) ---")
+        if wiki_cache.exists():
+            with open(wiki_cache, encoding="utf-8") as f:
+                wiki_docs = json.load(f)
+        print(f"  [cache] {wiki_cache.name}: {len(wiki_docs)} documents")
+    else:
+        print("--- Fetching Wikipedia articles ---")
+
+        for title in WIKIPEDIA_ARTICLES:
+            doc = fetch_wikipedia_summary(title)
+            if doc:
+                wiki_docs.append(doc)
+                print(f"  -> Summary: {title}")
+
+        print()
+        for title in WIKIPEDIA_SECTION_ARTICLES:
+            sections = fetch_wikipedia_sections(title)
+            wiki_docs.extend(sections)
+            print(f"  -> {len(sections)} sections from: {title}")
+
+        with open(wiki_cache, "w", encoding="utf-8") as f:
+            json.dump(wiki_docs, f, indent=2, ensure_ascii=False)
+        print(f"\nWikipedia raw data saved to {wiki_cache}")
     all_docs.extend(wiki_docs)
 
     # Deduplicate by id (same PMID can appear in multiple query results)

@@ -1,0 +1,70 @@
+# FitNotes Coach — public demo stack. See DEPLOY.md for the full walkthrough.
+#
+#   cp .env.example .env      # then set GEMINI_API_KEY and DOMAIN
+#   docker compose up -d --build
+#
+# Only Caddy publishes ports (80/443). The app's UI (:3000) is reachable only
+# on the internal Docker network, and its API (:8000) only inside its own
+# container (BACKEND_HOST=127.0.0.1) — the UI reverse-proxies to it.
+
+name: fitnotes-coach
+
+services:
+  app:
+    build: .
+    image: fitnotes-coach:latest
+    restart: unless-stopped
+    init: true                      # reap the MCP / UI child processes
+    environment:
+      GEMINI_API_KEY: ${GEMINI_API_KEY:?Set GEMINI_API_KEY in .env}
+      # Public demo: synthetic data, write/upload endpoints off, per-IP limits.
+      DEMO_MODE: ${DEMO_MODE:-1}
+      DEMO_RESET_ON_START: ${DEMO_RESET_ON_START:-0}
+      DEMO_RATE_LIMIT_PER_MINUTE: ${DEMO_RATE_LIMIT_PER_MINUTE:-3}
+      DEMO_RATE_LIMIT_PER_DAY: ${DEMO_RATE_LIMIT_PER_DAY:-30}
+      DEMO_RATE_LIMIT_GLOBAL_PER_DAY: ${DEMO_RATE_LIMIT_GLOBAL_PER_DAY:-0}
+      # Container plumbing — not meant to be changed.
+      CONFAB_ENABLED: "0"           # read-aloud service exists only on the dev PC
+      OPEN_BROWSER: "0"
+      BACKEND_HOST: 127.0.0.1
+      FRONTEND_PROXY_TIMEOUT: "900" # agent turns can take minutes
+    volumes:
+      - app-data:/app/data          # workout DB, Chroma index, memory, settings
+    expose:
+      - "3000"
+    healthcheck:
+      # /status goes through the UI's proxy to the API, so it checks both.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:3000/status', timeout=8)"]
+      interval: 30s
+      timeout: 10s
+      start_period: 180s
+      retries: 3
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - app
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"               # HTTP/3
+    environment:
+      DOMAIN: ${DOMAIN:?Set DOMAIN in .env (e.g. 203-0-113-7.sslip.io)}
+      APP_USER: ${APP_USER:-demo}
+      APP_PASSWORD_HASH: ${APP_PASSWORD_HASH:-none}   # "none" = no password
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data            # TLS certificates — keep it
+      - caddy-config:/config
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+volumes:
+  app-data:
+  caddy-data:
+  caddy-config:

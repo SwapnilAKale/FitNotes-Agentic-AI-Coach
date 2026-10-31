@@ -1,0 +1,43 @@
+# Caddy: automatic HTTPS in front of the app's UI (:3000 in the `app` service).
+#
+# DOMAIN            your hostname, e.g. coach.example.com or 203-0-113-7.sslip.io
+#                   (use http://localhost to test without TLS on your own machine)
+# APP_USER          optional basic-auth user name (default: demo)
+# APP_PASSWORD_HASH optional; when set, the whole site asks for a password.
+#                   Make one with:  docker run --rm caddy:2-alpine caddy hash-password -p 'your-password'
+
+{$DOMAIN} {
+	encode zstd gzip
+
+	# Basic auth only when a password hash is configured. docker-compose.yml
+	# passes the literal "none" when APP_PASSWORD_HASH is unset or empty (an
+	# empty value would make basic_auth unparsable); the matcher is then false
+	# and that placeholder is never compared against anything.
+	@protected expression `"{$APP_PASSWORD_HASH:none}" != "none"`
+	basic_auth @protected {
+		{$APP_USER:demo} {$APP_PASSWORD_HASH:none}
+	}
+
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+
+	# One agent turn can take several minutes (multiple Gemini calls, retries
+	# on overload). Caddy has no response timeout by default; these make the
+	# ceiling explicit and keep it above FRONTEND_PROXY_TIMEOUT (900 s).
+	reverse_proxy app:3000 {
+		transport http {
+			dial_timeout 10s
+			response_header_timeout 16m
+			read_timeout 16m
+			write_timeout 16m
+		}
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}

@@ -1074,9 +1074,10 @@ function persist(){
       exercise_id:l.ex, muscle_id:l.m, exercise_name:X.get(l.ex).name,
       muscle_name:M.get(l.m).name, role:l.role, decision:decisions[l.key] }));
     try {
-      await fetch('/ontology-review', { method:'POST',
+      const res = await fetch('/ontology-review', { method:'POST',
         headers:{'Content-Type':'application/json'},
         body: JSON.stringify({ decisions: rows }) });
+      if (!res.ok) return;   // e.g. 403 in the public demo: kept in this browser only
       const s = $('#saved'); if (s){ s.classList.add('on');
         setTimeout(() => s.classList.remove('on'), 1400); }
     } catch {}

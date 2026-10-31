@@ -193,6 +193,14 @@
     </button>
   </div>
 
+  <!-- Public-demo notice (shown only when the server reports DEMO_MODE=1) -->
+  <div id="demo-banner"
+    class="px-5 py-1.5 text-xs text-amber-200 bg-amber-950/60 border-b border-amber-800/60 flex-shrink-0"
+    style="display:none">
+    Public demo &mdash; synthetic training data, and one shared session for every visitor
+    (others may see your messages). Uploads and settings are turned off.
+  </div>
+
   <!-- Initialization banner -->
   <div id="init-banner"
     class="flex items-center gap-3 px-5 py-2 text-sm text-blue-300 bg-blue-950 border-b border-blue-800 flex-shrink-0"
@@ -558,7 +566,16 @@ function setBusy(b) {
 // silently dropped what was typed.
 const BUSY_TEXT = 'Your coach is still answering the previous message — this wasn\'t sent.';
 function isBusy(res, data) {
-  return res.status === 429 && (data || {}).error !== 'rate_limit';
+  const err = (data || {}).error;
+  return res.status === 429 && err !== 'rate_limit' && err !== 'demo_rate_limit';
+}
+
+// Public demo (DEMO_MODE=1): the server refused because of the per-visitor
+// limit or because the action is turned off. Its text says why.
+function demoRefusal(data) {
+  const err = (data || {}).error;
+  return (err === 'demo_rate_limit' || err === 'demo_disabled')
+    ? (data.text || data.message || 'Not available in the public demo.') : null;
 }
 
 // ── Message rendering ─────────────────────────────────────────────────────────
@@ -762,6 +779,9 @@ async function resumeSavedQuestion() {
     if (isBusy(res, data)) {
       addMsg('error', esc(BUSY_TEXT));
       setBusy(false);
+    } else if (demoRefusal(data)) {
+      addMsg('error', esc(demoRefusal(data)));
+      setBusy(false);
     } else if (res.status === 429) {
       handleRateLimitError(data);          // quota still down — re-offer Resume
     } else if (data.type === 'error') {
@@ -838,6 +858,7 @@ async function waitForReady() {
       const res = await fetch(`${API}/status`);
       const data = await res.json();
       failCount = 0;
+      if (data.demo_mode) document.getElementById('demo-banner').style.display = 'block';
       if (data.ready) break;
     } catch (e) {
       failCount++;
@@ -928,6 +949,12 @@ async function sendMessage(forcedText) {
       sentBubble.parentElement.parentElement.remove();
       if (!forcedText) input.value = text;
       addMsg('error', esc(BUSY_TEXT));
+      setBusy(false);
+    } else if (demoRefusal(data)) {
+      // Not sent (demo limit): same as busy — take the bubble back, keep the text.
+      sentBubble.parentElement.parentElement.remove();
+      if (!forcedText) input.value = text;
+      addMsg('error', esc(demoRefusal(data)));
       setBusy(false);
     } else if (res.status === 429) {
       handleRateLimitError(data);
@@ -1073,6 +1100,9 @@ async function submitDisambiguation() {
       // Not sent: bring the same panel back so the picks can be submitted again.
       addMsg('error', esc(BUSY_TEXT));
       renderDisambiguation(disambigGroups);
+    } else if (demoRefusal(data)) {
+      addMsg('error', esc(demoRefusal(data)));
+      renderDisambiguation(disambigGroups);
     } else if (data.type === 'disambiguation_required') {
       renderDisambiguation(data.groups);          // re-prompt (Other still ambiguous)
     } else if (data.type === 'confirmation_required') {
@@ -1167,7 +1197,8 @@ document.getElementById('article-input').addEventListener('change', async (e) =>
     } else {
       const msg = data.message || '';
       let toastMsg;
-      if (msg.includes('PDF')) toastMsg = 'Only PDF files are supported.';
+      if (demoRefusal(data)) toastMsg = demoRefusal(data);
+      else if (msg.includes('PDF')) toastMsg = 'Only PDF files are supported.';
       else if (msg.includes('too short')) toastMsg = 'PDF is too short. Try a longer document.';
       else if (msg.includes('structural marker')) toastMsg = "Doesn't look like a research article. Try uploading a study or paper.";
       else if (msg.includes('fitness') || msg.includes('health related')) toastMsg = 'Article must be fitness or health related.';
@@ -1280,6 +1311,7 @@ document.getElementById('wal-switch').addEventListener('click', async () => {
       body: JSON.stringify({ wal_replay_enabled: !walReplayEnabled }),
     });
     const data = await res.json();
+    if (demoRefusal(data)) { showToast(demoRefusal(data), true); return; }
     walReplayEnabled = !!data.wal_replay_enabled;
     renderWalSwitch();
     showToast(walReplayEnabled
@@ -1309,6 +1341,7 @@ document.getElementById('settings-wipe-btn').addEventListener('click', () => {
     try {
       const res = await fetch(`${API}/wal-wipe`, { method: 'POST' });
       const data = await res.json();
+      if (demoRefusal(data)) { showToast(demoRefusal(data), true); return; }
       showToast(data.wiped > 0 ? `Cleared ${data.wiped} saved chat log${data.wiped === 1 ? '' : 's'}.`
                                : 'No saved chat logs to clear.');
       refreshSettings();   // reflect the new pending count (0)
