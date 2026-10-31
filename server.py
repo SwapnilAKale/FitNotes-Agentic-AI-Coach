@@ -35,6 +35,7 @@ from src.agent import EXECUTE_TOOLS, AgentSession
 from src.coordinator import Coordinator, MSG_VERIFY_RESTATE, format_verify_fail_message
 from src import checkpoint as _ckpt
 from src import settings, wal
+import confab
 
 DB_PATH = os.environ.get("FITNOTES_DB_PATH", "./data/FitNotes_Backup.fitnotes")
 FRONTEND_SERVER = Path(__file__).parent / "frontend" / "server.py"
@@ -984,7 +985,11 @@ async def _run_turn(message: str, disambiguate_selections: list | None) -> JSONR
 
 @app.post("/chat")
 async def chat(body: ChatRequest):
-    return await _process_turn(body.message)
+    t = confab.turn(body.message, agent="fitnotes-coach")                 # line 1: message arrived
+    response = await _process_turn(body.message)
+    confab.speak(json.loads(response.body).get("text", ""),              # line 2: answer ready
+                 agent="fitnotes-coach", turn_id=t["turnId"])
+    return response
 
 
 @app.post("/resume")
