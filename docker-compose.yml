@@ -19,7 +19,7 @@ services:
       GEMINI_API_KEY: ${GEMINI_API_KEY:?Set GEMINI_API_KEY in .env}
       # Public demo: synthetic data, write/upload endpoints off, per-IP limits.
       DEMO_MODE: ${DEMO_MODE:-1}
-      DEMO_RESET_ON_START: ${DEMO_RESET_ON_START:-0}
+      DEMO_RESET_ON_START: ${DEMO_RESET_ON_START:-1}   # wipe visitors' changes on every start
       DEMO_RATE_LIMIT_PER_MINUTE: ${DEMO_RATE_LIMIT_PER_MINUTE:-3}
       DEMO_RATE_LIMIT_PER_DAY: ${DEMO_RATE_LIMIT_PER_DAY:-30}
       DEMO_RATE_LIMIT_GLOBAL_PER_DAY: ${DEMO_RATE_LIMIT_GLOBAL_PER_DAY:-0}

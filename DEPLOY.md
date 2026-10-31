@@ -346,8 +346,15 @@ DOMAIN=203-0-113-7.sslip.io
 DEMO_RATE_LIMIT_PER_MINUTE=3      # questions per visitor per minute
 DEMO_RATE_LIMIT_PER_DAY=30        # questions per visitor per day
 DEMO_RATE_LIMIT_GLOBAL_PER_DAY=0  # cap for ALL visitors together (0 = none)
-DEMO_RESET_ON_START=0             # 1 = fresh demo data at every restart
+DEMO_RESET_ON_START=1             # fresh demo data at every restart (default)
 ```
+
+Keep `DEMO_RESET_ON_START=1` for a public demo. Every visitor shares one
+session, and some of what they do is saved: workouts they log through chat,
+and personal details they tell the coach ("I'm 45 and weigh 90 kg" becomes
+*the* user's age and weight for everyone after them). A reset on every start,
+plus the nightly restart in **12**, wipes all of that back to the synthetic
+data. Set it to `0` only if you want visitors' changes to accumulate.
 
 **Optional password for the whole site.** Generate a hash (this downloads the
 Caddy image the first time):
@@ -459,25 +466,34 @@ docker compose up -d --build
 docker image prune -f
 ```
 
-Your data volume is kept across updates. If an update changes the research
-corpus and you want the new index (or simply a clean demo), reset the demo
-data as below.
+With `DEMO_RESET_ON_START=1` (the default) an update also resets the demo to
+fresh synthetic data and the research index from the new image.
 
-**Reset the demo to fresh synthetic data**
+**Reset the demo every night**
 
-Run this once:
-
-```bash
-DEMO_RESET_ON_START=1 docker compose up -d --force-recreate app
-```
-
-Then put the app back to normal, so later restarts keep their data:
+A restart re-runs the start-up reset, so a nightly restart wipes whatever
+visitors logged or told the coach that day. Add it to your user's crontab
+(this one runs at 04:00 server time, which is UTC on Oracle's images):
 
 ```bash
-docker compose up -d --force-recreate app
+(crontab -l 2>/dev/null; echo "0 4 * * * cd $HOME/FitNotes-Agentic-AI-Coach && /usr/bin/docker compose restart app >> $HOME/demo-reset.log 2>&1") | crontab -
 ```
 
-Alternatively, set `DEMO_RESET_ON_START=1` in `.env` to reset at every restart.
+Check it's there:
+
+```bash
+crontab -l
+```
+
+The next morning, `docker compose logs app | grep prepare` shows
+`[prepare] DEMO_MODE: seeding synthetic demo data (DEMO_RESET_ON_START=1)`.
+The app is unavailable for the minute or two it takes to start again.
+
+**Reset the demo right now**
+
+```bash
+docker compose restart app
+```
 
 **Back up the data volume**
 
