@@ -332,7 +332,10 @@
 
 <script>
 // ── Helpers ──────────────────────────────────────────────────────────────────
-const API = 'http://localhost:8000';
+// Same origin as this page — frontend/server.py proxies these to the backend
+// on localhost:8000, so a remote browser (e.g. through a Cloudflare tunnel
+// that only exposes this port) never needs a route to that other port.
+const API = '';
 let busy = false;
 let lastQuestion = null;
 let autoRetryTimer = null;

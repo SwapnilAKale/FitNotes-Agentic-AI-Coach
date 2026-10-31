@@ -7,13 +7,13 @@ import json
 import os
 import sqlite3
 import sys
-import urllib.request
 import webbrowser
 from pathlib import Path
 
+import httpx
 import uvicorn
-from fastapi import FastAPI, File, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import FileResponse, JSONResponse, Response
 
 FRONTEND_DIR = Path(__file__).parent
 REPO_ROOT = FRONTEND_DIR.parent
@@ -303,35 +303,52 @@ async def ontology_review(request: Request):
     return JSONResponse(content={"status": "saved", "total": len(rows), "cuts": cuts})
 
 
-@app.post("/upload")
-async def upload(file: UploadFile = File(...)):
-    if not (file.filename or "").endswith(".fitnotes"):
-        return JSONResponse(
-            status_code=400,
-            content={"status": "error", "detail": "Only .fitnotes files are accepted"},
-        )
+# ── Reverse proxy to the backend ────────────────────────────────────────────
+# index.html calls relative paths (/chat, /upload, /confirm, ...) on this same
+# origin, never http://localhost:8000 directly — a browser reaching this page
+# through a tunnel that only exposes this port has no route to that other
+# port. Every request that isn't one of the frontend's own routes above is
+# forwarded to the real backend, on this machine, over plain localhost.
+BACKEND_URL = "http://localhost:8000"
+_HOP_BY_HOP = {
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailers", "transfer-encoding", "upgrade", "content-length", "host",
+    # Starlette generates its own date/server headers on the outgoing
+    # Response; forwarding the backend's copies too would duplicate them.
+    "date", "server",
+}
+_http_client: httpx.AsyncClient | None = None
+
+
+@app.on_event("startup")
+async def _open_backend_client():
+    global _http_client
+    _http_client = httpx.AsyncClient(base_url=BACKEND_URL, timeout=300.0)
+
+
+@app.on_event("shutdown")
+async def _close_backend_client():
+    if _http_client is not None:
+        await _http_client.aclose()
+
+
+@app.api_route("/{path:path}", methods=["GET", "POST"])
+async def proxy_to_backend(path: str, request: Request):
+    body = await request.body()
+    headers = {k: v for k, v in request.headers.items()
+               if k.lower() not in _HOP_BY_HOP}
     try:
-        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-        DB_PATH.write_bytes(await file.read())
-    except Exception as exc:
-        return JSONResponse(
-            status_code=500,
-            content={"status": "error", "detail": str(exc)},
+        resp = await _http_client.request(
+            request.method, f"/{path}", params=request.query_params,
+            content=body, headers=headers,
         )
-
-    async def _notify_reload() -> None:
-        def _call():
-            urllib.request.urlopen(
-                urllib.request.Request("http://localhost:8000/reload-db", method="POST"),
-                timeout=3,
-            )
-        try:
-            await asyncio.to_thread(_call)
-        except Exception:
-            pass
-
-    await _notify_reload()
-    return JSONResponse(content={"status": "success"})
+    except httpx.ConnectError:
+        return JSONResponse(status_code=502,
+                            content={"detail": "Backend (port 8000) unreachable"})
+    out_headers = {k: v for k, v in resp.headers.items()
+                   if k.lower() not in _HOP_BY_HOP}
+    return Response(content=resp.content, status_code=resp.status_code,
+                    headers=out_headers)
 
 
 if __name__ == "__main__":
