@@ -12,6 +12,10 @@ framework — and then deliberately converted to LangGraph once the problems tho
 abstractions solve had actually been hit. Both versions are preserved as
 branches, which is the point: the diff between them is the lesson.
 
+**Try it live:** <https://130-210-14-28.sslip.io>. It's a public demo on
+synthetic data, with no install or sign-up; see [Live demo](#live-demo) for
+what to expect.
+
 | Branch | What it is |
 |---|---|
 | `main` | stable baseline |
@@ -19,11 +23,13 @@ branches, which is the point: the diff between them is the lesson.
 | `Multi-Agent-System` | **current** — LangGraph orchestration, Coordinator / Data Agent / Analysis Agent, muscle ontology, request decomposition |
 
 **Scale:** 36 source modules, 27 MCP tools, a 39-muscle ontology over 175
-curated exercise→muscle edges, and **1,533 tests**.
+curated exercise→muscle edges, and **2,056 tests**.
 
 ---
 
 ## Live demo
+
+**<https://130-210-14-28.sslip.io>**
 
 There's a public demo you can try in the browser with no install. It runs
 from this repo's Docker setup on a free Oracle Cloud ARM VM (see
@@ -37,8 +43,12 @@ from this repo's Docker setup on a free Oracle Cloud ARM VM (see
   same browser continues it; it's deleted after 30 days without a question.
 - **Nothing you do changes the demo data.** You can ask to log a workout or
   edit a set and see the confirmation panel, but the demo doesn't save
-  changes. Visitors' questions are answered one at a time, so if someone
-  else is using it you're asked to try again in a minute.
+  changes.
+- **One question at a time.** The coach answers one visitor's question at a
+  time. If someone else is being answered, you're asked to try again in a
+  minute. An answer that is still unfinished after 5 minutes, which normally
+  only happens when a Gemini request never comes back, is stopped, and you're
+  asked to ask again.
 - **Some features are off.** Uploading a database or articles, clearing logs
   and changing settings return a "turned off in the demo" message. Each
   visitor also gets a small number of questions per minute and per day, which
@@ -298,7 +308,7 @@ The 3D ontology viewer is at `http://localhost:3000/graph`.
 
 ```bash
 python -m src.data_agent 90 "Lat Pulldown" "Deadlift"   # Data Agent standalone
-python -m pytest                                        # 1,533 tests
+python -m pytest                                        # 2,056 tests
 ```
 
 ---
@@ -342,7 +352,7 @@ python -m pytest                                        # 1,533 tests
 ├── ontology/                  # muscles, exercises, edges, aliases (CSV)
 ├── frontend/                  # index.html (chat), graph.html (3D), body/, vendor/
 ├── docs/                      # routing-rules, data_agent_spec, changelog
-├── tests/                     # 76 files, 1,533 tests
+├── tests/                     # 87 files, 2,056 tests
 ├── evals/  scripts/  corpus/
 ├── server.py                  # FastAPI web server
 └── cli.py                     # async CLI
@@ -372,7 +382,7 @@ package answers them deterministically. There is one read path, not two. The
 ## Testing
 
 ```bash
-python -m pytest                    # 1,533 tests
+python -m pytest                    # 2,056 tests
 python evals/run_evals.py           # SQL correctness + LLM-as-judge
 python evals/stress_test.py         # adversarial suite
 ```
@@ -464,6 +474,11 @@ first approach was tried:
   say no.
 - **Deterministic guards enforce what citations cannot.** A citation proves
   which field was read, never what the sentence means.
+- **One agent, many private chats.** The demo VM has 1 CPU, too small for one
+  agent per visitor. So the expensive parts (models, search index, tool
+  server) load once, and each visitor's conversation is swapped in around
+  their turn and saved back afterwards. Writes are refused at four layers,
+  from the server down to the database connection.
 - **Build from scratch, then adopt the framework.** The hand-built ReAct loop
   came first; the LangGraph conversion came after, so the framework's design
   decisions were legible rather than magic. Both are on branches.
