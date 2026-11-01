@@ -452,7 +452,7 @@ def build_grounding_context(cited: list, package: dict) -> dict:
 
 
 # ── Citable-field schema (generated FROM the package — never hand-written) ────
-# The live re-check showed the draft model confabulates plausible-but-nonexistent
+# The live re-check showed the draft model invents plausible-but-nonexistent
 # field names (highest_volume, best_e1rm, pct_of_lbs_total) when told the tag
 # FORMAT but not the real field SCHEMA. build_citable_schema derives the allowed
 # (collection, field-path) leaves FROM the actual package, so it is always in

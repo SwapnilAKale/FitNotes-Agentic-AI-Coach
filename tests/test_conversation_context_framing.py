@@ -4,7 +4,7 @@ tests/test_conversation_context_framing.py — #27 prompt half.
 The analysis agent receives recent conversation history as background. It must
 be framed as continuity ONLY, so the draft never volunteers a data-availability
 disclaimer about an exercise the current question does not ask about (the "I only
-have Sumo Squats data, please update your Bench Press data" confabulation).
+have Sumo Squats data, please update your Bench Press data" fabrication).
 """
 
 import os

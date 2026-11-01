@@ -35,7 +35,7 @@ _MD_PARTS = (r"function esc\(s\)[\s\S]*?\n\}", r"const _ROW_RE[\s\S]*?\n  \}\n\}
 # Stubs for everything the functions under test touch. `log` is what the tests read.
 _PRELUDE = r"""
 const API = '';
-let busy = false, lastQuestion = null, autoRetryTimer = null;
+let busy = false, lastQuestion = null, autoRetryTimer = null, demoMode = false;
 let disambigGroups = [{name: 'row', candidates: ['Barbell Row']}];
 const log = {msgs: [], busy: [], thinking: 0, fetches: [], unlockAfterHistory: [],
              disambig: [], confirmPreview: [], rateLimited: 0, welcome: 0};
@@ -66,6 +66,7 @@ function handleRateLimitError(d) { log.rateLimited++; setBusy(false); }
 function handleOverloadError() {}
 function showToast() {}
 function _collectSelections() { return []; }
+function scrollBottom() {}
 function renderResumeNotice(message) { (log.resume = log.resume || []).push(message); }
 function setTimeout(fn) { fn(); }
 const SCRIPT = JSON.parse(process.argv[1]).script;
@@ -93,7 +94,7 @@ def _run(functions: list, call: str, script: dict, setup: str = "") -> dict:
     # every response, demo or not, so leaving it out is a ReferenceError.
     busy_text = re.search(r"const BUSY_TEXT = [^\n]*", src)
     helpers = (busy_text.group(0) if busy_text else "") + "\n" + "\n".join(
-        _fn(src, name) for name in ("isBusy", "demoRefusal")
+        _fn(src, name) for name in ("isBusy", "demoRefusal", "watchQueue", "turnFetch")
         if f"function {name}(" in src)
     code = ("\n".join(re.search(p, src).group(0) for p in _MD_PARTS) + "\n"
             + _PRELUDE + helpers + "\n" + "\n".join(_fn(src, f) for f in functions) + "\n"
@@ -248,3 +249,50 @@ def test_a_normal_answer_is_unchanged():
              setup="document.getElementById('input').value = 'hello';")
     assert _live(r["log"]["msgs"]) == [("user", "hello"), ("agent", "<strong>Done</strong>")]
     assert r["busy"] is False
+
+
+# ── public demo: the queue notice and a full queue ───────────────────────────
+
+_QUEUE_SETUP = r"""
+let created = null;
+const bubble = {appendChild(n) { created = n; }};
+document.querySelector = () => bubble;
+document.createElement = () => ({id: '', className: '', textContent: '',
+                                 remove() { created = null; }});
+const _byId = document.getElementById;
+document.getElementById = id => id === 'queue-note' ? created : _byId(id);
+demoMode = true;
+const timers = [];
+setTimeout = fn => { timers.push(fn); return timers.length; };
+"""
+
+
+def test_queue_notice_follows_the_visitors_position():
+    after = lambda n: (f"A few people are using the demo right now. Your question is "
+                       f"queued and will be answered after {n}.")
+    script = {"/queue-status": [
+        {"body": {"ahead": 2, "text": after("2 others")}},
+        {"body": {"ahead": 1, "text": after("1 other")}},
+        {"body": {"ahead": 0, "text": None}}]}
+    call = """(async () => {
+      const stop = watchQueue(); const seen = [];
+      for (let i = 0; i < 3; i++) { await timers.shift()(); seen.push(created && created.textContent); }
+      stop(); return seen; })()"""
+    r = _run([], call, script, setup=_QUEUE_SETUP)
+    assert r["result"] == [after("2 others"), after("1 other"), None]
+
+
+def test_no_queue_polling_outside_the_demo():
+    r = _run([], "(async () => { const stop = watchQueue(); stop(); return timers.length; })()",
+             {}, setup=_QUEUE_SETUP.replace("demoMode = true;", "demoMode = false;"))
+    assert r["result"] == 0 and r["log"]["fetches"] == []
+
+
+def test_a_full_demo_queue_is_said_plainly_and_keeps_the_text():
+    full = "The demo is full right now. Please try again in a few minutes."
+    script = {"/chat": [{"status": 429, "body": {"error": "demo_full", "type": "error",
+                                                 "text": full}}]}
+    r = _run(["sendMessage"], "sendMessage()", script,
+             setup="document.getElementById('input').value = 'hello';")
+    assert _live(r["log"]["msgs"]) == [("error", full)]       # the bubble taken back
+    assert r["input"] == "hello" and r["busy"] is False

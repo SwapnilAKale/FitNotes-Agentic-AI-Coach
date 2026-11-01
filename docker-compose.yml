@@ -19,17 +19,22 @@ services:
       GEMINI_API_KEY: ${GEMINI_API_KEY:?Set GEMINI_API_KEY in .env}
       # Public demo: synthetic data, write/upload endpoints off, per-IP limits.
       DEMO_MODE: ${DEMO_MODE:-1}
-      DEMO_RESET_ON_START: ${DEMO_RESET_ON_START:-1}   # wipe visitors' changes on every start
+      DEMO_RESET_ON_START: ${DEMO_RESET_ON_START:-1}   # fresh synthetic data on every start
       DEMO_RATE_LIMIT_PER_MINUTE: ${DEMO_RATE_LIMIT_PER_MINUTE:-3}
       DEMO_RATE_LIMIT_PER_DAY: ${DEMO_RATE_LIMIT_PER_DAY:-30}
       DEMO_RATE_LIMIT_GLOBAL_PER_DAY: ${DEMO_RATE_LIMIT_GLOBAL_PER_DAY:-0}
+      # One private conversation per visitor (data/visitor_sessions/, kept across resets).
+      DEMO_SESSION_TTL_DAYS: ${DEMO_SESSION_TTL_DAYS:-30}
+      DEMO_MAX_SESSIONS: ${DEMO_MAX_SESSIONS:-5000}
+      DEMO_SESSIONS_MAX_MB: ${DEMO_SESSIONS_MAX_MB:-200}
+      DEMO_SESSION_MAX_KB: ${DEMO_SESSION_MAX_KB:-256}
+      DEMO_MAX_QUEUED_TURNS: ${DEMO_MAX_QUEUED_TURNS:-4}
       # Container plumbing — not meant to be changed.
-      CONFAB_ENABLED: "0"           # read-aloud service exists only on the dev PC
       OPEN_BROWSER: "0"
       BACKEND_HOST: 127.0.0.1
       FRONTEND_PROXY_TIMEOUT: "900" # agent turns can take minutes
     volumes:
-      - app-data:/app/data          # workout DB, Chroma index, memory, settings
+      - app-data:/app/data          # workout DB, Chroma index, memory, settings, visitors' chats
     expose:
       - "3000"
     healthcheck:

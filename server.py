@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import copy
 import datetime
 import hashlib
 import json
@@ -18,6 +19,7 @@ from fastapi import FastAPI, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from types import SimpleNamespace
 
 load_dotenv()
 
@@ -36,7 +38,8 @@ from src.coordinator import Coordinator, MSG_VERIFY_RESTATE, format_verify_fail_
 from src import checkpoint as _ckpt
 from src import settings, wal
 from src import demo_mode
-import confab
+from src import memory as _memory
+from src import visitor_sessions as _vs
 
 DB_PATH = os.environ.get("FITNOTES_DB_PATH", "./data/FitNotes_Backup.fitnotes")
 FRONTEND_SERVER = Path(__file__).parent / "frontend" / "server.py"
@@ -340,7 +343,7 @@ GATED_TOOLS = EXECUTE_TOOLS | DIRECT_WRITE_TOOLS
 # events that shared one return value: the agent read the deferral as a refusal
 # and recorded "the write action was cancelled, do not retry" in its history,
 # which nothing ever corrected once the write went through on confirm.
-from src.agent import CONFIRM_DEFERRED  # noqa: E402
+from src.agent import CONFIRM_DEFERRED, SHARED_WRITE_TOOLS  # noqa: E402
 # The panel text for a direct write. Imported from the MCP module so the
 # rendering lives beside the other confirm-panel renderers rather than being a
 # second, drifting copy in the server.
@@ -372,6 +375,15 @@ _state: dict = {
 session: AgentSession | None = None
 coordinator: Coordinator | None = None
 agent_lock: asyncio.Lock | None = None
+
+# ── Public demo: one private conversation per visitor (src/visitor_sessions.py)
+# The per-conversation part of _state, as a fresh visitor starts. The upload
+# keys are not a conversation's (uploads are off in the demo anyway).
+_STATE_DEFAULTS: dict = {k: copy.deepcopy(v) for k, v in _state.items()
+                         if not k.startswith("pending_upload")}
+_visitor_store: "_vs.SessionStore | None" = None
+_turn_queue = _vs.TurnQueue()
+_HOUSEKEEPING_SECONDS = 3600
 
 
 async def _confirmation_handler(tool_name: str, arguments: dict):
@@ -419,11 +431,22 @@ async def _confirmation_handler(tool_name: str, arguments: dict):
     return True
 
 
+def _new_agent_session() -> AgentSession:
+    s = AgentSession(DB_PATH, debug=DEBUG)
+    s.confirmation_handler = _confirmation_handler
+    if demo_mode.enabled():
+        # Each visitor's memory lives in their session record; nothing a
+        # visitor does may change the shared stores. Off (defaults) locally.
+        s.memory_in_process = True
+        s.read_only_tools = SHARED_WRITE_TOOLS
+        s.auto_extract_memories = False
+    return s
+
+
 async def _initialize_in_background() -> None:
     global session, agent_ready, coordinator
     try:
-        session = AgentSession(DB_PATH, debug=DEBUG)
-        session.confirmation_handler = _confirmation_handler
+        session = _new_agent_session()
         await session.initialize()
         coordinator = Coordinator(session)
         agent_ready = True
@@ -435,8 +458,13 @@ async def _initialize_in_background() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global agent_lock
+    global agent_lock, _visitor_store
     agent_lock = asyncio.Lock()
+
+    housekeeping_task = None
+    if demo_mode.enabled():
+        _visitor_store = _vs.SessionStore()
+        housekeeping_task = asyncio.create_task(_visitor_housekeeping_loop())
 
     # Kick off agent initialization without blocking server startup
     asyncio.create_task(_initialize_in_background())
@@ -457,6 +485,8 @@ async def lifespan(app: FastAPI):
 
     global agent_ready
     agent_ready = False
+    if housekeeping_task is not None:
+        housekeeping_task.cancel()
     if frontend_proc is not None:
         try:
             frontend_proc.terminate()
@@ -471,6 +501,26 @@ async def lifespan(app: FastAPI):
             # "exit cancel scope in a different task" error should no longer fire.
             # If something still does, surface it instead of hiding it.
             print(f"[Server] Error during agent shutdown: {exc}", file=sys.stderr)
+    if _visitor_store is not None:
+        _visitor_store.close()
+        _visitor_store = None
+
+
+async def _visitor_housekeeping_loop() -> None:
+    """Expiry sweep + caps: once at startup, then hourly. Never evicts a
+    visitor whose turn is queued or running."""
+    while True:
+        try:
+            if _visitor_store is not None:
+                expired, evicted = _visitor_store.housekeeping(
+                    protect=_turn_queue.active())
+                if expired or evicted:
+                    print(f"[Server] visitor sessions: {expired} expired, "
+                          f"{evicted} evicted", file=sys.stderr)
+        except Exception as exc:
+            print(f"[Server] visitor-session housekeeping failed: {exc}",
+                  file=sys.stderr)
+        await asyncio.sleep(_HOUSEKEEPING_SECONDS)
 
 
 app = FastAPI(lifespan=lifespan)
@@ -495,7 +545,22 @@ async def _demo_mode_gates(request: Request, call_next):
     if refusal is not None:
         status_code, body, headers = refusal
         return JSONResponse(status_code=status_code, content=body, headers=headers)
-    return await call_next(request)
+    if not demo_mode.enabled():
+        return await call_next(request)
+    # Public demo: each browser gets its own random session id in a cookie,
+    # sent automatically with every same-origin request. HttpOnly, so page
+    # scripts never see it. Refreshed on every response, so it outlives the
+    # server-side TTL only while the visitor keeps coming back.
+    sid = request.cookies.get(_vs.COOKIE_NAME)
+    if not _vs.valid_sid(sid):
+        sid = _vs.new_sid()
+    request.state.sid = sid
+    response = await call_next(request)
+    response.set_cookie(
+        _vs.COOKIE_NAME, sid, max_age=_vs.ttl_days() * 86400, path="/",
+        httponly=True, samesite="lax",
+        secure=request.headers.get("x-forwarded-proto", "").lower() == "https")
+    return response
 
 
 class ChatRequest(BaseModel):
@@ -585,21 +650,59 @@ async def status():
     })
 
 
+def _store() -> "_vs.SessionStore":
+    """The visitor-session store, opened on first use if start-up hasn't."""
+    global _visitor_store
+    if _visitor_store is None:
+        _visitor_store = _vs.SessionStore()
+    return _visitor_store
+
+
+def _demo_sid(request: Request | None) -> str | None:
+    """The visitor's session id in the public demo; None means the single
+    global conversation (DEMO_MODE off, or a direct call from a test)."""
+    if request is None or not demo_mode.enabled():
+        return None
+    return getattr(request.state, "sid", None)
+
+
+def _visitor_state(sid: str) -> dict:
+    """A visitor's stored state, normalized (blank for a new visitor). For
+    display: a pending entry with no turn behind it is shown as interrupted."""
+    raw = _store().load(sid)
+    state = _vs.normalize(raw, _STATE_DEFAULTS)
+    if not _turn_queue.is_active(sid):
+        _vs.settle_stale_pending(state["agent"]["chat_history"])
+    return state
+
+
 @app.get("/history")
-async def history():
+async def history(request: Request = None):
+    sid = _demo_sid(request)
+    if sid is not None:
+        return JSONResponse(content={
+            "history": _visitor_state(sid)["agent"]["chat_history"]})
     return JSONResponse(content={"history": session.chat_history if session else []})
 
 
-@app.get("/checkpoint-status")
-async def checkpoint_status():
-    """Debug view of the checkpoint slot — never returns the draft text."""
-    from src.checkpoint import load_checkpoint
-    cp = load_checkpoint()
+@app.get("/queue-status")
+async def queue_status(request: Request = None):
+    """Where this visitor's turn is in the demo's queue. `ahead` 0 = running,
+    null = nothing queued. The page polls this while a request is out."""
+    sid = _demo_sid(request)
+    ahead = _turn_queue.ahead(sid) if sid is not None else None
+    return JSONResponse(content={
+        "ahead": ahead,
+        "text": _vs.queue_message(ahead) if ahead else None,
+    })
+
+
+def _checkpoint_body(cp: dict | None) -> dict:
     if cp is None:
-        return JSONResponse(content={"exists": False})
+        return {"exists": False}
     draft = cp.get("draft")
     msgs  = cp.get("messages")
-    return JSONResponse(content={
+    return {
         "exists":          True,
         "created":         cp.get("created"),
         "route":           cp.get("route"),
@@ -609,7 +712,18 @@ async def checkpoint_status():
         "has_draft":       bool(draft),
         "draft_chars":     len(draft) if draft else 0,
         "message_count":   len(msgs) if msgs else 0,
-    })
+    }
+
+
+@app.get("/checkpoint-status")
+async def checkpoint_status(request: Request = None):
+    """Debug view of the checkpoint slot — never returns the draft text."""
+    sid = _demo_sid(request)
+    if sid is not None:
+        return JSONResponse(content=_checkpoint_body(
+            _visitor_state(sid)["checkpoint"]))
+    from src.checkpoint import load_checkpoint
+    return JSONResponse(content=_checkpoint_body(load_checkpoint()))
 
 
 # ── Chat history: every accepted turn, recorded the moment it starts ─────────
@@ -667,6 +781,142 @@ def _history_end(entry: dict | None, response: JSONResponse | None) -> None:
             entry["resumable"] = True      # a reloaded page offers Resume again
         return
     entry["text"] = body.get("text", "")
+
+
+# ── Public demo: swap one visitor's conversation in and out of the agent ─────
+
+def _read_raw_checkpoint() -> dict | None:
+    try:
+        with open(_ckpt._path(), encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+
+
+async def _discard_mcp_staged() -> None:
+    # The staged-write slot lives in the MCP subprocess and is shared. Emptied
+    # at every swap, so no visitor's staged batch can surface in another's
+    # panel. (The demo never executes it, so nothing is lost.)
+    try:
+        await session.call_tool("discard_staged_writes", {})
+    except Exception as exc:
+        print(f"[server] discard_staged_writes (visitor swap) failed: {exc}",
+              file=sys.stderr)
+
+
+async def _swap_in(state: dict) -> None:
+    await _discard_mcp_staged()
+    _vs.restore(state, session, coordinator, _state)
+    if state.get("checkpoint"):
+        _ckpt._write(state["checkpoint"])
+    else:
+        _ckpt.clear_checkpoint()
+    _memory.set_overlay(copy.deepcopy(state["memory"]))
+
+
+async def _swap_out() -> dict:
+    state = _vs.capture(session, coordinator, _state, _STATE_DEFAULTS)
+    state["checkpoint"] = _read_raw_checkpoint()
+    state["memory"] = copy.deepcopy(_memory.get_overlay() or _vs.blank_memory())
+    # Leave the live objects blank, so nothing between turns can read the
+    # last visitor's conversation.
+    _vs.restore(_vs.blank_state(_STATE_DEFAULTS), session, coordinator, _state)
+    _ckpt.clear_checkpoint()
+    _memory.set_overlay(None)
+    await _discard_mcp_staged()
+    return state
+
+
+async def _demo_turn(sid: str, run, user_text: str | None = None) -> JSONResponse:
+    """
+    Run one turn for one visitor. Visitors queue in arrival order (no busy
+    refusals between visitors); a visitor already queued or running gets the
+    usual 429 busy; a full queue gets `demo_full`. The prompt is recorded the
+    moment the turn is accepted, so a reload while queued shows it. `run` is
+    the same coroutine the single-user path uses, run with this visitor's
+    state loaded.
+    """
+    if not agent_ready:
+        return JSONResponse(
+            status_code=503,
+            content={"type": "not_ready", "text": "Still initializing. Please wait a moment."},
+        )
+    if user_text is None and not _store().exists(sid):
+        # A button (/confirm, /resume, /disambiguate) from a visitor who has
+        # never asked anything has nothing to act on — and must not create a
+        # session row (only /chat, which is rate limited, creates them).
+        return JSONResponse(content={"type": "answer",
+                                     "text": "There's nothing to continue right now."})
+    try:
+        ticket = _turn_queue.enter(sid, _vs.max_queued_turns())
+    except _vs.AlreadyActive:
+        return JSONResponse(status_code=429,
+                            content={"error": "Agent is busy, please wait"})
+    except _vs.QueueFull:
+        return JSONResponse(status_code=429, content={
+            "error": "demo_full", "type": "error",
+            "text": _vs.FULL_TEXT, "message": _vs.FULL_TEXT})
+    swapped = False
+    try:
+        state = _vs.normalize(_store().load(sid), _STATE_DEFAULTS)
+        hist = state["agent"]["chat_history"]
+        _vs.settle_stale_pending(hist)
+        now = datetime.datetime.now().isoformat()
+        if user_text:
+            hist.append({"role": "user", "text": user_text, "timestamp": now})
+        hist.append({"role": "assistant", "text": "", "pending": True, "timestamp": now})
+        _store().save(sid, state, prompted=True, protect=_turn_queue.active())
+
+        await _turn_queue.wait(sid, ticket)
+
+        state = _vs.normalize(_store().load(sid), _STATE_DEFAULTS)
+        await _swap_in(state)
+        swapped = True
+        entry = next((m for m in reversed(session.chat_history)
+                      if m.get("pending")), None)
+        try:
+            response = await run()
+        except BaseException:
+            _history_end(entry, None)
+            raise
+        _history_end(entry, response)
+        return response
+    finally:
+        try:
+            if swapped:
+                _store().save(sid, await _swap_out(),
+                                    protect=_turn_queue.active())
+        finally:
+            _turn_queue.release(sid)
+
+
+async def _run_demo_confirm(body: "ConfirmRequest") -> JSONResponse:
+    """/confirm in the public demo: the panel works as usual, but a confirmed
+    write is never executed — the visitor is told nothing was saved. Cancel
+    takes the ordinary path (it writes nothing)."""
+    if not body.confirmed:
+        return await _run_confirm(body)
+    async with agent_lock:
+        had_panel = bool(_state["pending_execute_kind"] or _state["panel"])
+        _state["pending_confirmation"] = False
+        _state["pending_execute_kind"] = None
+        _state["panel"] = None
+        _state["allow_execute"] = False
+        await _discard_mcp_staged()
+        _ckpt.clear_staged_checkpoint()
+        if coordinator is not None:
+            coordinator._pending_log_carry = False
+        if had_panel:
+            # The agent staged it and would otherwise go on believing it is
+            # pending, or that it was saved.
+            session._save_exchange([{"role": "user", "content": (
+                "[demo] The user confirmed, but this public demo does not save "
+                "changes: nothing was written to the database, and the staging "
+                "area is now empty.")}], 0)
+        return JSONResponse(content={
+            "type": "answer",
+            "text": _with_decomposed_answer(_vs.DEMO_NOT_SAVED_TEXT),
+        })
 
 
 async def _process_turn(message: str = "", *,
@@ -1003,66 +1253,90 @@ async def _run_turn(message: str, disambiguate_selections: list | None) -> JSONR
 
 
 @app.post("/chat")
-async def chat(body: ChatRequest):
-    # Confab (read-aloud) runs only on the developer's PC; CONFAB_ENABLED=0
-    # (set by docker-compose.yml) skips it entirely. Default on.
-    use_confab = demo_mode.confab_enabled()
-    if use_confab:
-        t = confab.turn(body.message, agent="fitnotes-coach")             # line 1: message arrived
-    response = await _process_turn(body.message)
-    if use_confab:
-        confab.speak(json.loads(response.body).get("text", ""),          # line 2: answer ready
-                     agent="fitnotes-coach", turn_id=t["turnId"])
-    return response
+async def chat(body: ChatRequest, request: Request = None):
+    sid = _demo_sid(request)
+    if sid is not None:
+        return await _demo_turn(sid, lambda: _run_turn(body.message, None),
+                                user_text=body.message)
+    return await _process_turn(body.message)
 
 
 @app.post("/resume")
-async def resume():
+async def resume(request: Request = None):
     # The "Resume" button calls this. Reuse the Coordinator's continue-intent
     # path: load the slot → _resume, or the nothing-to-resume notice if empty.
+    sid = _demo_sid(request)
+    if sid is not None:
+        return await _demo_turn(sid, lambda: _run_turn("continue", None))
     return await _process_turn("continue", record_prompt=False)
 
 
 @app.post("/disambiguate")
-async def disambiguate(body: DisambiguateRequest):
+async def disambiguate(body: DisambiguateRequest, request: Request = None):
     # The disambiguation panel's Submit. Resolve the pending slot with the
     # user's structured picks and resume the whole turn — shares _process_turn's
     # write-path tail, so a resolved write lands on the same confirm panel.
-    return await _process_turn(
-        disambiguate_selections=[s.model_dump() for s in body.selections])
+    selections = [s.model_dump() for s in body.selections]
+    sid = _demo_sid(request)
+    if sid is not None:
+        return await _demo_turn(sid, lambda: _run_turn("", selections))
+    return await _process_turn(disambiguate_selections=selections)
+
+
+_CANCELLED_TEXT = "Okay — I've set that aside. What would you like to do?"
 
 
 @app.post("/disambiguate/cancel")
-async def disambiguate_cancel():
+async def disambiguate_cancel(request: Request = None):
     # The panel's Cancel: drop the pending slot + the /log carry, return to chat.
+    sid = _demo_sid(request)
+    if sid is not None:
+        # Not a turn: edit the visitor's stored state directly (their state is
+        # only in the store while no turn of theirs is queued or running).
+        if _turn_queue.is_active(sid):
+            return JSONResponse(status_code=429,
+                                content={"error": "Agent is busy, please wait"})
+        raw = _store().load(sid)
+        if raw is not None:
+            state = _vs.normalize(raw, _STATE_DEFAULTS)
+            state["coordinator"]["_pending_decomposition"] = None
+            state["coordinator"]["_pending_log_carry"] = False
+            _store().save(sid, state)
+        return JSONResponse(content={"type": "answer", "text": _CANCELLED_TEXT})
     if coordinator is None:
         return JSONResponse(status_code=503,
                             content={"type": "not_ready",
                                      "text": "Still initializing."})
     coordinator.cancel_disambiguation()
-    return JSONResponse(content={
-        "type": "answer",
-        "text": "Okay — I've set that aside. What would you like to do?"})
+    return JSONResponse(content={"type": "answer", "text": _CANCELLED_TEXT})
 
 
 @app.get("/pending-disambiguation")
-async def pending_disambiguation():
+async def pending_disambiguation(request: Request = None):
     # Reload persistence: the frontend calls this on load to re-render the panel
     # if a slot is still live (server-memory state survives a page reload; a
     # server stop wipes it → null → chatbox). Read-only, no lock needed.
+    sid = _demo_sid(request)
+    if sid is not None:
+        slot = _visitor_state(sid)["coordinator"]["_pending_decomposition"]
+        payload = Coordinator._disambiguation_payload(
+            SimpleNamespace(_pending_decomposition=slot))
+        return JSONResponse(content={"groups": payload["groups"] if payload else None})
     payload = (coordinator._disambiguation_payload()
                if coordinator is not None else None)
     return JSONResponse(content={"groups": payload["groups"] if payload else None})
 
 
 @app.get("/pending-confirmation")
-async def pending_confirmation():
+async def pending_confirmation(request: Request = None):
     # Reload persistence for the confirmation panel, the twin of
     # /pending-disambiguation. A staged write waiting for the user survives a
     # page reload server-side; without this the page lost its Confirm/Cancel
     # buttons and showed a "staged" message nobody could act on. Read-only.
-    panel = _state.get("panel")
-    if _state.get("pending_execute_kind") and panel:
+    sid = _demo_sid(request)
+    st = _visitor_state(sid)["server"] if sid is not None else _state
+    panel = st.get("panel")
+    if st.get("pending_execute_kind") and panel:
         return JSONResponse(content=dict(panel))
     return JSONResponse(content={})
 
@@ -1148,7 +1422,11 @@ async def _commit_staged_sibling():
 
 
 @app.post("/confirm")
-async def confirm(body: ConfirmRequest):
+async def confirm(body: ConfirmRequest, request: Request = None):
+    sid = _demo_sid(request)
+    if sid is not None:
+        # The public demo never executes a write (see _run_demo_confirm).
+        return await _demo_turn(sid, lambda: _run_demo_confirm(body))
     # /confirm is the request that actually executes staged DB writes —
     # it must never run while upload+replay is replacing the DB file.
     if _upload_lock.locked():
@@ -1314,8 +1592,7 @@ async def _reinitialize_session():
         session = None
 
     try:
-        session = AgentSession(DB_PATH, debug=DEBUG)
-        session.confirmation_handler = _confirmation_handler
+        session = _new_agent_session()
         await session.initialize()
         coordinator = Coordinator(session)
         agent_ready = True

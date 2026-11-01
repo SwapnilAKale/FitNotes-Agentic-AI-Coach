@@ -2,10 +2,13 @@
 Public-demo safety gates. Inert unless DEMO_MODE=1.
 
 When the app is hosted as a shared public demo (see DEPLOY.md), every visitor
-talks to ONE session over ONE synthetic database. Two things must hold then:
+has their own conversation (src/visitor_sessions.py) over ONE shared,
+read-only synthetic database. Two things must hold here:
 
   1. Nobody can replace, wipe or reconfigure the shared state — the upload,
      wipe and settings endpoints answer 403 with a message the UI shows.
+     (Chat-driven writes are refused by the agent, the tool server and
+     src/db.py; see AgentSession.read_only_tools.)
   2. Nobody can burn the Gemini quota for everyone — the turn-running
      endpoints are rate limited per client IP (in memory; resets on restart).
 
@@ -243,9 +246,3 @@ def open_browser_allowed() -> bool:
     if enabled():
         return False
     return _flag("OPEN_BROWSER", "1")
-
-
-def confab_enabled() -> bool:
-    """CONFAB_ENABLED (default on) — the read-aloud service only exists on the
-    developer's own PC; containers set it to 0 so it is skipped entirely."""
-    return _flag("CONFAB_ENABLED", "1")

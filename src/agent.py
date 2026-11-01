@@ -124,6 +124,19 @@ _OTHER_STORE_WRITE_TOOLS = {
     "delete_user_article",
 }
 
+# Long-term memory tools. In the public demo they run in-process (see
+# AgentSession.memory_in_process) so each visitor's facts stay their own.
+MEMORY_TOOLS = frozenset({"remember_fact", "recall_memories", "forget_fact"})
+
+# Every tool that changes a shared store when it runs: the execute half of each
+# staged write, and the direct writers to the other stores. The public demo
+# refuses these (staging still runs, so the confirmation panel still shows).
+SHARED_WRITE_TOOLS = frozenset(EXECUTE_TOOLS | _OTHER_STORE_WRITE_TOOLS)
+
+DEMO_READ_ONLY_MESSAGE = (
+    "This public demo doesn't save changes, so nothing was written. "
+    "Run your own copy to log your training.")
+
 CONFIRM_TOOLS = DB_WRITE_TOOLS | _OTHER_STORE_WRITE_TOOLS | {
     # The agent may ASK to drop a staged batch when the user says so, but the
     # drop itself still happens only after an explicit confirmation — the same
@@ -366,6 +379,18 @@ class AgentSession:
         self._cache_name: str | None = None
         self._effective_system_prompt: str = SYSTEM_PROMPT
         self._gemini_tools: list | None = None
+        # Public demo (DEMO_MODE=1; set by server.py). All three are inert at
+        # their defaults, so a local single-user run is unchanged.
+        #  memory_in_process: remember/recall/forget run here, through
+        #    src/memory.py's per-visitor overlay, instead of in the MCP
+        #    subprocess, which only knows the shared data/memory.json.
+        #  read_only_tools: refused outright — nothing a visitor does may reach
+        #    the shared DB, user_context.json, the write log or the articles.
+        #  auto_extract_memories: mining facts from the last exchanges at
+        #    close() would mix whichever visitors spoke last.
+        self.memory_in_process: bool = False
+        self.read_only_tools: frozenset = frozenset()
+        self.auto_extract_memories: bool = True
 
     async def initialize(self) -> None:
         if self._memory_only:
@@ -745,7 +770,11 @@ class AgentSession:
     async def call_tool(self, tool_name: str, arguments: dict) -> str:
         if self.debug:
             print(f"[DEBUG] → Tool call: {tool_name}({json.dumps(arguments)})")
-        if self._memory_only:
+        if tool_name in self.read_only_tools:
+            return json.dumps({"success": False, "error": "demo_read_only",
+                               "message": DEMO_READ_ONLY_MESSAGE})
+        if self._memory_only or (self.memory_in_process
+                                 and tool_name in MEMORY_TOOLS):
             return await self._call_memory_tool(tool_name, arguments)
         result = await self._session.call_tool(tool_name, arguments)
         if self.debug:
@@ -1544,10 +1573,11 @@ class AgentSession:
         a second call is a no-op once the owner task is gone. The server creates
         a fresh AgentSession to reload — there is no in-place reopen.
         """
-        try:
-            await self._auto_extract_memories()
-        except Exception:
-            pass
+        if self.auto_extract_memories:
+            try:
+                await self._auto_extract_memories()
+            except Exception:
+                pass
         if self._cache_name:
             try:
                 await asyncio.to_thread(self._client.caches.delete, self._cache_name)

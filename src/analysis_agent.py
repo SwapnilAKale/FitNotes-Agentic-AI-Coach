@@ -888,7 +888,7 @@ def _build_user_message(
 
     # Citable-field schema — generated FROM this exact package (per-scope correct),
     # so the draft can only cite leaves that actually exist. Prevents the model
-    # confabulating plausible-but-nonexistent field names (the Stage-1 YELLOW).
+    # inventing plausible-but-nonexistent field names (the Stage-1 YELLOW).
     try:
         citable_schema = build_citable_schema(package)
     except Exception as e:

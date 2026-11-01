@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 import re
@@ -36,6 +37,26 @@ def _get_chroma_collection():
 
 MEMORY_PATH = Path("data/memory.json")
 MAX_FACTS = 30
+
+# ── Per-visitor overlay (public demo only) ───────────────────────────────────
+# With DEMO_MODE=1 every visitor has their own remembered facts and
+# demographics, kept in their session record (src/visitor_sessions.py). While
+# that visitor's turn runs, the server sets the overlay to their memory dict,
+# and every read/write below goes to it instead of data/memory.json — and the
+# shared Chroma memory collection is skipped, so one visitor's facts can never
+# be retrieved for another. None (always, outside the demo) = memory.json.
+# Turns are serialized, so a module global is enough (no contextvar to lose
+# across LangGraph's executor threads).
+_overlay: dict | None = None
+
+
+def set_overlay(memory: dict | None) -> None:
+    global _overlay
+    _overlay = memory
+
+
+def get_overlay() -> dict | None:
+    return _overlay
 
 # ── Relative-time disambiguation guard ───────────────────────────────────────
 # Stored facts are re-read on later sessions with NO per-fact date attached
@@ -78,6 +99,12 @@ def _strip_as_of(content: str) -> str:
 
 
 def load_memory() -> dict:
+    if _overlay is not None:
+        memory = copy.deepcopy(_overlay)
+        memory.setdefault("facts", [])
+        memory.setdefault("summary", None)
+        memory.setdefault("demographics", {})
+        return memory
     if not MEMORY_PATH.exists():
         return {"facts": [], "last_updated": None, "summary": None,
                 "demographics": {}}
@@ -91,6 +118,10 @@ def load_memory() -> dict:
 
 def save_memory(memory: dict):
     memory["last_updated"] = datetime.now().isoformat()
+    if _overlay is not None:
+        _overlay.clear()
+        _overlay.update(copy.deepcopy(memory))
+        return
     with open(MEMORY_PATH, "w") as f:
         json.dump(memory, f, indent=2)
 
@@ -139,6 +170,8 @@ def add_fact(category: str, content: str,
         memory["summary"] = (existing_summary + " | " + compressed).strip(" |")
 
     save_memory(memory)
+    if _overlay is not None:
+        return {"status": "saved", "fact": fact}
     try:
         embed_and_store_fact(fact)
     except Exception:
@@ -156,6 +189,8 @@ def delete_fact(fact_id: str) -> dict:
     memory["facts"] = [f for f in memory["facts"] if f["id"] != fact_id]
     if len(memory["facts"]) < before:
         save_memory(memory)
+        if _overlay is not None:
+            return {"status": "deleted"}
         try:
             collection = _get_chroma_collection()
             collection.delete(ids=[fact_id])
@@ -301,6 +336,8 @@ def embed_and_store_fact(fact: dict):
 def sync_to_chromadb():
     """Sync all facts in memory.json to ChromaDB.
     Adds missing facts. Removes deleted facts from ChromaDB."""
+    if _overlay is not None:
+        return
     facts = get_all_facts()
     if not facts:
         return
@@ -319,6 +356,12 @@ def sync_to_chromadb():
 
 def retrieve_relevant_memories(question: str, n_results: int = 5) -> list[dict]:
     """Retrieve the most relevant stored memories for a given question."""
+    if _overlay is not None:
+        # A visitor's facts are few (MAX_FACTS) and never embedded: all of
+        # them are "relevant", newest last.
+        return [{"id": f["id"], "content": f["content"],
+                 "category": f.get("category", ""), "distance": 0.0}
+                for f in load_memory().get("facts", [])][-n_results:]
     collection = _get_chroma_collection()
     model = _get_embed_model()
 

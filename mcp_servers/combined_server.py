@@ -558,10 +558,38 @@ async def list_tools() -> list[types.Tool]:
     ]
 
 
+# Public demo (DEMO_MODE=1, inherited from the server's environment): every tool
+# that changes a shared store is refused here too, behind the server's own
+# refusal (AgentSession.read_only_tools) — nothing a visitor does may reach the
+# demo DB, user_context.json, the write log, the articles or memory.json.
+# Staging tools still run (they only fill this process's in-memory slot), so
+# the confirmation panel still shows. Must cover src.agent.SHARED_WRITE_TOOLS
+# (tests/test_visitor_sessions.py checks it).
+_DEMO_REFUSED_TOOLS = frozenset({
+    "execute_staged_workout", "execute_staged_goal",
+    "execute_staged_goal_update", "execute_staged_goal_delete",
+    "execute_staged_set_update", "execute_staged_set_delete",
+    "execute_staged_set_comment",
+    "execute_staged_bodyweight", "execute_staged_bodyweight_delete",
+    "add_exercise_quirk", "update_exercise_quirk", "delete_exercise_quirk",
+    "delete_user_article",
+    "remember_fact", "forget_fact",
+})
+
+
+def _demo_read_only() -> bool:
+    return os.environ.get("DEMO_MODE", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
 @server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
     try:
-        if name == "get_exercise_history":
+        if _demo_read_only() and name in _DEMO_REFUSED_TOOLS:
+            result = json.dumps({
+                "success": False, "error": "demo_read_only",
+                "message": "This public demo doesn't save changes, so nothing "
+                           "was written."})
+        elif name == "get_exercise_history":
             result = await _get_exercise_history(
                 arguments["exercise_name"],
                 int(arguments.get("days", 30)),
