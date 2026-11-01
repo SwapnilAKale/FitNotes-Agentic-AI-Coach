@@ -15,7 +15,8 @@ visitor ──HTTPS──▶ Caddy (ports 80/443, automatic certificate)
                    ├─ UI + same-origin proxy  :3000
                    ├─ API                     127.0.0.1:8000 (never exposed)
                    └─ MCP tool server         (child process)
-                   data volume: workout DB, RAG index, memory, settings
+                   data volume: workout DB, RAG index, memory, settings,
+                                visitors' conversations
 ```
 
 The demo runs with `DEMO_MODE=1`:
@@ -23,8 +24,20 @@ The demo runs with `DEMO_MODE=1`:
 * It uses a **synthetic** workout history (`scripts/make_demo_db.py`), about 12
   weeks of push/pull/legs training by a person who doesn't exist. No real
   personal data is involved.
-* There is **one shared session**. Every visitor talks to the same coach and
-  sees the same chat history.
+* **Each visitor has their own conversation.** The browser gets a random
+  session id in a cookie; the chat history, what the coach remembers, and any
+  pending confirmation or clarification belong to that browser only. Coming
+  back days later (same browser) continues the same chat. A conversation is
+  deleted after `DEMO_SESSION_TTL_DAYS` (default 30) days without a question.
+* **Nothing a visitor does changes the shared demo data.** Asking to log a
+  workout, edit a set or a goal, or add an exercise quirk still shows the
+  confirmation panel, but Confirm only answers that the demo doesn't save
+  changes. Facts the visitor tells the coach ("I'm 45") are remembered for
+  that visitor only.
+* **Visitors take turns.** The coach answers one question at a time. While
+  someone else's question is being answered, a new one waits in a short queue
+  and the page shows its position. When `DEMO_MAX_QUEUED_TURNS` (default 4)
+  are already waiting, the page says the demo is full and to try again later.
 * Uploading a database or articles, clearing logs, changing settings and
   reloading the DB are **turned off** (the server answers 403 and the UI says why).
 * Each visitor IP gets a small **question quota** (3 per minute, 30 per day by
@@ -347,14 +360,27 @@ DEMO_RATE_LIMIT_PER_MINUTE=3      # questions per visitor per minute
 DEMO_RATE_LIMIT_PER_DAY=30        # questions per visitor per day
 DEMO_RATE_LIMIT_GLOBAL_PER_DAY=0  # cap for ALL visitors together (0 = none)
 DEMO_RESET_ON_START=1             # fresh demo data at every restart (default)
+DEMO_SESSION_TTL_DAYS=30          # delete a visitor's chat after N days with no question
+DEMO_MAX_SESSIONS=5000            # most visitor chats kept (least recently used go first)
+DEMO_SESSIONS_MAX_MB=200          # most disk the visitor chats may use (same rule)
+DEMO_SESSION_MAX_KB=256           # one chat's size; its oldest messages are trimmed past it
+DEMO_MAX_QUEUED_TURNS=4           # questions that may wait behind the one being answered
 ```
 
-Keep `DEMO_RESET_ON_START=1` for a public demo. Every visitor shares one
-session, and some of what they do is saved: workouts they log through chat,
-and personal details they tell the coach ("I'm 45 and weigh 90 kg" becomes
-*the* user's age and weight for everyone after them). A reset on every start,
-plus the nightly restart in **12**, wipes all of that back to the synthetic
-data. Set it to `0` only if you want visitors' changes to accumulate.
+**What is shared and what is per visitor.** The synthetic workout database,
+the research index and the models are shared and read-only: no visitor can
+change them. Each visitor's conversation (chat history, what the coach
+remembers about them, a pending confirmation or clarification, an interrupted
+question to resume) is stored per browser in
+`data/visitor_sessions/sessions.sqlite` on the data volume. It survives
+restarts and updates. A conversation is deleted once it has had no question
+for `DEMO_SESSION_TTL_DAYS` days (checked at start-up and every hour). The
+size caps evict the least recently used conversations first, so a bot can't
+fill the disk.
+
+`DEMO_RESET_ON_START=1` (the default) re-generates the synthetic database on
+every start, so its most recent workout is always yesterday. It does **not**
+touch visitors' conversations.
 
 **Optional password for the whole site.** Generate a hash (this downloads the
 Caddy image the first time):
@@ -467,13 +493,18 @@ docker image prune -f
 ```
 
 With `DEMO_RESET_ON_START=1` (the default) an update also resets the demo to
-fresh synthetic data and the research index from the new image.
+fresh synthetic data and the research index from the new image. Visitors'
+conversations are kept.
 
-**Reset the demo every night**
+**Refresh the demo data every night**
 
-A restart re-runs the start-up reset, so a nightly restart wipes whatever
-visitors logged or told the coach that day. Add it to your user's crontab
-(this one runs at 04:00 server time, which is UTC on Oracle's images):
+Visitors can no longer change the shared data, so this is not needed for
+privacy. It keeps the synthetic history current: the generator ends it
+yesterday, and without a restart it slowly ages ("you haven't trained in two
+weeks"). A restart re-runs the start-up reset. Visitors' conversations are
+kept, but a question being answered at that moment is cut off (the visitor
+sees "This answer was interrupted… Please ask again."). Add it to your user's
+crontab (this one runs at 04:00 server time, which is UTC on Oracle's images):
 
 ```bash
 (crontab -l 2>/dev/null; echo "0 4 * * * cd $HOME/FitNotes-Agentic-AI-Coach && /usr/bin/docker compose restart app >> $HOME/demo-reset.log 2>&1") | crontab -
@@ -490,6 +521,16 @@ The next morning, `docker compose logs app | grep prepare` shows
 The app is unavailable for the minute or two it takes to start again.
 
 **Reset the demo right now**
+
+```bash
+docker compose restart app
+```
+
+**Delete every visitor's conversation** (for example, after a bot flood):
+
+```bash
+docker compose exec app rm -f data/visitor_sessions/sessions.sqlite data/visitor_sessions/sessions.sqlite-wal data/visitor_sessions/sessions.sqlite-shm
+```
 
 ```bash
 docker compose restart app
@@ -567,15 +608,17 @@ needed, since Cloud Run terminates HTTPS), but be aware of what this app
 assumes:
 
 * **Ephemeral disk.** `data/` (SQLite DB, Chroma index, memory, chat
-  checkpoints) lives on the container's local disk and is lost whenever an
-  instance is replaced. With `DEMO_MODE=1` it simply re-seeds, which is
+  checkpoints, visitors' conversations) lives on the container's local disk
+  and is lost whenever an instance is replaced. With `DEMO_MODE=1` the demo
+  data simply re-seeds, but visitors lose their conversations, which is
   acceptable for a throwaway demo but not for real data. Don't put the SQLite
   files on a Cloud Storage FUSE mount, because SQLite needs real file locking.
 * **Scale to zero means slow cold starts.** The first request after idling
   waits for Python, PyTorch, the models and the agent to start (often 30–90
   s). `--min-instances=1` avoids that, but it isn't free.
-* **Exactly one instance.** The shared session, its lock and the rate limiter
-  are in memory, so set `--max-instances=1`.
+* **Exactly one instance.** The agent, its turn queue and the rate limiter
+  are in memory, and visitors' conversations are in one SQLite file, so set
+  `--max-instances=1`.
 * **CPU must stay allocated** (`--no-cpu-throttling`). The agent initialises in
   the background after start-up, and Cloud Run otherwise throttles CPU
   outside requests.

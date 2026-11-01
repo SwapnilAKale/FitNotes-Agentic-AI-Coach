@@ -3,6 +3,7 @@
 
 import asyncio
 import csv
+import http.cookiejar
 import json
 import os
 import sqlite3
@@ -333,10 +334,26 @@ _HOP_BY_HOP = {
 _http_client: httpx.AsyncClient | None = None
 
 
+def _no_cookie_jar() -> http.cookiejar.CookieJar:
+    """A jar that never stores anything. The proxy's ONE client is shared by
+    every visitor: with httpx's default jar it would keep the backend's
+    Set-Cookie (the demo's per-visitor session id) and send it on the next
+    request that arrives without a Cookie header — handing a new visitor the
+    previous visitor's conversation. Cookies must travel only in each
+    browser's own request and response headers."""
+    return http.cookiejar.CookieJar(
+        policy=http.cookiejar.DefaultCookiePolicy(allowed_domains=[]))
+
+
+def _make_backend_client(**kwargs) -> httpx.AsyncClient:
+    return httpx.AsyncClient(base_url=BACKEND_URL, timeout=PROXY_TIMEOUT,
+                             cookies=_no_cookie_jar(), **kwargs)
+
+
 @app.on_event("startup")
 async def _open_backend_client():
     global _http_client
-    _http_client = httpx.AsyncClient(base_url=BACKEND_URL, timeout=PROXY_TIMEOUT)
+    _http_client = _make_backend_client()
 
 
 @app.on_event("shutdown")

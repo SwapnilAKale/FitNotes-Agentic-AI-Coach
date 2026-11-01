@@ -9,7 +9,9 @@ Run by deploy/entrypoint.sh before `python server.py`. Idempotent and quick.
     coach cannot cite research.
   * DEMO_MODE=1 and (no workout DB in the volume, or DEMO_RESET_ON_START=1):
     empty the volume and seed it with a freshly generated SYNTHETIC database
-    (scripts/make_demo_db.py) plus default state files.
+    (scripts/make_demo_db.py) plus default state files. Visitors' own
+    conversations (data/visitor_sessions/, src/visitor_sessions.py) are kept:
+    the reset is for the shared base data only.
   * Otherwise (your own deployment, no DB yet): leave it alone and say how to
     add one — upload your FitNotes backup from the UI's attach menu.
 
@@ -72,9 +74,27 @@ def _copy_seed_chroma() -> bool:
     return True
 
 
+def _kept_names() -> set:
+    """Top-level entries of DATA a reset must not delete: .gitkeep and the
+    visitor-session store (its default folder, or wherever
+    DEMO_SESSIONS_PATH puts it inside DATA)."""
+    kept = {".gitkeep", "visitor_sessions"}
+    custom = os.environ.get("DEMO_SESSIONS_PATH")
+    if custom:
+        try:
+            rel = Path(custom).resolve().relative_to(DATA.resolve())
+            kept.add(rel.parts[0])
+            # SQLite's WAL side files sit next to a top-level store file.
+            kept.update({rel.parts[0] + "-wal", rel.parts[0] + "-shm"})
+        except ValueError:
+            pass                      # outside DATA: nothing here to protect
+    return kept
+
+
 def _empty_data_dir() -> None:
+    kept = _kept_names()
     for child in DATA.iterdir():
-        if child.name == ".gitkeep":
+        if child.name in kept:
             continue
         if child.is_dir() and not child.is_symlink():
             shutil.rmtree(child)

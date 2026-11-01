@@ -197,9 +197,7 @@
   <div id="demo-banner"
     class="px-5 py-1.5 text-xs text-amber-200 bg-amber-950/60 border-b border-amber-800/60 flex-shrink-0"
     style="display:none">
-    Public demo &mdash; synthetic training data, and one shared session for every visitor
-    (others may see your messages). Uploads and settings are turned off, and anything
-    logged or told to the coach is wiped back to the demo data regularly.
+    Public demo with synthetic training data. Other visitors can't see your chat.
   </div>
 
   <!-- Initialization banner -->
@@ -346,6 +344,7 @@
 // that only exposes this port) never needs a route to that other port.
 const API = '';
 let busy = false;
+let demoMode = false;     // set from /status; turns on the queue notice
 let lastQuestion = null;
 let autoRetryTimer = null;
 
@@ -568,15 +567,65 @@ function setBusy(b) {
 const BUSY_TEXT = 'Your coach is still answering the previous message — this wasn\'t sent.';
 function isBusy(res, data) {
   const err = (data || {}).error;
-  return res.status === 429 && err !== 'rate_limit' && err !== 'demo_rate_limit';
+  return res.status === 429 && err !== 'rate_limit' && err !== 'demo_rate_limit'
+    && err !== 'demo_full';
 }
 
 // Public demo (DEMO_MODE=1): the server refused because of the per-visitor
 // limit or because the action is turned off. Its text says why.
 function demoRefusal(data) {
   const err = (data || {}).error;
-  return (err === 'demo_rate_limit' || err === 'demo_disabled')
+  return (err === 'demo_rate_limit' || err === 'demo_disabled' || err === 'demo_full')
     ? (data.text || data.message || 'Not available in the public demo.') : null;
+}
+
+// Public demo: visitors' questions are answered one at a time, in order. While
+// a request is out, ask the server where it is in the queue and say so under
+// the "…" bubble; the note goes away once the question is being answered.
+// Returns a function that stops watching.
+function watchQueue() {
+  if (!demoMode) return () => {};
+  let stopped = false;
+  let timer = null;
+  const clear = () => {
+    const note = document.getElementById('queue-note');
+    if (note) note.remove();
+  };
+  const tick = async () => {
+    if (stopped) return;
+    try {
+      const q = await fetch(`${API}/queue-status`).then(r => r.json());
+      if (stopped) return;
+      const bubble = document.querySelector('#thinking-row .bubble-agent');
+      if (q.ahead > 0 && q.text && bubble) {
+        let note = document.getElementById('queue-note');
+        if (!note) {
+          note = document.createElement('div');
+          note.id = 'queue-note';
+          note.className = 'mt-2 text-xs text-gray-400';
+          bubble.appendChild(note);
+          scrollBottom();
+        }
+        note.textContent = q.text;
+      } else {
+        clear();
+      }
+    } catch { /* the request itself reports a lost server */ }
+    if (!stopped) timer = setTimeout(tick, 2000);
+  };
+  timer = setTimeout(tick, 500);
+  return () => { stopped = true; clearTimeout(timer); clear(); };
+}
+
+// fetch() for a request that runs a turn (/chat, /resume, /disambiguate,
+// /confirm): the same call, plus the queue notice while it waits.
+async function turnFetch(url, options) {
+  const stop = watchQueue();
+  try {
+    return await fetch(url, options);
+  } finally {
+    stop();
+  }
 }
 
 // ── Message rendering ─────────────────────────────────────────────────────────
@@ -770,7 +819,7 @@ async function resumeSavedQuestion() {
   setBusy(true);
   addThinking();
   try {
-    const res = await fetch(`${API}/resume`, {
+    const res = await turnFetch(`${API}/resume`, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: '{}',
@@ -859,7 +908,10 @@ async function waitForReady() {
       const res = await fetch(`${API}/status`);
       const data = await res.json();
       failCount = 0;
-      if (data.demo_mode) document.getElementById('demo-banner').style.display = 'block';
+      if (data.demo_mode) {
+        demoMode = true;
+        document.getElementById('demo-banner').style.display = 'block';
+      }
       if (data.ready) break;
     } catch (e) {
       failCount++;
@@ -890,6 +942,7 @@ async function waitForReady() {
   // input locked and follow it until the answer is recorded. Unlocking here used
   // to lose the turn, and a message typed then was rejected as busy.
   let drawn = null;
+  const stopQueueNote = inProgress ? watchQueue() : () => {};
   while (inProgress) {
     await new Promise(r => setTimeout(r, 1500));
     let hist;
@@ -906,6 +959,7 @@ async function waitForReady() {
       inProgress = restoreHistory(hist.history || []);
     }
   }
+  stopQueueNote();
   setBusy(false);
   // Reload persistence: if a disambiguation slot is still live server-side
   // (page reload, not a server stop), re-render its panel over the chatbox.
@@ -937,7 +991,7 @@ async function sendMessage(forcedText) {
   const thinking = addThinking();
 
   try {
-    const res = await fetch(`${API}/chat`, {
+    const res = await turnFetch(`${API}/chat`, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({message: text})
@@ -995,17 +1049,17 @@ async function sendConfirm(confirmed) {
   setBusy(true);
   const thinking = addThinking();
   try {
-    const res = await fetch(`${API}/confirm`, {
+    const res = await turnFetch(`${API}/confirm`, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({confirmed})
     });
     const data = await res.json();
     removeThinking();
-    if (isBusy(res, data)) {
+    if (isBusy(res, data) || demoRefusal(data)) {
       // Not sent: the staged write is still waiting, so the panel comes back.
       document.getElementById('confirm-bar').classList.remove('hidden');
-      addMsg('error', esc(BUSY_TEXT));
+      addMsg('error', esc(demoRefusal(data) || BUSY_TEXT));
       setBusy(false);
       return;
     }
@@ -1091,7 +1145,7 @@ async function submitDisambiguation() {
   setBusy(true);
   addThinking();
   try {
-    const res = await fetch(`${API}/disambiguate`, {
+    const res = await turnFetch(`${API}/disambiguate`, {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({ selections })
     });

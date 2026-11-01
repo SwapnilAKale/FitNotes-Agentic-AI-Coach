@@ -1,4 +1,5 @@
 import hashlib
+import os
 import sqlite3
 import threading
 from typing import Any
@@ -186,7 +187,14 @@ def get_connection(db_path: str) -> sqlite3.Connection:
 
 
 def get_write_connection(db_path: str) -> sqlite3.Connection:
-    """Opens a read-write connection for write operations only."""
+    """Opens a read-write connection for write operations only.
+
+    Refused in the public demo (DEMO_MODE=1): the demo database is shared by
+    every visitor and no chat may change it. The last of several layers — the
+    server never executes a confirmed write in the demo, and the agent and the
+    tool server both refuse the execute tools."""
+    if os.environ.get("DEMO_MODE", "0").strip().lower() in {"1", "true", "yes", "on"}:
+        raise PermissionError("DEMO_MODE: the shared demo database is read-only")
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     return conn
