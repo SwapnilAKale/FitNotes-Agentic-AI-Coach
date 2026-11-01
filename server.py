@@ -36,7 +36,6 @@ from src.coordinator import Coordinator, MSG_VERIFY_RESTATE, format_verify_fail_
 from src import checkpoint as _ckpt
 from src import settings, wal
 from src import demo_mode
-import confab
 
 DB_PATH = os.environ.get("FITNOTES_DB_PATH", "./data/FitNotes_Backup.fitnotes")
 FRONTEND_SERVER = Path(__file__).parent / "frontend" / "server.py"
@@ -1004,16 +1003,7 @@ async def _run_turn(message: str, disambiguate_selections: list | None) -> JSONR
 
 @app.post("/chat")
 async def chat(body: ChatRequest):
-    # Confab (read-aloud) runs only on the developer's PC; CONFAB_ENABLED=0
-    # (set by docker-compose.yml) skips it entirely. Default on.
-    use_confab = demo_mode.confab_enabled()
-    if use_confab:
-        t = confab.turn(body.message, agent="fitnotes-coach")             # line 1: message arrived
-    response = await _process_turn(body.message)
-    if use_confab:
-        confab.speak(json.loads(response.body).get("text", ""),          # line 2: answer ready
-                     agent="fitnotes-coach", turn_id=t["turnId"])
-    return response
+    return await _process_turn(body.message)
 
 
 @app.post("/resume")

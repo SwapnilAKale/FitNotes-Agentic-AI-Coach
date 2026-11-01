@@ -243,9 +243,3 @@ def open_browser_allowed() -> bool:
     if enabled():
         return False
     return _flag("OPEN_BROWSER", "1")
-
-
-def confab_enabled() -> bool:
-    """CONFAB_ENABLED (default on) — the read-aloud service only exists on the
-    developer's own PC; containers set it to 0 so it is skipped entirely."""
-    return _flag("CONFAB_ENABLED", "1")

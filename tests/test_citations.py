@@ -257,7 +257,7 @@ def test_schema_contains_real_leaves(pkg):
 def test_exercises_line_does_not_offer_ranking_leaves(pkg):
     # Stage 1.7 update: highest_volume / best_e1rm / most_frequent / pct_of_lbs_total
     # are now REAL flat leaves — but on the rankings / muscle_group_balance entity
-    # views, NOT on the exercises line. The original confabulation was citing them
+    # views, NOT on the exercises line. The original invented citation used them
     # under `exercises|X|…`; assert the exercises line still doesn't offer them.
     s = C.build_citable_schema(pkg)
     ex_line = next(l for l in s.splitlines() if l.startswith("exercises (match-key"))

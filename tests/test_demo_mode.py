@@ -1,7 +1,6 @@
 """
 Public-demo plumbing (src/demo_mode.py, deploy/prepare_data.py,
-scripts/make_demo_db.py) and the two switches it relies on (CONFAB_ENABLED,
-OPEN_BROWSER).
+scripts/make_demo_db.py) and the OPEN_BROWSER switch it relies on.
 
 The invariant that matters most is the first test: with DEMO_MODE unset,
 nothing is blocked or limited, so `python server.py` behaves exactly as before.
@@ -117,13 +116,12 @@ def test_client_ip_fallbacks(monkeypatch):
 
 # ── switches ─────────────────────────────────────────────────────────────────
 
-def test_confab_and_browser_switches_default_on(monkeypatch):
-    for var in ("CONFAB_ENABLED", "OPEN_BROWSER", "DEMO_MODE"):
+def test_browser_switch_defaults_on(monkeypatch):
+    for var in ("OPEN_BROWSER", "DEMO_MODE"):
         monkeypatch.delenv(var, raising=False)
-    assert demo_mode.confab_enabled() and demo_mode.open_browser_allowed()
-    monkeypatch.setenv("CONFAB_ENABLED", "0")
+    assert demo_mode.open_browser_allowed()
     monkeypatch.setenv("OPEN_BROWSER", "0")
-    assert not demo_mode.confab_enabled() and not demo_mode.open_browser_allowed()
+    assert not demo_mode.open_browser_allowed()
     monkeypatch.setenv("OPEN_BROWSER", "1")
     monkeypatch.setenv("DEMO_MODE", "1")
     assert not demo_mode.open_browser_allowed()        # never in the demo
@@ -160,20 +158,6 @@ def test_api_rate_limits_chat_by_forwarded_ip(api, demo_on):
     other = c.post("/chat", json={"message": "hi"},
                    headers={"X-Forwarded-For": "203.0.113.51"})
     assert other.status_code == 503
-
-
-def test_chat_skips_confab_when_disabled(api, demo_off, monkeypatch):
-    calls = []
-    monkeypatch.setattr(api.confab, "turn",
-                        lambda *a, **k: calls.append("turn") or {"turnId": "t"})
-    monkeypatch.setattr(api.confab, "speak", lambda *a, **k: calls.append("speak"))
-    c = TestClient(api.app)
-    monkeypatch.setenv("CONFAB_ENABLED", "0")
-    c.post("/chat", json={"message": "hi"})
-    assert calls == []
-    monkeypatch.delenv("CONFAB_ENABLED")               # default: unchanged behaviour
-    c.post("/chat", json={"message": "hi"})
-    assert calls == ["turn", "speak"]
 
 
 def _frontend():

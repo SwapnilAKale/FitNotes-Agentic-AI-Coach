@@ -72,7 +72,6 @@ ENV HF_HUB_OFFLINE=1 \
     TRANSFORMERS_OFFLINE=1 \
     # Container defaults (docker-compose.yml sets them too).
     OPEN_BROWSER=0 \
-    CONFAB_ENABLED=0 \
     BACKEND_HOST=127.0.0.1 \
     FRONTEND_PROXY_TIMEOUT=900
 
