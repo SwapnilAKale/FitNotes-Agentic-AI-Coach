@@ -638,7 +638,19 @@ def _error_response(exc: Exception) -> JSONResponse:
                 "checkpoint_saved": bool(getattr(exc, "checkpoint_saved", False)),
             },
         )
+    if _is_request_timeout(exc):
+        return JSONResponse(content={"type": "error", "text": GEMINI_TIMEOUT_TEXT})
     return JSONResponse(content={"type": "error", "text": f"An error occurred: {msg}"})
+
+
+GEMINI_TIMEOUT_TEXT = "Gemini took too long to answer. Please ask again."
+
+
+def _is_request_timeout(exc: Exception) -> bool:
+    """A Gemini request that hit its time limit (src/llm.py
+    gemini_http_options) — httpx raises a TimeoutException subclass."""
+    import httpx
+    return isinstance(exc, (httpx.TimeoutException, TimeoutError))
 
 
 @app.get("/status")
@@ -829,12 +841,13 @@ async def _swap_out() -> dict:
 
 async def _demo_turn(sid: str, run, user_text: str | None = None) -> JSONResponse:
     """
-    Run one turn for one visitor. Visitors queue in arrival order (no busy
-    refusals between visitors); a visitor already queued or running gets the
-    usual 429 busy; a full queue gets `demo_full`. The prompt is recorded the
-    moment the turn is accepted, so a reload while queued shows it. `run` is
-    the same coroutine the single-user path uses, run with this visitor's
-    state loaded.
+    Run one turn for one visitor. One turn runs at a time: by default
+    (DEMO_MAX_QUEUED_TURNS=0) another visitor who asks meanwhile gets
+    `demo_full` ("try again in a minute"); with a queue they wait in arrival
+    order. A visitor already queued or running gets the usual 429 busy. The
+    prompt is recorded the moment the turn is accepted, so a reload mid-turn
+    shows it. `run` is the same coroutine the single-user path uses, run with
+    this visitor's state loaded, and is stopped after DEMO_TURN_TIMEOUT_SECONDS.
     """
     if not agent_ready:
         return JSONResponse(
@@ -875,7 +888,16 @@ async def _demo_turn(sid: str, run, user_text: str | None = None) -> JSONRespons
         entry = next((m for m in reversed(session.chat_history)
                       if m.get("pending")), None)
         try:
-            response = await run()
+            response = await asyncio.wait_for(run(), _vs.turn_timeout_seconds())
+        except asyncio.TimeoutError:
+            # A hung turn (a Gemini request that never came back) would keep
+            # every other visitor out for good. Stop waiting for it; the
+            # request itself ends at its own limit (GEMINI_TIMEOUT_SECONDS).
+            print(f"[Server] demo turn stopped after "
+                  f"{_vs.turn_timeout_seconds():.0f}s", file=sys.stderr)
+            _vs.clear_unfinished(session, coordinator, _state, _STATE_DEFAULTS)
+            response = JSONResponse(content={"type": "error",
+                                             "text": _vs.TIMED_OUT_TEXT})
         except BaseException:
             _history_end(entry, None)
             raise

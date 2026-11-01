@@ -34,7 +34,10 @@ DEMO_SESSION_TTL_DAYS     delete a session after this many days without a questi
 DEMO_MAX_SESSIONS         keep at most this many sessions; LRU evicted (5000)
 DEMO_SESSIONS_MAX_MB      keep the store under this many MB; LRU evicted (200)
 DEMO_SESSION_MAX_KB       per-session size; oldest chat entries trimmed past it (256)
-DEMO_MAX_QUEUED_TURNS     turns that may wait behind the running one (4)
+DEMO_MAX_QUEUED_TURNS     turns that may wait behind the running one (0: none;
+                          a visitor who asks while another is answered is told
+                          to try again in a minute)
+DEMO_TURN_TIMEOUT_SECONDS stop waiting for a turn still running after this long (300)
 """
 
 from __future__ import annotations
@@ -86,7 +89,17 @@ def session_max_bytes() -> int:
 
 
 def max_queued_turns() -> int:
-    return _int_env("DEMO_MAX_QUEUED_TURNS", 4)
+    return _int_env("DEMO_MAX_QUEUED_TURNS", 0)
+
+
+def turn_timeout_seconds() -> float:
+    """A safety net for a turn that hangs (a Gemini request that never comes
+    back), not a speed limit: a slow answer, per-minute 429 waits included,
+    finishes well inside it."""
+    try:
+        return max(0.01, float(os.environ.get("DEMO_TURN_TIMEOUT_SECONDS", 300)))
+    except (TypeError, ValueError):
+        return 300.0
 
 
 # ── Session ids ──────────────────────────────────────────────────────────────
@@ -180,6 +193,19 @@ def restore(state: dict, agent, coordinator, server_state: dict) -> None:
         for k in COORD_FIELDS:
             setattr(coordinator, k, copy.deepcopy(state["coordinator"][k]))
     for k, v in state["server"].items():
+        server_state[k] = copy.deepcopy(v)
+
+
+def clear_unfinished(agent, coordinator, server_state: dict,
+                     server_defaults: dict) -> None:
+    """After a turn was stopped part-way: drop any panel or pending question it
+    half-built, keeping the visitor's chat and conversation history."""
+    agent._staged_active = False
+    if coordinator is not None:
+        for k, f in COORD_FIELDS.items():
+            if k != "_history":
+                setattr(coordinator, k, f())
+    for k, v in server_defaults.items():
         server_state[k] = copy.deepcopy(v)
 
 
@@ -374,6 +400,7 @@ class QueueFull(Exception):
     """Too many turns are already waiting."""
 
 
+
 class TurnQueue:
     """FIFO of visitors' turns: one runs, up to `max_waiting` wait behind it.
     A visitor holds at most one place. Turns run back to back."""
@@ -445,6 +472,9 @@ def queue_message(ahead: int) -> str:
             f"queued and will be answered after {others}.")
 
 
-FULL_TEXT = ("The demo is full right now. Please try again in a few minutes.")
+FULL_TEXT = ("Someone else is using the coach right now. "
+             "Please try again in a minute.")
+TIMED_OUT_TEXT = ("This answer took too long and was stopped. "
+                  "Please ask again.")
 DEMO_NOT_SAVED_TEXT = ("This public demo doesn't save changes, so nothing was "
                        "written. Run your own copy to log your training.")

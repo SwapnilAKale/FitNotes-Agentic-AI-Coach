@@ -17,6 +17,7 @@ services:
     init: true                      # reap the MCP / UI child processes
     environment:
       GEMINI_API_KEY: ${GEMINI_API_KEY:?Set GEMINI_API_KEY in .env}
+      GEMINI_TIMEOUT_SECONDS: ${GEMINI_TIMEOUT_SECONDS:-1800}   # ends a request Google never answers
       # Public demo: synthetic data, write/upload endpoints off, per-IP limits.
       DEMO_MODE: ${DEMO_MODE:-1}
       DEMO_RESET_ON_START: ${DEMO_RESET_ON_START:-1}   # fresh synthetic data on every start
@@ -28,7 +29,8 @@ services:
       DEMO_MAX_SESSIONS: ${DEMO_MAX_SESSIONS:-5000}
       DEMO_SESSIONS_MAX_MB: ${DEMO_SESSIONS_MAX_MB:-200}
       DEMO_SESSION_MAX_KB: ${DEMO_SESSION_MAX_KB:-256}
-      DEMO_MAX_QUEUED_TURNS: ${DEMO_MAX_QUEUED_TURNS:-4}
+      DEMO_MAX_QUEUED_TURNS: ${DEMO_MAX_QUEUED_TURNS:-0}
+      DEMO_TURN_TIMEOUT_SECONDS: ${DEMO_TURN_TIMEOUT_SECONDS:-300}
       # Container plumbing — not meant to be changed.
       OPEN_BROWSER: "0"
       BACKEND_HOST: 127.0.0.1

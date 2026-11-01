@@ -121,7 +121,7 @@ def test_custom_sql_prompt_forbids_weight_aggregation(monkeypatch):
     from src.coordinator import Coordinator
 
     monkeypatch.setattr(coordinator_mod.genai, "Client",
-                        lambda api_key=None: SimpleNamespace())
+                        lambda api_key=None, **kw: SimpleNamespace())
     c = Coordinator(agent_session=None)
 
     seen = {}
@@ -155,7 +155,7 @@ def test_refusal_degrades_to_none(monkeypatch):
     from src.coordinator import Coordinator
 
     monkeypatch.setattr(coordinator_mod.genai, "Client",
-                        lambda api_key=None: SimpleNamespace())
+                        lambda api_key=None, **kw: SimpleNamespace())
     c = Coordinator(agent_session=None)
 
     import src.llm as llm_mod

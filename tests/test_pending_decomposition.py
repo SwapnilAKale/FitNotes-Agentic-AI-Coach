@@ -104,7 +104,7 @@ def _seed_slot(coord, **over):
 @pytest.fixture()
 def coord(tmp_path, monkeypatch):
     monkeypatch.setattr(coordinator_mod.genai, "Client",
-                        lambda api_key=None: SimpleNamespace())
+                        lambda api_key=None, **kw: SimpleNamespace())
     monkeypatch.setattr(memory, "MEMORY_PATH", tmp_path / "mem.json")
     import src.checkpoint as ckpt
     monkeypatch.setattr(ckpt, "load_checkpoint", lambda: None)
@@ -403,7 +403,7 @@ def test_synthetic_write_params_still_dispatch_operational(coord):
 
 def test_reminder_not_in_recorded_history(tmp_path, monkeypatch):
     monkeypatch.setattr(coordinator_mod.genai, "Client",
-                        lambda api_key=None: SimpleNamespace())
+                        lambda api_key=None, **kw: SimpleNamespace())
     monkeypatch.setattr(memory, "MEMORY_PATH", tmp_path / "mem.json")
     import src.checkpoint as ckpt
     monkeypatch.setattr(ckpt, "load_checkpoint", lambda: None)

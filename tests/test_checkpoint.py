@@ -59,7 +59,7 @@ def slot(tmp_path, monkeypatch):
 def coord(monkeypatch):
     """Coordinator with no Gemini client, no agent, free package build."""
     monkeypatch.setattr(coordinator_mod.genai, "Client",
-                        lambda api_key=None: SimpleNamespace())
+                        lambda api_key=None, **kw: SimpleNamespace())
     c = Coordinator(agent_session=None)
 
     async def fake_classify(question):

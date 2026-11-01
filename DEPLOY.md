@@ -34,10 +34,15 @@ The demo runs with `DEMO_MODE=1`:
   confirmation panel, but Confirm only answers that the demo doesn't save
   changes. Facts the visitor tells the coach ("I'm 45") are remembered for
   that visitor only.
-* **Visitors take turns.** The coach answers one question at a time. While
-  someone else's question is being answered, a new one waits in a short queue
-  and the page shows its position. When `DEMO_MAX_QUEUED_TURNS` (default 4)
-  are already waiting, the page says the demo is full and to try again later.
+* **Visitors take turns.** The coach answers one question at a time. A
+  visitor who asks while someone else's question is being answered is told
+  someone else is using the coach and to try again in a minute.
+  (`DEMO_MAX_QUEUED_TURNS`, default 0, lets that many wait in a queue instead,
+  with the page showing their position.) If a question is still unanswered
+  after `DEMO_TURN_TIMEOUT_SECONDS` (default 300, five minutes; normally only
+  when a Gemini request never comes back), the visitor is told to ask again
+  and the coach is free for the next one. The stuck request itself ends at
+  `GEMINI_TIMEOUT_SECONDS` (default 1800, 30 minutes).
 * Uploading a database or articles, clearing logs, changing settings and
   reloading the DB are **turned off** (the server answers 403 and the UI says why).
 * Each visitor IP gets a small **question quota** (3 per minute, 30 per day by
@@ -364,7 +369,9 @@ DEMO_SESSION_TTL_DAYS=30          # delete a visitor's chat after N days with no
 DEMO_MAX_SESSIONS=5000            # most visitor chats kept (least recently used go first)
 DEMO_SESSIONS_MAX_MB=200          # most disk the visitor chats may use (same rule)
 DEMO_SESSION_MAX_KB=256           # one chat's size; its oldest messages are trimmed past it
-DEMO_MAX_QUEUED_TURNS=4           # questions that may wait behind the one being answered
+DEMO_MAX_QUEUED_TURNS=0           # questions that may wait behind the one being answered (0: none)
+DEMO_TURN_TIMEOUT_SECONDS=300     # stop waiting for a question still unanswered after this
+GEMINI_TIMEOUT_SECONDS=1800       # end one Gemini request Google never answers (any mode)
 ```
 
 **What is shared and what is per visitor.** The synthetic workout database,
@@ -616,7 +623,7 @@ assumes:
 * **Scale to zero means slow cold starts.** The first request after idling
   waits for Python, PyTorch, the models and the agent to start (often 30–90
   s). `--min-instances=1` avoids that, but it isn't free.
-* **Exactly one instance.** The agent, its turn queue and the rate limiter
+* **Exactly one instance.** The agent, its turn lock and the rate limiter
   are in memory, and visitors' conversations are in one SQLite file, so set
   `--max-instances=1`.
 * **CPU must stay allocated** (`--no-cpu-throttling`). The agent initialises in

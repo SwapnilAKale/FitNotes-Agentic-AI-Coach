@@ -526,6 +526,59 @@ def test_other_visitors_queue_instead_of_busy(demo, monkeypatch):
     asyncio.run(go())
 
 
+def test_by_default_another_visitor_is_told_to_try_again(demo):
+    async def go():
+        gate = asyncio.Event()
+        demo.coord.gates["slow"] = gate
+        async with _browser(demo.srv) as a, _browser(demo.srv) as b:
+            await b.get("/status")
+            ta = asyncio.create_task(a.post("/chat", json={"message": "slow"}))
+            while demo.srv._turn_queue.running is None:
+                await asyncio.sleep(0.01)
+            r = await b.post("/chat", json={"message": "mine"})
+            assert r.status_code == 429 and r.json()["error"] == "demo_full"
+            assert r.json()["text"] == vs.FULL_TEXT
+            assert "try again in a minute" in vs.FULL_TEXT
+            # Nothing was recorded for B: they just ask again.
+            assert (await b.get("/history")).json()["history"] == []
+            gate.set()
+            assert (await ta).json()["text"] == "echo:slow seen=[]"
+            r = await b.post("/chat", json={"message": "mine"})
+            assert r.json()["text"] == "echo:mine seen=[]"
+    asyncio.run(go())
+
+
+def test_a_stuck_turn_is_stopped_and_the_coach_is_free_again(demo, monkeypatch):
+    monkeypatch.setenv("DEMO_TURN_TIMEOUT_SECONDS", "0.2")
+    stuck_route = demo.coord.route
+
+    async def route(message):
+        if message == "stuck":
+            # Half-builds a follow-up, then waits on a reply that never comes.
+            demo.coord._pending_followup = {"question": "how old are you?"}
+            await asyncio.Event().wait()
+        return await stuck_route(message)
+    demo.coord.route = route
+
+    async def go():
+        async with _browser(demo.srv) as a, _browser(demo.srv) as b:
+            r = await a.post("/chat", json={"message": "stuck"})
+            assert r.json() == {"type": "error", "text": vs.TIMED_OUT_TEXT}
+            sid = a.cookies.get(vs.COOKIE_NAME)
+            h = (await a.get("/history")).json()["history"]
+            assert _texts(h) == [("user", "stuck"), ("assistant", vs.TIMED_OUT_TEXT)]
+            assert h[-1]["kind"] == "error"
+            # The half-built follow-up is gone; the chat itself is kept.
+            assert demo.store.load(sid)["coordinator"]["_pending_followup"] is None
+            # The coach is free: another visitor, then the same one, are answered.
+            assert demo.srv._turn_queue.running is None
+            r = await b.post("/chat", json={"message": "hi"})
+            assert r.json()["text"] == "echo:hi seen=[]"
+            r = await a.post("/chat", json={"message": "again"})
+            assert r.json()["text"].startswith("echo:again")
+    asyncio.run(go())
+
+
 def test_demo_mode_off_uses_the_single_session(monkeypatch, tmp_path):
     import server as srv
     monkeypatch.delenv("DEMO_MODE", raising=False)

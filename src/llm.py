@@ -75,10 +75,23 @@ _JUDGE_SYSTEM = (
 )
 
 
+def gemini_http_options() -> types.HttpOptions:
+    """The time limit for every Gemini request (GEMINI_TIMEOUT_SECONDS, default
+    30 min). Far above any real answer, so it never cuts one off: it only ends
+    a request Google never answers, which would otherwise hold its worker
+    thread until a restart. Every genai.Client in the app passes this."""
+    try:
+        seconds = float(os.environ.get("GEMINI_TIMEOUT_SECONDS", 1800))
+    except (TypeError, ValueError):
+        seconds = 1800.0
+    return types.HttpOptions(timeout=int(max(1.0, seconds) * 1000))
+
+
 def _get_client():
     global _client
     if _client is None:
-        _client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+        _client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"),
+                               http_options=gemini_http_options())
     return _client
 
 

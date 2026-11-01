@@ -76,7 +76,7 @@ def patch_mcp(monkeypatch):
     FakeStdio.instances.clear()
     monkeypatch.setattr(agent_mod, "stdio_client", lambda params: FakeStdio(params))
     monkeypatch.setattr(agent_mod, "ClientSession", FakeSession)
-    monkeypatch.setattr(agent_mod.genai, "Client", lambda api_key=None: SimpleNamespace())
+    monkeypatch.setattr(agent_mod.genai, "Client", lambda api_key=None, **kw: SimpleNamespace())
     # Stub the heavy, non-MCP parts of initialize()
     monkeypatch.setattr(AgentSession, "_setup_cache", lambda self: asyncio.sleep(0))
     monkeypatch.setattr(AgentSession, "_build_gemini_tools", lambda self, t: [])

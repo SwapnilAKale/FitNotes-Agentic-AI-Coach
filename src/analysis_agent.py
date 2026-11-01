@@ -27,6 +27,7 @@ from google.genai import types
 
 from src.citations import build_citable_schema
 from src.prompt_blocks import ADVICE_STYLE, MEDICAL_LINE
+from src.llm import gemini_http_options
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +38,8 @@ _client = None
 def _get_client():
     global _client
     if _client is None:
-        _client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+        _client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"),
+                               http_options=gemini_http_options())
     return _client
 
 ANALYSIS_MODEL  = "gemini-3.1-flash-lite"   # same as agent.py — free tier, supports thinking

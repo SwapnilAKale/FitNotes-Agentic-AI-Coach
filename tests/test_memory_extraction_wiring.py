@@ -81,7 +81,7 @@ class _FakeAgent:
 @pytest.fixture()
 def coord_with_agent(monkeypatch):
     monkeypatch.setattr(coordinator_mod.genai, "Client",
-                        lambda api_key=None: SimpleNamespace())
+                        lambda api_key=None, **kw: SimpleNamespace())
     agent = _FakeAgent()
     c = Coordinator(agent_session=agent)
     import src.checkpoint as ckpt

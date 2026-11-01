@@ -80,7 +80,7 @@ class FakeAgent:
 
 def _make_coord(monkeypatch, agent):
     monkeypatch.setattr(coordinator_mod.genai, "Client",
-                        lambda api_key=None: SimpleNamespace())
+                        lambda api_key=None, **kw: SimpleNamespace())
     c = Coordinator(agent_session=agent)
     import src.checkpoint as ckpt
     monkeypatch.setattr(ckpt, "load_checkpoint", lambda: None)

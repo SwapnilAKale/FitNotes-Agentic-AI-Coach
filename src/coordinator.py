@@ -47,6 +47,7 @@ from src.data_agent import (
 )
 from src import analysis_agent
 from src import checkpoint as _ckpt
+from src.llm import gemini_http_options
 from src import citations as _cite
 from src import demographic_followup as _followup
 from src import memory as _memory
@@ -1155,7 +1156,8 @@ class Coordinator:
                        questions. Pass None to disable the operational path (testing).
         """
         self._agent   = agent_session
-        self._client  = genai.Client(api_key=_GEMINI_API_KEY)
+        self._client  = genai.Client(api_key=_GEMINI_API_KEY,
+                                     http_options=gemini_http_options())
         self._history: list[dict] = []   # {role, content} pairs, last CONTEXT_WINDOW*2
         # Stage B: a one-turn pending demographic follow-up — {"key", "clarified"}.
         # In-memory, per session. Lives exactly the immediate next turn (+1 turn

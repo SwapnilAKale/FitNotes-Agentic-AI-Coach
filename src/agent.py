@@ -18,6 +18,7 @@ from src.prompt_blocks import (
 )
 from src.schema_prompt import build_user_context_prompt, load_user_context
 from src import checkpoint as _ckpt
+from src.llm import gemini_http_options
 
 logger = logging.getLogger(__name__)
 
@@ -403,7 +404,8 @@ class AgentSession:
             except Exception:
                 pass
 
-            self._client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+            self._client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"),
+                                        http_options=gemini_http_options())
             self._initialized = True
             self._effective_system_prompt = self._base_system_prompt
             self._gemini_tools = self._build_gemini_tools(self._all_tools)
@@ -460,7 +462,8 @@ class AgentSession:
         except Exception:
             pass
 
-        self._client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+        self._client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"),
+                                    http_options=gemini_http_options())
         self._initialized = True
         self._effective_system_prompt = self._base_system_prompt
         self._gemini_tools = self._build_gemini_tools(self._all_tools)

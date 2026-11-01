@@ -58,6 +58,7 @@ from google import genai
 from google.genai import types
 
 from src import checkpoint as _ckpt
+from src.llm import gemini_http_options
 from src.ontology import (CARDIO_PATTERN, ROLE_PRECEDENCE, closed_muscle_names,
                           resolve_muscle_names, subtree)
 
@@ -107,7 +108,8 @@ _client = None
 def _get_client():
     global _client
     if _client is None:
-        _client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+        _client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"),
+                               http_options=gemini_http_options())
     return _client
 
 

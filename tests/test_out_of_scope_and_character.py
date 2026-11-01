@@ -28,7 +28,7 @@ from src.coordinator import Coordinator, OUT_OF_SCOPE_REFUSAL  # noqa: E402
 @pytest.fixture()
 def coord(monkeypatch):
     monkeypatch.setattr(coordinator_mod.genai, "Client",
-                        lambda api_key=None: SimpleNamespace())
+                        lambda api_key=None, **kw: SimpleNamespace())
     c = Coordinator(agent_session=None)
     # No checkpoint slot interference
     import src.checkpoint as ckpt

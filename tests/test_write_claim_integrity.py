@@ -63,7 +63,7 @@ def _coord(monkeypatch, answer, *, db_write_effect=False,
     real rather than re-implemented here.
     """
     monkeypatch.setattr(coordinator_mod.genai, "Client",
-                        lambda api_key=None: SimpleNamespace())
+                        lambda api_key=None, **kw: SimpleNamespace())
 
     class _FakeAgent:
         async def answer(self, question, resume_messages=None):

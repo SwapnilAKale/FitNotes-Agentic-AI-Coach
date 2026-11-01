@@ -96,7 +96,7 @@ class RestoreFakeAgent:
 
 def _make_coord(monkeypatch, agent):
     monkeypatch.setattr(coordinator_mod.genai, "Client",
-                        lambda api_key=None: SimpleNamespace())
+                        lambda api_key=None, **kw: SimpleNamespace())
     return Coordinator(agent_session=agent)
 
 

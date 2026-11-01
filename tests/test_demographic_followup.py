@@ -91,7 +91,7 @@ MAIN = "Your squat is up 10% this period."
 @pytest.fixture()
 def coord(tmp_path, monkeypatch):
     monkeypatch.setattr(coordinator_mod.genai, "Client",
-                        lambda api_key=None: SimpleNamespace())
+                        lambda api_key=None, **kw: SimpleNamespace())
     monkeypatch.setattr(memory, "MEMORY_PATH", tmp_path / "mem.json")
     import src.checkpoint as ckpt
     monkeypatch.setattr(ckpt, "load_checkpoint", lambda: None)
@@ -191,7 +191,7 @@ def test_one_turn_life_late_bare_answer_not_captured(coord):
 
 def test_followup_not_in_recorded_history(tmp_path, monkeypatch):
     monkeypatch.setattr(coordinator_mod.genai, "Client",
-                        lambda api_key=None: SimpleNamespace())
+                        lambda api_key=None, **kw: SimpleNamespace())
     monkeypatch.setattr(memory, "MEMORY_PATH", tmp_path / "mem.json")
     import src.checkpoint as ckpt
     monkeypatch.setattr(ckpt, "load_checkpoint", lambda: None)

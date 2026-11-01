@@ -37,8 +37,8 @@ from this repo's Docker setup on a free Oracle Cloud ARM VM (see
   same browser continues it; it's deleted after 30 days without a question.
 - **Nothing you do changes the demo data.** You can ask to log a workout or
   edit a set and see the confirmation panel, but the demo doesn't save
-  changes. Visitors' questions are answered one at a time, so you may see a
-  short "your question is queued" note when others are using it.
+  changes. Visitors' questions are answered one at a time, so if someone
+  else is using it you're asked to try again in a minute.
 - **Some features are off.** Uploading a database or articles, clearing logs
   and changing settings return a "turned off in the demo" message. Each
   visitor also gets a small number of questions per minute and per day, which

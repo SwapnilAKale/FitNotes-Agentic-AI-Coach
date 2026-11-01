@@ -44,7 +44,7 @@ from src.coordinator import (                           # noqa: E402
 @pytest.fixture()
 def coord(monkeypatch):
     monkeypatch.setattr(coordinator_mod.genai, "Client",
-                        lambda api_key=None: SimpleNamespace())
+                        lambda api_key=None, **kw: SimpleNamespace())
     c = Coordinator(agent_session=None)
     import src.checkpoint as ckpt
     monkeypatch.setattr(ckpt, "load_checkpoint", lambda: None)

@@ -68,7 +68,7 @@ def _isolate_checkpoint(tmp_path, monkeypatch):
 def coord(monkeypatch):
     """Coordinator with no Gemini client and a free (stubbed) package build."""
     monkeypatch.setattr(coordinator_mod.genai, "Client",
-                        lambda api_key=None: SimpleNamespace())
+                        lambda api_key=None, **kw: SimpleNamespace())
     c = Coordinator(agent_session=None)
 
     async def fake_classify(question):
