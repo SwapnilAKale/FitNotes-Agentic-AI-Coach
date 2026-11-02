@@ -348,6 +348,39 @@ let demoMode = false;     // set from /status; turns on the queue notice
 let lastQuestion = null;
 let autoRetryTimer = null;
 
+// ── Client events (public demo only) ─────────────────────────────────────────
+// One "visit" per page load, sent once /status has answered (so the visitor's
+// session cookie is already set), and a ping for a few UI clicks. Sent only
+// when /status says demo_mode; the server ignores them unless its analytics
+// are on (src/analytics.py). sendBeacon survives navigating away (the graph
+// link); text/plain keeps it a simple request in every browser.
+let visitSent = false;
+function sendClientEvent(payload) {
+  if (!demoMode) return;
+  try {
+    const body = JSON.stringify(payload);
+    if (navigator.sendBeacon &&
+        navigator.sendBeacon(`${API}/client-event`, new Blob([body], {type: 'text/plain'}))) return;
+    fetch(`${API}/client-event`, {method: 'POST', body, keepalive: true,
+      headers: {'Content-Type': 'text/plain'}}).catch(() => {});
+  } catch (e) { /* never let this affect the page */ }
+}
+function sendVisit() {
+  if (visitSent || !demoMode) return;
+  visitSent = true;
+  let tz = null;
+  try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone; } catch (e) {}
+  sendClientEvent({
+    kind: 'visit',
+    src: new URLSearchParams(location.search).get('src'),
+    referrer: document.referrer || null,
+    path: location.pathname + location.search,
+    screen: `${screen.width}x${screen.height}`,
+    language: navigator.language || null,
+    timezone: tz,
+  });
+}
+
 function nowTime() {
   return new Date().toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
 }
@@ -911,6 +944,7 @@ async function waitForReady() {
       if (data.demo_mode) {
         demoMode = true;
         document.getElementById('demo-banner').style.display = 'block';
+        sendVisit();
       }
       if (data.ready) break;
     } catch (e) {
@@ -1339,6 +1373,10 @@ function closeSettings() {
 }
 
 document.getElementById('settings-btn').addEventListener('click', openSettings);
+document.getElementById('settings-btn').addEventListener('click',
+  () => sendClientEvent({kind: 'settings_click'}));
+document.getElementById('graph-btn').addEventListener('click',
+  () => sendClientEvent({kind: 'graph_click'}));
 document.getElementById('settings-close').addEventListener('click', closeSettings);
 document.getElementById('settings-overlay').addEventListener('click', (e) => {
   if (e.target === document.getElementById('settings-overlay')) closeSettings();
