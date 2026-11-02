@@ -57,7 +57,19 @@ COPY scripts/build_corpus.py scripts/build_corpus.py
 RUN CHROMA_DB_PATH=/app/seed/chroma_db python scripts/build_corpus.py --offline \
     && test -f /app/seed/chroma_db/chroma.sqlite3
 
-# 5) The application.
+# 5) Offline IP → city/country database for the visitor analytics
+#    (src/analytics.py): DB-IP "IP to City Lite", CC BY 4.0, about 130 MB.
+#    Placed BEFORE the app code is copied, so an ordinary code change reuses
+#    this cached layer instead of downloading it again. The cache also means
+#    it is not refreshed on its own: to fetch a newer month, rebuild with
+#    GEOIP_MONTH=YYYY-MM (docker-compose.yml passes it through), which redoes
+#    only this step and the ones after it. A failed download never fails the
+#    build — the analytics then record no location.
+ARG GEOIP_MONTH=
+COPY deploy/fetch_geoip.py deploy/fetch_geoip.py
+RUN python deploy/fetch_geoip.py /app/seed/geo/dbip-city-lite.mmdb "${GEOIP_MONTH}"
+
+# 6) The application.
 COPY . .
 
 # Run as an unprivileged user. data/ is the named volume's mount point; Docker

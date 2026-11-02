@@ -10,7 +10,8 @@ Run by deploy/entrypoint.sh before `python server.py`. Idempotent and quick.
   * DEMO_MODE=1 and (no workout DB in the volume, or DEMO_RESET_ON_START=1):
     empty the volume and seed it with a freshly generated SYNTHETIC database
     (scripts/make_demo_db.py) plus default state files. Visitors' own
-    conversations (data/visitor_sessions/, src/visitor_sessions.py) are kept:
+    conversations (data/visitor_sessions/, src/visitor_sessions.py) and the
+    permanent visitor analytics (data/analytics/, src/analytics.py) are kept:
     the reset is for the shared base data only.
   * Otherwise (your own deployment, no DB yet): leave it alone and say how to
     add one — upload your FitNotes backup from the UI's attach menu.
@@ -75,12 +76,15 @@ def _copy_seed_chroma() -> bool:
 
 
 def _kept_names() -> set:
-    """Top-level entries of DATA a reset must not delete: .gitkeep and the
-    visitor-session store (its default folder, or wherever
-    DEMO_SESSIONS_PATH puts it inside DATA)."""
-    kept = {".gitkeep", "visitor_sessions"}
-    custom = os.environ.get("DEMO_SESSIONS_PATH")
-    if custom:
+    """Top-level entries of DATA a reset must not delete: .gitkeep, the
+    visitor-session store and the permanent visitor analytics
+    (src/analytics.py) — their default folders, or wherever
+    DEMO_SESSIONS_PATH / ANALYTICS_DB_PATH put them inside DATA."""
+    kept = {".gitkeep", "visitor_sessions", "analytics"}
+    for var in ("DEMO_SESSIONS_PATH", "ANALYTICS_DB_PATH"):
+        custom = os.environ.get(var)
+        if not custom:
+            continue
         try:
             rel = Path(custom).resolve().relative_to(DATA.resolve())
             kept.add(rel.parts[0])

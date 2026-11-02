@@ -372,6 +372,10 @@ DEMO_SESSION_MAX_KB=256           # one chat's size; its oldest messages are tri
 DEMO_MAX_QUEUED_TURNS=0           # questions that may wait behind the one being answered (0: none)
 DEMO_TURN_TIMEOUT_SECONDS=300     # stop waiting for a question still unanswered after this
 GEMINI_TIMEOUT_SECONDS=1800       # end one Gemini request Google never answers (any mode)
+ANALYTICS_ENABLED=                # private visitor analytics; empty = on exactly when DEMO_MODE=1
+ANALYTICS_BEACON_PER_MINUTE=30    # page-load / click reports accepted per visitor IP per minute
+ANALYTICS_BEACON_PER_DAY=500      # ... and per day
+GEOIP_MONTH=                      # build-time DB-IP database month (YYYY-MM); empty = latest
 ```
 
 **What is shared and what is per visitor.** The synthetic workout database,
@@ -387,7 +391,19 @@ fill the disk.
 
 `DEMO_RESET_ON_START=1` (the default) re-generates the synthetic database on
 every start, so its most recent workout is always yesterday. It does **not**
-touch visitors' conversations.
+touch visitors' conversations or the visitor analytics.
+
+**Private visitor analytics.** With `DEMO_MODE=1` the app also keeps a
+permanent log of how the demo is used, in `data/analytics/analytics.sqlite`
+(see the README's "Demo visitor analytics"). It records page loads, questions,
+answers, outcomes, raw IPs and user-agents. Nothing ever deletes it, and no
+URL serves it: you copy it to your own computer over SSH (step 12, "Copy the
+visitor analytics to your PC"). Set `ANALYTICS_ENABLED=0` to turn it off.
+City and country come from DB-IP's free IP database, which the image build
+downloads (about 130 MB) before it copies the app code, so ordinary code
+updates reuse the cached download. To refresh it with a newer month, set
+`GEOIP_MONTH=YYYY-MM` in `.env` and run `docker compose up -d --build`. If
+the download fails, the build carries on and no location is recorded.
 
 **Optional password for the whole site.** Generate a hash (this downloads the
 Caddy image the first time):
@@ -501,7 +517,7 @@ docker image prune -f
 
 With `DEMO_RESET_ON_START=1` (the default) an update also resets the demo to
 fresh synthetic data and the research index from the new image. Visitors'
-conversations are kept.
+conversations and the visitor analytics are kept.
 
 **Refresh the demo data every night**
 
@@ -542,6 +558,39 @@ docker compose exec app rm -f data/visitor_sessions/sessions.sqlite data/visitor
 ```bash
 docker compose restart app
 ```
+
+**Copy the visitor analytics to your PC**
+
+Run this **on your own computer**, in your clone of the repo. On Windows use
+a normal PowerShell or Command Prompt window, with Python 3 and the built-in
+OpenSSH client:
+
+```bash
+python scripts/export_analytics.py
+```
+
+In one SSH connection (a key passphrase is asked once), it:
+
+1. makes a consistent snapshot of `data/analytics/analytics.sqlite` inside
+   the `app` container, using SQLite's backup API, not a copy of the live
+   file;
+2. streams the snapshot back to your computer;
+3. deletes the snapshot from the container.
+
+Then it checks the copy's SHA-256 and integrity, and saves it as
+`analytics_export/analytics-YYYYMMDD-HHMMSS.sqlite` and
+`analytics_export/latest.sqlite` (the folder is gitignored). Point your
+private dashboard at `latest.sqlite`.
+
+The defaults are key `~/.ssh/oracle_fitnotes`, host `ubuntu@130.210.14.28`,
+repo `~/FitNotes-Agentic-AI-Coach` on the VM, and service `app`. Override any
+of them:
+
+```bash
+python scripts/export_analytics.py --key C:\Users\you\.ssh\oracle_fitnotes --host ubuntu@<IP>
+```
+
+It answers "nothing recorded yet" until the first visit has been logged.
 
 **Back up the data volume**
 

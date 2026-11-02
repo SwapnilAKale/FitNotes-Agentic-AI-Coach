@@ -17,3 +17,5 @@ python-multipart>=0.0.9
 pypdf>=4.0.0
 langgraph>=1.1,<2.0
 langgraph-checkpoint-sqlite>=2.0
+# Reads the DB-IP City Lite .mmdb for the demo's visitor analytics (src/analytics.py).
+maxminddb>=2.0,<4

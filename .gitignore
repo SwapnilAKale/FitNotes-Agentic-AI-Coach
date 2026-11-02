@@ -36,3 +36,7 @@ ontology/review_cuts.csv
 # nature — a journal habit is not a fact about anatomy — while exercises.csv,
 # aliases.csv and exercise_muscle.csv are the universal graph everyone shares.
 ontology/not_exercises.csv
+
+# Visitor-analytics snapshots copied from the demo VM (scripts/export_analytics.py).
+# Raw IPs and visitors' questions — never push.
+analytics_export/

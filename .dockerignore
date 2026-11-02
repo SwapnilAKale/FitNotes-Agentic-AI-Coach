@@ -24,6 +24,7 @@ dist
 data/
 *.fitnotes
 personal_lessons.md
+analytics_export/
 lessons.md
 pending_review.csv
 ontology/review_cuts.csv

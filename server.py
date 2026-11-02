@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import sys
+import time
 import webbrowser
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -17,7 +18,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 from types import SimpleNamespace
 
@@ -37,6 +38,7 @@ from src.agent import EXECUTE_TOOLS, AgentSession
 from src.coordinator import Coordinator, MSG_VERIFY_RESTATE, format_verify_fail_message
 from src import checkpoint as _ckpt
 from src import settings, wal
+from src import analytics as _analytics
 from src import demo_mode
 from src import memory as _memory
 from src import visitor_sessions as _vs
@@ -465,6 +467,10 @@ async def lifespan(app: FastAPI):
     if demo_mode.enabled():
         _visitor_store = _vs.SessionStore()
         housekeeping_task = asyncio.create_task(_visitor_housekeeping_loop())
+    if _analytics.enabled():
+        # Private visitor analytics (src/analytics.py): on with DEMO_MODE only,
+        # unless ANALYTICS_ENABLED says otherwise.
+        _analytics.start()
 
     # Kick off agent initialization without blocking server startup
     asyncio.create_task(_initialize_in_background())
@@ -504,6 +510,7 @@ async def lifespan(app: FastAPI):
     if _visitor_store is not None:
         _visitor_store.close()
         _visitor_store = None
+    _analytics.shutdown()
 
 
 async def _visitor_housekeeping_loop() -> None:
@@ -544,6 +551,8 @@ async def _demo_mode_gates(request: Request, call_next):
         request.headers.get("x-forwarded-for"))
     if refusal is not None:
         status_code, body, headers = refusal
+        if body.get("error") == "demo_rate_limit":
+            await _record_refused_turn(request, status_code, body)
         return JSONResponse(status_code=status_code, content=body, headers=headers)
     if not demo_mode.enabled():
         return await call_next(request)
@@ -561,6 +570,104 @@ async def _demo_mode_gates(request: Request, call_next):
         httponly=True, samesite="lax",
         secure=request.headers.get("x-forwarded-proto", "").lower() == "https")
     return response
+
+
+# ── Private visitor analytics (src/analytics.py) ─────────────────────────────
+# Every turn-running request is recorded with its outcome, off the request
+# path (a queue + writer thread). Nothing is recorded unless
+# _analytics.enabled() — by default exactly when DEMO_MODE=1.
+
+def _selections_text(selections) -> str | None:
+    """A disambiguation panel's picks, as one readable line."""
+    try:
+        return "; ".join(
+            f"{s.get('name')} → {s.get('other_text') or s.get('choice')}"
+            for s in selections) or None
+    except Exception:
+        return None
+
+
+def _response_body(response) -> dict:
+    try:
+        body = json.loads(response.body.decode())
+        return body if isinstance(body, dict) else {}
+    except Exception:
+        return {}
+
+
+async def _record_refused_turn(request: Request, status_code: int, body: dict) -> None:
+    """A turn refused by the demo rate limit in the middleware, before any
+    endpoint ran. The question is read from the (small, JSON) request body."""
+    if not _analytics.enabled():
+        return
+    path = request.url.path.rstrip("/") or "/"
+    endpoint = path.lstrip("/") or path
+    question = None
+    try:
+        payload = json.loads((await request.body()) or b"{}")
+        if endpoint == "chat":
+            question = payload.get("message")
+        elif endpoint == "disambiguate":
+            question = _selections_text(payload.get("selections") or [])
+    except Exception:
+        pass
+    _analytics.record_turn(request, endpoint=endpoint, question=question,
+                           status=status_code, body=body, latency_ms=0)
+
+
+async def _tracked_turn(request: Request | None, endpoint: str,
+                        question: str | None, run) -> JSONResponse:
+    """Run one turn-running endpoint and record how it went: latency, route,
+    Gemini tokens (src/analytics.py install_usage_counter) and outcome."""
+    if not _analytics.enabled():
+        return await run()
+    stats, token = _analytics.begin_turn()
+    started = time.monotonic()
+    common = dict(endpoint=endpoint, question=question, stats=stats,
+                  identity=_analytics.who(request),
+                  turn_timeout_text=_vs.TIMED_OUT_TEXT,
+                  gemini_timeout_text=GEMINI_TIMEOUT_TEXT)
+    try:
+        response = await run()
+    except BaseException:
+        _analytics.record_turn(
+            request, status=500, body=None,
+            latency_ms=int((time.monotonic() - started) * 1000), **common)
+        raise
+    finally:
+        _analytics.end_turn(token)
+    _analytics.record_turn(
+        request, status=response.status_code, body=_response_body(response),
+        latency_ms=int((time.monotonic() - started) * 1000), **common)
+    return response
+
+
+@app.post("/client-event")
+async def client_event(request: Request):
+    """The page's beacon: one page load ("visit", sent once its JS has run, so
+    crawlers that don't run JS never count) or one UI click. Write-only —
+    nothing is ever returned — size-capped and rate limited per client IP.
+    Always 204, and a no-op unless analytics is on. (Not named "analytics" or
+    "beacon": ad blockers drop requests to paths like that.)"""
+    if not _analytics.enabled():
+        return Response(status_code=204)
+    try:
+        declared = int(request.headers.get("content-length") or 0)
+    except ValueError:
+        declared = 0
+    if declared > _analytics.BEACON_MAX_BYTES:
+        return Response(status_code=413)
+    data = b""
+    async for chunk in request.stream():
+        data += chunk
+        if len(data) > _analytics.BEACON_MAX_BYTES:
+            return Response(status_code=413)
+    try:
+        payload = json.loads(data or b"{}")
+    except Exception:
+        return Response(status_code=204)
+    _analytics.record_beacon(request, payload)
+    return Response(status_code=204)
 
 
 class ChatRequest(BaseModel):
@@ -1008,6 +1115,7 @@ async def _run_turn(message: str, disambiguate_selections: list | None) -> JSONR
                 return JSONResponse(content={
                     "type": "answer",
                     "text": "There's nothing to clarify right now."})
+            _analytics.note_route(result)
             # Reuse `message` for the tail's history/checkpoint fallbacks.
             message = result.get("resolved_question") or ""
         else:
@@ -1033,6 +1141,7 @@ async def _run_turn(message: str, disambiguate_selections: list | None) -> JSONR
                 print(f"[server] discard_staged_writes (turn-start) failed: {exc}", file=sys.stderr)
             try:
                 result = await coordinator.route(message)
+                _analytics.note_route(result)
                 if DEBUG:
                     print(f"[DEBUG] Result: {json.dumps({k: v for k, v in result.items() if k != 'flagged_claims'}, indent=2)}")
             except Exception as exc:
@@ -1276,6 +1385,11 @@ async def _run_turn(message: str, disambiguate_selections: list | None) -> JSONR
 
 @app.post("/chat")
 async def chat(body: ChatRequest, request: Request = None):
+    return await _tracked_turn(request, "chat", body.message,
+                               lambda: _chat(body, request))
+
+
+async def _chat(body: ChatRequest, request: Request | None) -> JSONResponse:
     sid = _demo_sid(request)
     if sid is not None:
         return await _demo_turn(sid, lambda: _run_turn(body.message, None),
@@ -1285,6 +1399,10 @@ async def chat(body: ChatRequest, request: Request = None):
 
 @app.post("/resume")
 async def resume(request: Request = None):
+    return await _tracked_turn(request, "resume", None, lambda: _resume(request))
+
+
+async def _resume(request: Request | None) -> JSONResponse:
     # The "Resume" button calls this. Reuse the Coordinator's continue-intent
     # path: load the slot → _resume, or the nothing-to-resume notice if empty.
     sid = _demo_sid(request)
@@ -1299,6 +1417,12 @@ async def disambiguate(body: DisambiguateRequest, request: Request = None):
     # user's structured picks and resume the whole turn — shares _process_turn's
     # write-path tail, so a resolved write lands on the same confirm panel.
     selections = [s.model_dump() for s in body.selections]
+    return await _tracked_turn(request, "disambiguate",
+                               _selections_text(selections),
+                               lambda: _disambiguate(selections, request))
+
+
+async def _disambiguate(selections: list, request: Request | None) -> JSONResponse:
     sid = _demo_sid(request)
     if sid is not None:
         return await _demo_turn(sid, lambda: _run_turn("", selections))
@@ -1445,6 +1569,11 @@ async def _commit_staged_sibling():
 
 @app.post("/confirm")
 async def confirm(body: ConfirmRequest, request: Request = None):
+    return await _tracked_turn(request, "confirm" if body.confirmed else "cancel",
+                               None, lambda: _confirm(body, request))
+
+
+async def _confirm(body: ConfirmRequest, request: Request | None) -> JSONResponse:
     sid = _demo_sid(request)
     if sid is not None:
         # The public demo never executes a write (see _run_demo_confirm).

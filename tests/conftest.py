@@ -71,3 +71,17 @@ def _isolated_wal(tmp_path, monkeypatch):
     # Subprocesses spawned by a test (live MCP servers) inherit the env.
     monkeypatch.setenv("AGENT_WRITES_PATH", wal_path)
     yield
+
+
+@pytest.fixture(autouse=True)
+def _isolated_analytics(tmp_path, monkeypatch):
+    # src/analytics.py turns itself on with DEMO_MODE=1, which several tests
+    # set. Each test gets its own analytics file and a fresh recorder / beacon
+    # limiter, so nothing is ever written to the real data/analytics/.
+    from src import analytics
+    monkeypatch.setenv("ANALYTICS_DB_PATH", str(tmp_path / "analytics" / "analytics.sqlite"))
+    monkeypatch.setenv("GEOIP_DB_PATH", str(tmp_path / "no-geoip.mmdb"))
+    monkeypatch.setattr(analytics, "_beacon_limiter", None)
+    analytics.set_recorder(None)
+    yield
+    analytics.shutdown()

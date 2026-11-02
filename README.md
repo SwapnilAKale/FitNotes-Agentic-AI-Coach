@@ -22,8 +22,8 @@ what to expect.
 | `Single-Agent-System` | the hand-built single agent: web UI, MCP tools, RAG, memory, writes |
 | `Multi-Agent-System` | **current** — LangGraph orchestration, Coordinator / Data Agent / Analysis Agent, muscle ontology, request decomposition |
 
-**Scale:** 36 source modules, 27 MCP tools, a 39-muscle ontology over 175
-curated exercise→muscle edges, and **2,056 tests**.
+**Scale:** 37 source modules, 27 MCP tools, a 39-muscle ontology over 175
+curated exercise→muscle edges, and **2,102 tests**.
 
 ---
 
@@ -266,6 +266,57 @@ them. Replay is user-controllable from the settings panel.
 
 ---
 
+## Demo visitor analytics
+
+The public demo keeps a private log of how it's used, so I can see whether
+anyone tried the live site and what they asked. It's on only with
+`DEMO_MODE=1` (or `ANALYTICS_ENABLED=1`), so a local, personal run is never
+logged. The code is `src/analytics.py`.
+
+- **One permanent SQLite file:** `data/analytics/analytics.sqlite` on the data
+  volume (`ANALYTICS_DB_PATH` overrides it). It's separate from the visitor
+  chats, and nothing deletes it: not the demo reset, not the nightly restart,
+  not the 30-day chat expiry.
+- **What's recorded.** There are three tables. Every row has the time, the
+  visitor id (the session cookie), the raw client IP, the full user-agent,
+  the device, browser and OS parsed from it, and city and country from an
+  offline IP database.
+  - `turns`: every question or button press that runs a turn. It records
+    the question, the answer, the route taken, latency, Gemini tokens and
+    the outcome. The outcome is `ok`, `error`, `turn_timeout`,
+    `gemini_timeout`, `demo_full`, `demo_rate_limit`, `gemini_429`, `busy` or
+    `not_ready`. Refused questions are recorded too.
+  - `visits`: page loads where the page's JavaScript ran, so crawlers that
+    don't run JS aren't counted. It keeps the `?src=` tag from the link
+    (`?src=resume`, `?src=linkedin`, a company name), the referrer, the screen
+    size, the language and the timezone.
+  - `events`: clicks on the graph button and the settings button.
+- **Views for a dashboard:**
+  - `daily_visits`: page loads and unique visitors per day.
+  - `visitors`: first and last seen, visits, questions, bounced or not, first
+    `src` and referrer, and last location.
+  - `daily_outcomes`: errors, timeouts, slow answers (60 s or more), refusals,
+    Gemini 429s and tokens per day.
+- **Never on the request path.** A request puts the row on a queue and moves
+  on. One background thread does the IP lookup and the database write.
+- **Nothing is served back.** The page reports visits and clicks to a
+  write-only `/client-event` endpoint. It's capped at 4 KB, rate limited per
+  IP, and returns nothing. The data leaves the server only through
+  `scripts/export_analytics.py`, run on my own PC. Over SSH, it makes a
+  consistent SQLite backup inside the container, copies it into the
+  gitignored `analytics_export/` folder, and checks its SHA-256. See
+  [DEPLOY.md](DEPLOY.md#12-day-2-operations).
+- **Tokens** are summed per turn from each Gemini response's `usage_metadata`.
+  Calls made inside the MCP tool subprocess, the research search's query
+  rewrite, aren't counted.
+- **IP location** comes from DB-IP's free *IP to City Lite* database,
+  downloaded when the Docker image is built. If the download fails, no
+  location is recorded.
+  [IP Geolocation by DB-IP](https://db-ip.com), licensed under
+  [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
+
+---
+
 ## Setup
 
 **Prerequisites:** Python 3.11+, a `.fitnotes` backup exported from the FitNotes
@@ -308,7 +359,7 @@ The 3D ontology viewer is at `http://localhost:3000/graph`.
 
 ```bash
 python -m src.data_agent 90 "Lat Pulldown" "Deadlift"   # Data Agent standalone
-python -m pytest                                        # 2,056 tests
+python -m pytest                                        # 2,102 tests
 ```
 
 ---
@@ -347,12 +398,13 @@ python -m pytest                                        # 2,056 tests
 │   ├── ontology*.py           # ontology load / propose / reconcile
 │   ├── prompt_blocks.py       # prompt text shared by both agents
 │   ├── memory.py  demographics.py  wal.py  settings.py  units.py  checkpoint.py
+│   ├── demo_mode.py  visitor_sessions.py  analytics.py   # public demo
 │   └── rag.py  llm.py  db.py  schema_prompt.py  text_to_sql.py  stdio_utf8.py
 ├── mcp_servers/combined_server.py   # all 27 exposed MCP tools
 ├── ontology/                  # muscles, exercises, edges, aliases (CSV)
 ├── frontend/                  # index.html (chat), graph.html (3D), body/, vendor/
 ├── docs/                      # routing-rules, data_agent_spec, changelog
-├── tests/                     # 87 files, 2,056 tests
+├── tests/                     # 88 files, 2,102 tests
 ├── evals/  scripts/  corpus/
 ├── server.py                  # FastAPI web server
 └── cli.py                     # async CLI
@@ -382,7 +434,7 @@ package answers them deterministically. There is one read path, not two. The
 ## Testing
 
 ```bash
-python -m pytest                    # 2,056 tests
+python -m pytest                    # 2,102 tests
 python evals/run_evals.py           # SQL correctness + LLM-as-judge
 python evals/stress_test.py         # adversarial suite
 ```

@@ -11,7 +11,12 @@ name: fitnotes-coach
 
 services:
   app:
-    build: .
+    build:
+      context: .
+      args:
+        # Month of the DB-IP city database to download (YYYY-MM). Empty = this
+        # month or the last. Change it to refresh a cached download.
+        GEOIP_MONTH: ${GEOIP_MONTH:-}
     image: fitnotes-coach:latest
     restart: unless-stopped
     init: true                      # reap the MCP / UI child processes
@@ -31,12 +36,19 @@ services:
       DEMO_SESSION_MAX_KB: ${DEMO_SESSION_MAX_KB:-256}
       DEMO_MAX_QUEUED_TURNS: ${DEMO_MAX_QUEUED_TURNS:-0}
       DEMO_TURN_TIMEOUT_SECONDS: ${DEMO_TURN_TIMEOUT_SECONDS:-300}
+      # Private visitor analytics (data/analytics/analytics.sqlite, never wiped;
+      # export over SSH with scripts/export_analytics.py). Empty = on with DEMO_MODE.
+      # ANALYTICS_DB_PATH and GEOIP_DB_PATH keep their container defaults
+      # (data/analytics/analytics.sqlite, /app/seed/geo/dbip-city-lite.mmdb).
+      ANALYTICS_ENABLED: ${ANALYTICS_ENABLED:-}
+      ANALYTICS_BEACON_PER_MINUTE: ${ANALYTICS_BEACON_PER_MINUTE:-30}
+      ANALYTICS_BEACON_PER_DAY: ${ANALYTICS_BEACON_PER_DAY:-500}
       # Container plumbing — not meant to be changed.
       OPEN_BROWSER: "0"
       BACKEND_HOST: 127.0.0.1
       FRONTEND_PROXY_TIMEOUT: "900" # agent turns can take minutes
     volumes:
-      - app-data:/app/data          # workout DB, Chroma index, memory, settings, visitors' chats
+      - app-data:/app/data          # workout DB, Chroma index, memory, settings, visitors' chats, analytics
     expose:
       - "3000"
     healthcheck:
