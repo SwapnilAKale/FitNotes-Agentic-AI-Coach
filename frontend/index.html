@@ -698,6 +698,33 @@ function scrollBottom() {
   c.scrollTop = c.scrollHeight;
 }
 
+// Phones and tablets: the chat scrolled to the end while the page was still
+// settling, and then got shorter (the banners, the address bar sliding in, the
+// page coming back from the ontology viewer), so it opened a little above the
+// last message. Keep it pinned to the end for as long as the person is there.
+const COMPACT_SCREEN = window.matchMedia('(max-width: 1024px)');
+(function pinChatToEnd() {
+  const c = document.getElementById('chat');
+  let atEnd = true, areaH = c.clientHeight, contentH = c.scrollHeight;
+  c.addEventListener('scroll', () => {
+    // The browser also scrolls when the area or its content changes size;
+    // only a scroll at unchanged sizes is the person moving away from the end.
+    if (c.clientHeight !== areaH || c.scrollHeight !== contentH) return;
+    atEnd = c.scrollHeight - c.scrollTop - c.clientHeight < 40;
+  }, {passive: true});
+  const keep = () => {
+    areaH = c.clientHeight;
+    contentH = c.scrollHeight;
+    if (COMPACT_SCREEN.matches && atEnd) scrollBottom();
+  };
+  const ro = new ResizeObserver(keep);
+  ro.observe(c);                 // the chat area got shorter or taller
+  ro.observe(chatInner());       // messages drawn or redrawn
+  window.addEventListener('pageshow', () => {   // back from another page
+    if (COMPACT_SCREEN.matches) { atEnd = true; scrollBottom(); }
+  });
+})();
+
 function setBusy(b) {
   busy = b;
   document.getElementById('input').disabled = b;

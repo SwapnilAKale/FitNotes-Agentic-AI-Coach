@@ -192,6 +192,63 @@
     .legend{display:none}
   }
   @media (prefers-reduced-motion:reduce){*{transition-duration:.01ms !important}}
+
+  /* Touch screens get the touch gestures in the hint (phones and tablets only). */
+  .hint-touch{display:none}
+  @media (max-width:1024px) and (pointer:coarse){
+    .hint-mouse{display:none}
+    .hint-touch{display:block}
+  }
+
+  /* ── Phones (up to 767px) ────────────────────────────────────────────
+     The page scrolls as one: a compact header, the figure on most of the
+     screen, then the audit card and the panel in the page below it. */
+  @media (max-width:767px){
+    html,body{height:auto}
+    body{display:block;min-height:100%;overflow-x:hidden;overflow-y:auto}
+    header{gap:8px 10px;padding:10px 14px}
+    header h1{order:1;flex:1 0 70%;font-size:17px}   /* leaves the first row to title + theme */
+    #theme{order:2}
+    a.back{order:3}
+    .modes{order:4;margin-left:auto}
+    .stat-row{order:5;flex:1 0 100%;gap:10px}
+    .spacer,#rail-toggle{display:none}
+    main{display:block}
+    #stage{height:64svh;min-height:340px}
+    /* One row of tools that slides sideways instead of stacking over the figure. */
+    .toolbar{left:0;right:0;top:0;padding:10px 12px;flex-wrap:nowrap;overflow-x:auto;
+             scrollbar-width:none;touch-action:pan-x}
+    .toolbar::-webkit-scrollbar{display:none}
+    .hint{left:12px;right:12px;bottom:10px;text-align:center}
+    aside,body[data-rail="off"] aside{display:flex;border-left:0;border-top:1px solid var(--line)}
+    .rail-scroll{overflow:visible}
+    body[data-mode="audit"] .console{order:-1;border-top:0;border-bottom:1px solid var(--line)}
+  }
+
+  /* ── Tablets (768–1024px) ─────────────────────────────────────────────
+     Upright: stacked like a phone, with a taller figure and the legend.
+     Sideways: figure and panel side by side; the panel scrolls as one, with
+     the audit card held at its top. */
+  @media (min-width:768px) and (max-width:1024px) and (orientation:portrait){
+    html,body{height:auto}
+    body{display:block;min-height:100%;overflow-x:hidden;overflow-y:auto}
+    .spacer{flex:1 1 0}
+    #rail-toggle{display:none}
+    main{display:block}
+    #stage{height:60svh;min-height:420px}
+    .legend{display:flex}
+    aside,body[data-rail="off"] aside{display:flex;border-left:0;border-top:1px solid var(--line)}
+    .rail-scroll{overflow:visible}
+    body[data-mode="audit"] .console{order:-1;border-top:0;border-bottom:1px solid var(--line)}
+  }
+  @media (min-width:768px) and (max-width:1024px) and (orientation:landscape){
+    main{flex-direction:row}
+    aside{flex:0 0 320px;border-top:0;border-left:1px solid var(--line);overflow-y:auto;
+          overscroll-behavior:contain}
+    .rail-scroll{flex:none;overflow:visible}
+    body[data-mode="audit"] .console{order:-1;position:sticky;top:0;z-index:1;
+                                     border-top:0;border-bottom:1px solid var(--line)}
+  }
 </style>
 <script type="importmap">
 {"imports":{"three":"/vendor/three.module.js"}}
@@ -241,9 +298,12 @@
       <div class="row"><span class="dot" style="background:var(--node)"></span>muscle
         <span style="width:8px"></span><span class="dot" style="background:var(--accent)"></span>exercise</div>
     </div>
-    <div class="overlay hint">
+    <div class="overlay hint hint-mouse">
       drag to move · <kbd>right-drag</kbd> to rotate<br>
       pinch or <kbd>ctrl</kbd>+scroll to zoom · scroll to pan
+    </div>
+    <div class="overlay hint hint-touch">
+      drag to move · pinch to zoom · drag with two fingers to rotate
     </div>
   </div>
   <aside>
