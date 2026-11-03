@@ -15,6 +15,10 @@
     --scene:#EEEBE1; --node:#4B5762; --anat:#B6AF9C; --body:#9AA3AA;
     --shadow:0 1px 2px rgba(20,26,33,.10),0 8px 24px -12px rgba(20,26,33,.28);
     --r:3px;
+    /* pull-to-reload card (vendor/pull-reload.js), in the plate's palette */
+    --ptr-bg:var(--panel); --ptr-border:var(--line); --ptr-shadow:var(--shadow);
+    --ptr-stroke:var(--fg-2); --ptr-face:var(--fg); --ptr-bell:var(--fg-3);
+    --ptr-plate:var(--accent); --ptr-label:var(--fg-3); --ptr-label-on:var(--fg);
   }
   :root[data-theme="dark"]{
     --limit:#6E8AA6;
@@ -204,6 +208,7 @@
      The page scrolls as one: a compact header, the figure on most of the
      screen, then the audit card and the panel in the page below it. */
   @media (max-width:767px){
+    html{overscroll-behavior-y:none}       /* the in-app pull to reload, not Chrome's arrow */
     html,body{height:auto}
     body{display:block;min-height:100%;overflow-x:hidden;overflow-y:auto}
     header{gap:8px 10px;padding:10px 14px}
@@ -215,10 +220,9 @@
     .spacer,#rail-toggle{display:none}
     main{display:block}
     #stage{height:64svh;min-height:340px}
-    /* One row of tools that slides sideways instead of stacking over the figure. */
-    .toolbar{left:0;right:0;top:0;padding:10px 12px;flex-wrap:nowrap;overflow-x:auto;
-             scrollbar-width:none;touch-action:pan-x}
-    .toolbar::-webkit-scrollbar{display:none}
+    /* Two rows of tools, every control whole; the figure is framed below them. */
+    .toolbar{left:12px;right:12px;top:10px}
+    .toolbar>*{flex-shrink:0}
     .hint{left:12px;right:12px;bottom:10px;text-align:center}
     aside,body[data-rail="off"] aside{display:flex;border-left:0;border-top:1px solid var(--line)}
     .rail-scroll{overflow:visible}
@@ -229,6 +233,9 @@
      Upright: stacked like a phone, with a taller figure and the legend.
      Sideways: figure and panel side by side; the panel scrolls as one, with
      the audit card held at its top. */
+  @media (min-width:768px) and (max-width:1024px){
+    html{overscroll-behavior-y:none}       /* the in-app pull to reload, not Chrome's arrow */
+  }
   @media (min-width:768px) and (max-width:1024px) and (orientation:portrait){
     html,body{height:auto}
     body{display:block;min-height:100%;overflow-x:hidden;overflow-y:auto}
@@ -253,6 +260,8 @@
 <script type="importmap">
 {"imports":{"three":"/vendor/three.module.js"}}
 </script>
+<!-- Pull to reload on touch phones and tablets (shared with the chat page). -->
+<script src="/vendor/pull-reload.js"></script>
 </head>
 <body data-mode="explore" data-rail="on">
 
@@ -430,6 +439,27 @@ renderer.domElement.addEventListener('wheel', e => {
   }
   saveUI();
 }, { passive:false });
+
+/* pinch to zoom on touch screens. OrbitControls' own zoom is off so the wheel
+   above can pan, and that also switched off its pinch; this puts pinch back.
+   Two fingers still rotate (OrbitControls' DOLLY_ROTATE minus the dolly). */
+let pinch = null;
+const fingers = e => Math.hypot(e.touches[0].clientX - e.touches[1].clientX,
+                                e.touches[0].clientY - e.touches[1].clientY);
+renderer.domElement.addEventListener('touchstart', e => {
+  pinch = e.touches.length === 2
+    ? { d: fingers(e), len: camera.position.distanceTo(controls.target) } : null;
+}, { passive:true });
+renderer.domElement.addEventListener('touchmove', e => {
+  if (!pinch || e.touches.length !== 2) return;
+  const d = THREE.MathUtils.clamp(pinch.len * pinch.d / Math.max(1, fingers(e)),
+                                  controls.minDistance, controls.maxDistance);
+  const off = camera.position.clone().sub(controls.target);
+  camera.position.copy(controls.target).add(off.setLength(d));
+}, { passive:true });
+renderer.domElement.addEventListener('touchend', e => {
+  if (e.touches.length < 2 && pinch){ pinch = null; saveUI(); }
+}, { passive:true });
 
 /* ---- geometry kernel -------------------------------------------------
    A chain of rings {c:[x,y,z], rx, rz} lofted into a closed tube. The SAME
@@ -769,16 +799,30 @@ function placeLabels(){
 }
 
 /* ---- camera framing --------------------------------------------------- */
+// Phones and tablets: the toolbar and the hint sit over the top and bottom of
+// the figure's area, so frame the figure in the band between them.
+const COMPACT = matchMedia('(max-width:1024px)');
+function freeBand(){
+  const H = stage.clientHeight, top = stage.getBoundingClientRect().top;
+  if (!COMPACT.matches || !H) return { frac: 1, shift: 0 };
+  const tb = $('.toolbar').getBoundingClientRect().bottom - top + 8;
+  const hint = [...document.querySelectorAll('.hint')].find(h => h.offsetParent);
+  const hb = hint ? H - (hint.getBoundingClientRect().top - top) + 8 : 0;
+  return { frac: Math.max(.4, (H - tb - hb) / H), shift: (tb - hb) / 2 };
+}
 function fitView(){
   const box = new THREE.Box3().setFromObject(GROUP);
   const c = box.getCenter(new THREE.Vector3());
   const size = box.getSize(new THREE.Vector3());
-  const fitH = size.y / (2 * Math.tan(camera.fov * Math.PI / 360));
+  const band = freeBand();
+  const fitH = size.y / (2 * Math.tan(camera.fov * Math.PI / 360)) / band.frac;
   const fitW = size.x / camera.aspect / (2 * Math.tan(camera.fov * Math.PI / 360));
   const dist = 1.10 * Math.max(fitH, fitW, size.z);
   controls.target.copy(c);
   camera.position.set(c.x + dist * .34, c.y + dist * .06, c.z + dist * .93);
-  camera.updateProjectionMatrix(); controls.update(); saveUI();
+  camera.updateProjectionMatrix(); controls.update();
+  if (band.shift){ camera.updateMatrixWorld(); panScreen(0, band.shift); controls.update(); }
+  saveUI();
 }
 
 /* ---- picking ---------------------------------------------------------- */
@@ -1188,6 +1232,17 @@ $('#theme').onclick = () => {
   UI.theme = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
   document.documentElement.dataset.theme = UI.theme; saveUI(); readTheme();
 };
+/* Pull to reload (touch phones and tablets): the same lifter as the chat, in
+   this page's palette. A pull starts on the header, or on the panel below the
+   figure, only with the page at its top; the figure itself is for the model
+   (one finger moves it). Review decisions are already saved as they are made. */
+const aside = $('aside');
+pullToReload({
+  anchor: $('header'),
+  zone: t => window.scrollY <= 0
+    && ($('header').contains(t) || (aside.contains(t) && aside.scrollTop <= 0)),
+});
+
 function renderStats(){
   $('#sMus').textContent = DATA.muscles.length;
   $('#sEx').textContent = DATA.exercises.length;
@@ -1244,8 +1299,10 @@ function renderStats(){
   readTheme(); renderStats();
   setMode(UI.mode, false);
   if (sel) select(sel.kind, sel.id); else renderRail();
-  if (UI.cam){ camera.position.fromArray(UI.cam.p); controls.target.fromArray(UI.cam.t);
-               controls.update(); }
+  // A phone or tablet opens framed between the toolbar and the hint, never at a
+  // camera saved under another layout or screen size.
+  if (UI.cam && !COMPACT.matches){ camera.position.fromArray(UI.cam.p); controls.target.fromArray(UI.cam.t);
+                                   controls.update(); }
   else fitView();
   controls.addEventListener('end', saveUI);
 })();
