@@ -7,6 +7,9 @@
   <script src="https://cdn.tailwindcss.com"></script>
   <style>
     body { background: #0f172a; font-family: system-ui, sans-serif; }
+    /* A phone's 100vh includes the space under its address bar, which pushed
+       the line under the input box off-screen. dvh is the visible height. */
+    body.h-screen { height: 100vh; height: 100dvh; }
     #chat { scrollbar-width: thin; scrollbar-color: #334155 transparent; }
     #chat::-webkit-scrollbar { width: 6px; }
     #chat::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
@@ -206,6 +209,43 @@
                        border-radius: 2px; background: #334155; overflow: hidden; }
     #dictation-level span { display: block; height: 100%; width: 0; background: #3b82f6; }
     #dictation-timer { font-size: 12px; color: #94a3b8; font-variant-numeric: tabular-nums; flex-shrink: 0; }
+    /* The dictation notice: attached above the input box like the /log menu,
+       same surface as the box, one tone colour on the icon. */
+    #dict-notice {
+      position: absolute; left: 0; right: 0; bottom: calc(100% + 8px); z-index: 40;
+      display: grid; grid-template-columns: 18px minmax(0, 1fr) 28px; column-gap: 10px;
+      padding: 12px 8px 12px 14px;
+      background: #1e293b; border: 1px solid #334155; border-radius: 14px;
+      box-shadow: 0 12px 32px rgba(2, 6, 23, .5);
+      animation: dn-in .16s ease-out;
+    }
+    #dict-notice[hidden] { display: none; }
+    @keyframes dn-in { from { opacity: 0; transform: translateY(6px); } }
+    #dict-notice .dn-icon { width: 18px; height: 18px; margin-top: 1px; color: #fbbf24; }
+    #dict-notice[data-tone="wait"] .dn-icon { color: #60a5fa; }
+    #dict-notice[data-tone="info"] .dn-icon { color: #94a3b8; }
+    #dict-notice .dn-title { font-size: 13px; line-height: 20px; font-weight: 600; color: #f1f5f9; }
+    #dict-notice .dn-body { font-size: 12.5px; line-height: 1.45; color: #94a3b8; }
+    #dict-notice .dn-body:empty { display: none; }
+    #dict-notice .dn-path {
+      display: flex; flex-wrap: wrap; align-items: center; row-gap: 2px;
+      margin-top: 6px; font-size: 12.5px; line-height: 1.6; color: #e2e8f0;
+    }
+    #dict-notice .dn-path[hidden] { display: none; }
+    #dict-notice .dn-sep { color: #64748b; margin: 0 4px; }
+    #dict-notice .dn-close {
+      grid-column: 3; grid-row: 1 / span 2; align-self: start;
+      width: 28px; height: 28px; margin-top: -4px; border-radius: 8px;
+      display: flex; align-items: center; justify-content: center; color: #94a3b8;
+    }
+    #dict-notice .dn-close:hover { background: #334155; color: #fff; }
+    #dict-notice .dn-retry {
+      grid-column: 2; justify-self: start; margin: 8px 0 0 -8px; padding: 5px 8px; border-radius: 8px;
+      font-size: 12.5px; font-weight: 600; color: #93c5fd; font-variant-numeric: tabular-nums;
+    }
+    #dict-notice .dn-retry:hover:not(:disabled) { background: rgba(59, 130, 246, .14); }
+    #dict-notice .dn-retry:disabled { color: #64748b; cursor: default; }
+    #dict-notice .dn-retry[hidden] { display: none; }
     #mic-btn .stop-icon, #mic-btn .spinner { display: none; }
     #mic-btn[data-state="recording"] .mic-icon { display: none; }
     #mic-btn[data-state="recording"] .stop-icon { display: block; }
@@ -218,6 +258,7 @@
     #mic-btn[data-state="recording"]:hover { background: #ef4444; }
     @media (prefers-reduced-motion: reduce) {
       #input-wrap #input, #dictation, #dictation-wave, #dictation-caption, #dictation-shimmer { transition: none; }
+      #dict-notice { animation: none; }
       #dictation, #input-wrap[data-dictation] #input { transform: none; filter: none; }
       #dictation-wave { display: none; }
       #dictation-level { display: block; }
@@ -281,6 +322,20 @@
         <!-- Slash-command autocomplete (shown while typing "/" … "/log") -->
         <div id="slash-menu">
           <button id="slash-log-btn"><span class="slash-cmd">/log</span><span class="slash-desc">Log a workout — using /log gives a more reliable log</span></button>
+        </div>
+
+        <!-- Dictation notice: what went wrong with the mic and how to fix it -->
+        <div id="dict-notice" role="status" aria-live="polite" hidden>
+          <svg class="dn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"></svg>
+          <div class="dn-text">
+            <p class="dn-title"></p>
+            <p class="dn-body"></p>
+            <p class="dn-path" hidden></p>
+          </div>
+          <button class="dn-close" type="button" aria-label="Dismiss">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+          </button>
+          <button class="dn-retry" type="button" hidden>Try again</button>
         </div>
 
         <!-- Attach button + menu -->
@@ -348,8 +403,7 @@
           </svg>
         </button>
       </div>
-      <!-- Dictation notices (model loading, limits, errors) take this line's place for a while. -->
-      <div id="input-note" role="status" aria-live="polite" class="text-center text-xs text-gray-600 mt-2">FitNotes Coach can make mistakes. Verify important information.</div>
+      <div class="text-center text-xs text-gray-600 mt-2">FitNotes Coach can make mistakes. Verify important information.</div>
     </div>
   </div>
 
@@ -653,7 +707,15 @@ function setBusy(b) {
   // rather than leave a live mic behind a disabled box; its text still lands.
   if (b && stt && stt.state !== 'idle' && stt.state !== 'transcribing') stt.stop();
   syncDictationControls();
-  if (!b) document.getElementById('input').focus();
+  if (!b) focusInput();
+}
+
+// On a phone, focusing the box opens the on-screen keyboard, so there only the
+// person's own tap on the box does that. With a mouse, the cursor goes back
+// into the box as before.
+const TOUCH_SCREEN = window.matchMedia('(hover: none) and (pointer: coarse)');
+function focusInput() {
+  if (!TOUCH_SCREEN.matches) document.getElementById('input').focus();
 }
 
 // The server refused a request because a turn is still running (a 429 that is
@@ -1558,7 +1620,6 @@ document.getElementById('disambig-cancel').addEventListener('click', cancelDisam
 // cursor while the person is still talking. Nothing is ever sent by itself:
 // the person reads the text and presses send.
 const DICTATION_TIP = 'Dictate. Audio is transcribed on this server and not stored.';
-const NOTE_DEFAULT = 'FitNotes Coach can make mistakes. Verify important information.';
 const MORPH_MS = 250, TRANSCRIBING_MIN_MS = 500;
 const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
 let stt = null;              // set by initDictation in a browser that can record
@@ -1569,7 +1630,7 @@ let dictBefore = '';         // the box's text when dictation started; cancel pu
 let dictInsertAt = 0;        // where the next sentence goes
 let dictBegan = 0, dictClock = null, dictRaf = 0, dictLast = 0, dictTranscribingAt = 0;
 let dictRetryAt = 0, dictRetryText = '';
-let noteTimer = null, noteKind = '';
+let noticeTimer = null, captionIsStatus = false;
 let wave = {env: 0, level: 0, bars: [], td: null, fd: null, analyser: null};
 
 function dictationActive() {
@@ -1585,24 +1646,56 @@ function dictationUnavailable() {
   return null;
 }
 
-// The line under the box: the disclaimer, or a dictation notice for a while.
-// kind: 'info' | 'error' | 'loading'. ms = 0 keeps it until replaced.
-function showNote(text, kind = 'info', ms = 5000) {
-  const el = document.getElementById('input-note');
-  clearTimeout(noteTimer);
-  noteKind = kind;
-  el.textContent = text;
-  el.classList.remove('text-gray-600', 'text-gray-400', 'text-red-300');
-  el.classList.add(kind === 'error' ? 'text-red-300' : 'text-gray-400');
-  if (ms) noteTimer = setTimeout(clearNote, ms);
+// The notice attached to the top of the input box: what went wrong with
+// dictation and how to fix it, where the person just tapped.
+//   tone   'fix' (something they can fix) | 'wait' | 'info'
+//   path   settings steps, shown as Settings › Apps › …
+//   retry  show "Try again"; until: a time before which it counts down instead
+//   ms     hide by itself after this long (information only)
+const NOTICE_ICONS = {
+  fix: '<path d="M2 2l20 20M9 9v2a3 3 0 0 0 5.1 2.1M15 9.3V5a3 3 0 0 0-5.9-.7"/><path d="M19 10v1a7 7 0 0 1-.6 2.9M5 10v1a7 7 0 0 0 11.2 5.6M12 18v4M8 22h8"/>',
+  wait: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+  info: '<circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/>',
+};
+function showNotice({tone = 'fix', title, body = '', path = null, retry = false, until = 0, ms = 0}) {
+  const el = document.getElementById('dict-notice');
+  clearTimeout(noticeTimer);
+  el.dataset.tone = tone;
+  el.querySelector('.dn-icon').innerHTML = NOTICE_ICONS[tone];
+  el.querySelector('.dn-title').textContent = title;
+  el.querySelector('.dn-body').textContent = body;
+  const p = el.querySelector('.dn-path');
+  p.replaceChildren(...(path || []).flatMap((step, i) => {
+    const s = document.createElement('span');
+    s.textContent = step;
+    if (!i) return [s];
+    const sep = document.createElement('span');
+    sep.className = 'dn-sep';
+    sep.textContent = '›';
+    return [sep, s];
+  }));
+  p.hidden = !path;
+  const btn = el.querySelector('.dn-retry');
+  btn.hidden = !retry;
+  const tick = () => {
+    const left = Math.ceil((until - Date.now()) / 1000);
+    btn.disabled = left > 0;
+    btn.textContent = left > 0 ? `Try again in ${Math.floor(left / 60)}:${String(left % 60).padStart(2, '0')}` : 'Try again';
+    if (left > 0) noticeTimer = setTimeout(tick, 1000);
+  };
+  if (retry) tick();
+  el.hidden = false;
+  if (ms) noticeTimer = setTimeout(hideNotice, ms);
 }
-function clearNote() {
-  const el = document.getElementById('input-note');
-  clearTimeout(noteTimer);
-  noteKind = '';
-  el.textContent = NOTE_DEFAULT;
-  el.classList.remove('text-gray-400', 'text-red-300');
-  el.classList.add('text-gray-600');
+function hideNotice() {
+  clearTimeout(noticeTimer);
+  document.getElementById('dict-notice').hidden = true;
+}
+
+// While recording, short status lines sit inside the wave, where the person is looking.
+function setCaptionStatus(text) {
+  document.getElementById('dictation-caption').textContent = text;
+  captionIsStatus = !!text;
 }
 
 function syncDictationControls() {
@@ -1629,6 +1722,7 @@ function insertDictated(text) {
   dictInsertAt += piece.length;
   resizeInput(input);
   document.getElementById('dictation-caption').textContent = text;
+  captionIsStatus = false;
 }
 
 function tickDictationClock() {
@@ -1675,7 +1769,7 @@ function closeWave() {
     cancelAnimationFrame(dictRaf);
     dictOpen = false;
     syncDictationControls();
-    if (!input.disabled) { input.focus(); input.setSelectionRange(dictInsertAt, dictInsertAt); }
+    if (!input.disabled) { focusInput(); input.setSelectionRange(dictInsertAt, dictInsertAt); }
   }, ms);
 }
 
@@ -1743,10 +1837,67 @@ function startDictation() {
   dictBefore = input.value;
   dictInsertAt = input.selectionStart ?? input.value.length;
   dictCancelled = false;
-  if (noteKind) clearNote();
+  hideNotice();
   openWave();
   stt.start().catch(() => {});   // failures arrive through onerror
   syncDictationControls();
+  // The first time, the browser asks for the microphone: say what it is waiting for.
+  micPermission().then(state => {
+    if (state === 'prompt' && stt.state === 'connecting') setCaptionStatus('Allow the microphone when your browser asks');
+  });
+}
+
+// This site's microphone permission: 'granted' | 'prompt' | 'denied', or null
+// where the browser won't say.
+async function micPermission() {
+  try { return (await navigator.permissions.query({name: 'microphone'})).state; } catch { return null; }
+}
+
+// Where this device keeps the browser's own microphone switch.
+function deviceMicSettings() {
+  const ua = navigator.userAgent;
+  const browser = /SamsungBrowser/.test(ua) ? 'Samsung Internet' : /EdgA?\/|Edg\//.test(ua) ? 'Edge'
+    : /Firefox|FxiOS/.test(ua) ? 'Firefox' : /CriOS|Chrome/.test(ua) ? 'Chrome' : /Safari/.test(ua) ? 'Safari' : null;
+  const app = browser || 'your browser';
+  if (/Android/.test(ua)) return {browser, path: ['Settings', 'Apps', app, 'Permissions', 'Microphone']};
+  if (/iPhone|iPad/.test(ua)) return {browser, path: ['Settings', 'Apps', app, 'Microphone']};
+  if (/Windows/.test(ua)) return {browser, path: ['Settings', 'Privacy & security', 'Microphone']};
+  if (/Mac OS X/.test(ua)) return {browser, path: ['System Settings', 'Privacy & Security', 'Microphone', app]};
+  return {browser, path: null};
+}
+
+// What went wrong, in the person's terms, and the way out.
+async function explainDictationError(e) {
+  const tap = TOUCH_SCREEN.matches ? 'Tap' : 'Click';
+  if (e.reason === 'microphone' && (e.name === 'NotAllowedError' || e.name === 'SecurityError')) {
+    // Refused without asking: this site is blocked, or the device keeps the
+    // browser itself away from the microphone.
+    if (await micPermission() === 'denied') {
+      return {title: 'Microphone blocked for this site',
+              body: `${tap} the icon left of the address bar, then allow Microphone under Permissions.`, retry: true};
+    }
+    const d = deviceMicSettings();
+    return {title: `${d.browser || 'This browser'} can't use the microphone`,
+            body: d.path ? 'Turn it on in your device settings:' : "Allow it in your device's privacy settings.",
+            path: d.path, retry: true};
+  }
+  if (e.reason === 'microphone' && (e.name === 'NotFoundError' || e.name === 'OverconstrainedError')) {
+    return {title: 'No microphone found', body: "Connect one, or check it isn't switched off.", retry: true};
+  }
+  if (e.reason === 'microphone' && (e.name === 'NotReadableError' || e.name === 'AbortError')) {
+    return {title: 'Microphone in use', body: 'Another app is using it. Close that app, then try again.', retry: true};
+  }
+  if (e.reason === 'busy') {
+    return {tone: 'wait', title: 'Someone else is dictating', body: 'One person can dictate at a time.', retry: true};
+  }
+  if (e.reason === 'rate_limited') {
+    return {tone: 'wait', title: 'Too many recordings in a row', body: 'Dictation is paused for a moment.',
+            retry: true, until: dictRetryAt};
+  }
+  if (e.reason === 'connection') {
+    return {title: 'Dictation lost its connection', body: 'Check your internet connection, then try again.', retry: true};
+  }
+  return {title: 'Dictation stopped', body: e.message, retry: true};
 }
 
 function cancelDictation() {
@@ -1777,11 +1928,10 @@ function wireDictation() {
       if (!dictBegan) { dictBegan = Date.now(); tickDictationClock(); dictClock = setInterval(tickDictationClock, 500); }
       // The first recording after a restart waits while the model loads; the
       // audio is buffered meanwhile, so nothing said is lost.
-      if (detail.loading) showNote('Loading speech model, keep talking…', 'loading', 0);
-      else if (noteKind === 'loading') clearNote();
+      if (detail.loading) setCaptionStatus('Loading speech model, keep talking');
+      else if (captionIsStatus) setCaptionStatus('');
     } else if (state === 'transcribing') {
       clearInterval(dictClock);
-      if (noteKind === 'loading') clearNote();
       if (wrap.dataset.dictation) wrap.dataset.dictation = 'transcribing';
       dictTranscribingAt = Date.now();
     } else if (state === 'idle') {
@@ -1794,9 +1944,6 @@ function wireDictation() {
         input.value = dictBefore;
         dictInsertAt = Math.min(dictInsertAt, dictBefore.length);
         dictCancelled = false;
-        showNote('Dictation cancelled.', 'info', 2500);
-      } else if (!detail.error && noteKind === 'loading') {
-        clearNote();
       }
       // Text that was ready at once would only flash the shimmer: hold it briefly.
       const held = finished && wrap.dataset.dictation === 'transcribing' ? TRANSCRIBING_MIN_MS - (Date.now() - dictTranscribingAt) : 0;
@@ -1810,20 +1957,21 @@ function wireDictation() {
     // sqrt: ordinary speech sits around 0.1–0.4 and would barely move the meter.
     document.getElementById('dictation-level').firstElementChild.style.width = Math.round(Math.sqrt(level) * 100) + '%';
   };
-  stt.onlimit = reason => showNote(reason === 'max_duration'
-    ? 'Reached the 10-minute limit, so dictation stopped. Your text is on its way.'
-    : 'The microphone went silent, so dictation stopped. Your text is on its way.', 'info', 6000);
-  stt.ondone = text => { if (!text.trim()) showNote('No speech was recognised.', 'info', 3000); };
-  stt.onerror = e => {
-    // busy: someone else is dictating. rate_limited: the mic waits out
-    // retryAfterSeconds. microphone: permission was blocked.
+  stt.onlimit = reason => showNotice(reason === 'max_duration'
+    ? {tone: 'info', title: '10-minute limit reached', body: 'Dictation stopped. Your text is in the box.', ms: 6000}
+    : {tone: 'info', title: 'The microphone went quiet', body: 'Dictation stopped. Your text is in the box.', ms: 6000});
+  stt.ondone = text => {
+    if (!text.trim()) showNotice({tone: 'info', title: "Didn't catch anything", body: 'Try again a little closer to the microphone.', retry: true, ms: 8000});
+  };
+  stt.onerror = async e => {
+    // rate_limited: the mic waits out retryAfterSeconds.
     if (e.reason === 'rate_limited' && e.retryAfterSeconds) {
       dictRetryAt = Date.now() + e.retryAfterSeconds * 1000;
       dictRetryText = e.message;
       setTimeout(syncDictationControls, e.retryAfterSeconds * 1000 + 50);
     }
-    showNote(e.message, 'error', 8000);
     syncDictationControls();
+    showNotice(await explainDictationError(e));
   };
 }
 
@@ -1835,6 +1983,9 @@ document.getElementById('mic-btn').addEventListener('click', () => {
   else if (stt.state === 'recording' || stt.state === 'connecting') stt.stop();
 });
 document.getElementById('dictation-cancel').addEventListener('click', cancelDictation);
+document.querySelector('#dict-notice .dn-close').addEventListener('click', hideNotice);
+document.querySelector('#dict-notice .dn-retry').addEventListener('click', () => { hideNotice(); startDictation(); });
+document.getElementById('input').addEventListener('input', hideNotice);   // typing instead: the notice has done its job
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && stt && stt.state !== 'idle') { e.preventDefault(); cancelDictation(); }
 });

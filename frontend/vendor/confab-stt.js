@@ -8,6 +8,7 @@
  *   stt.onlimit = reason => ...            // 'max_duration' or 'no_audio': the recording stopped by itself
  *   stt.ondone = text => ...               // the whole text, however the recording ended
  *   stt.onerror = error => ...             // error.reason: 'busy', 'rate_limited', 'microphone', 'connection', ...
+ *                                          // ('microphone' also has error.name, the browser's: NotAllowedError, ...)
  *   await stt.start();                     // asks for the microphone; call it from a click
  *   const text = await stt.stop();         // resolves with the whole text
  *   stt.cancel();                          // discards the recording
@@ -53,6 +54,14 @@ registerProcessor('confab-capture', ConfabCapture);`;
     return u.href;
   }
   function err(reason, message, extra) { return Object.assign(new Error(message), {reason}, extra); }
+  // reason 'microphone'; error.name is the browser's (NotAllowedError, NotFoundError, NotReadableError, ...).
+  function micError(e) {
+    const message = e.name === 'NotAllowedError' || e.name === 'SecurityError' ? 'Microphone access was blocked. Allow it in the browser to dictate.'
+      : e.name === 'NotFoundError' || e.name === 'OverconstrainedError' ? 'No microphone was found on this device.'
+      : e.name === 'NotReadableError' || e.name === 'AbortError' ? 'The microphone could not be started. Another app may be using it.'
+      : 'No microphone could be opened: ' + e.message;
+    return err('microphone', message, {name: e.name});
+  }
 
   class ConfabSTT {
     static isSupported() {
@@ -75,14 +84,14 @@ registerProcessor('confab-capture', ConfabCapture);`;
       const run = this._run = {ctx: new AudioContext(), pending: [], started: false, segments: [], stopped: null};
       this._set('connecting');
       try {
-        const [stream] = await Promise.all([
-          navigator.mediaDevices.getUserMedia({audio: this.audio}).catch(e => {
-            throw err('microphone', e.name === 'NotAllowedError' ? 'Microphone access was blocked. Allow it in the browser to dictate.' : 'No microphone could be opened: ' + e.message);
-          }),
+        // The microphone first, so the browser's permission prompt is the first thing the person sees and nothing
+        // else can fail while it is open.
+        const stream = run.stream = await navigator.mediaDevices.getUserMedia({audio: this.audio}).catch(e => { throw micError(e); });
+        if (this._run !== run) { stream.getTracks().forEach(t => t.stop()); return; }
+        await Promise.all([
           this._connect(run),
           run.ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET], {type: 'text/javascript'})))
         ]);
-        run.stream = stream;
         if (this._run !== run) { stream.getTracks().forEach(t => t.stop()); return; }
         await run.ctx.resume();
         run.source = run.ctx.createMediaStreamSource(stream);
