@@ -1,0 +1,106 @@
+{
+ "note": "The speech models dictation needs (src/dictation), from confab-stt's models.json, itself copied from Confab assets/live-models.json (generated 2026-10-11). The models folder is git-ignored. scripts/fetch_speech_models.py downloads each piece from \"download\" and accepts a file only if its size and SHA-256 match.",
+ "pieces": [
+  {
+   "name": "Parakeet TDT 0.6B v2, int8 (sherpa-onnx export)",
+   "path": "sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8",
+   "version": "parakeet-tdt-0.6b-v2, sherpa-onnx int8 export (release tag asr-models)",
+   "source": "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8.tar.bz2",
+   "upstreamModel": "https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2",
+   "license": "CC-BY-4.0",
+   "totalBytes": 661471436,
+   "download": {
+    "archive": {
+     "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8.tar.bz2",
+     "size": 482468385,
+     "sha256": "157c157bc51155e03e37d2466522a3a737dd9c72bb25f36eb18912964161e1ad",
+     "folder": "sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8"
+    },
+    "extra": {
+     "ATTRIBUTION.md": "repo:src/dictation/notices/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8/ATTRIBUTION.md",
+     "LICENSE-CC-BY-4.0.txt": "https://creativecommons.org/licenses/by/4.0/legalcode.txt",
+     "MODEL_CARD.md": "https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2/raw/ae9ad07059c7c739ffaf932226a8fe64ae2620b0/README.md"
+    }
+   },
+   "upstreamCheck": [
+    "2026-10-07: the 5 model files (encoder, decoder, joiner, tokens and test data) match the upstream archive byte for byte (archive SHA-256 above)",
+    "ATTRIBUTION.md is written by this project and kept in assets/notices",
+    "LICENSE-CC-BY-4.0.txt matches https://creativecommons.org/licenses/by/4.0/legalcode.txt",
+    "MODEL_CARD.md matches the model card (README.md) of nvidia/parakeet-tdt-0.6b-v2 at revision ae9ad07"
+   ],
+   "files": [
+    {
+     "path": "ATTRIBUTION.md",
+     "size": 703,
+     "sha256": "85111acbd3c1bc1d082901d096545fcc57d13757249c3bcebef127f61de40572"
+    },
+    {
+     "path": "LICENSE-CC-BY-4.0.txt",
+     "size": 18657,
+     "sha256": "9ba9550ad48438d0836ddab3da480b3b69ffa0aac7b7878b5a0039e7ab429411"
+    },
+    {
+     "path": "MODEL_CARD.md",
+     "size": 23599,
+     "sha256": "e2d10f955eb14a871092de134d2e82a59f494f001a181111fb95c74805763c65"
+    },
+    {
+     "path": "decoder.int8.onnx",
+     "size": 7257753,
+     "sha256": "b6bb64963457237b900e496ee9994b59294526439fbcc1fecf705b31a15c6b4e"
+    },
+    {
+     "path": "encoder.int8.onnx",
+     "size": 652184296,
+     "sha256": "a32b12d17bbbc309d0686fbbcc2987b5e9b8333a7da83fa6b089f0a2acd651ab"
+    },
+    {
+     "path": "joiner.int8.onnx",
+     "size": 1739080,
+     "sha256": "7946164367946e7f9f29a122407c3252b680dbae9a51343eb2488d057c3c43d2"
+    },
+    {
+     "path": "test_wavs/0.wav",
+     "size": 237964,
+     "sha256": "5fceacff0315d49cb59fcc505bcecf1ed5f2f35c2897b1e65a59f30e5d922150"
+    },
+    {
+     "path": "tokens.txt",
+     "size": 9384,
+     "sha256": "ec182b70dd42113aff6c5372c75cac58c952443eb22322f57bbd7f53977d497d"
+    }
+   ],
+   "use": "speech recognition, src/dictation/recognizer.py"
+  },
+  {
+   "name": "Silero VAD v6.2.3",
+   "path": "silero-vad",
+   "version": "silero-vad v6.2.3 (tag commit 5cd7945676eb32225748052e2e6a0580e4686a08)",
+   "source": "https://github.com/snakers4/silero-vad/tree/v6.2.3",
+   "license": "MIT (LICENSE in the folder)",
+   "totalBytes": 2328599,
+   "upstreamCheck": [
+    "2026-10-11: both files match release v6.2.3 of snakers4/silero-vad, downloaded from its tag commit (SHA-256 above)"
+   ],
+   "download": {
+    "extra": {
+     "silero_vad.onnx": "https://raw.githubusercontent.com/snakers4/silero-vad/5cd7945676eb32225748052e2e6a0580e4686a08/src/silero_vad/data/silero_vad.onnx",
+     "LICENSE": "https://raw.githubusercontent.com/snakers4/silero-vad/5cd7945676eb32225748052e2e6a0580e4686a08/LICENSE"
+    }
+   },
+   "files": [
+    {
+     "path": "LICENSE",
+     "size": 1075,
+     "sha256": "2e63e9a38b6e8fc0c7bc37ce174caca1862870856c6daf5697cfb785e925520b"
+    },
+    {
+     "path": "silero_vad.onnx",
+     "size": 2327524,
+     "sha256": "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3"
+    }
+   ],
+   "use": "speech detection, src/dictation/turns.py"
+  }
+ ]
+}

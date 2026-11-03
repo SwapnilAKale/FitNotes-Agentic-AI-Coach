@@ -36,6 +36,10 @@ docs/
 fix5_prompt.md
 =0.2.2
 
+# Local speech models: the image downloads and checks its own copy (Dockerfile
+# step 5).
+models/
+
 # Deployment files that are not needed inside the image
 docker-compose.yml
 DEPLOY.md

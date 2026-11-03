@@ -69,6 +69,8 @@ function _collectSelections() { return []; }
 function scrollBottom() {}
 function renderResumeNotice(message) { (log.resume = log.resume || []).push(message); }
 function setTimeout(fn) { fn(); }
+let dictating = false;
+function dictationActive() { return dictating; }
 const SCRIPT = JSON.parse(process.argv[1]).script;
 async function fetch(url) {
   const path = url.replace(API, '');
@@ -249,6 +251,15 @@ def test_a_normal_answer_is_unchanged():
              setup="document.getElementById('input').value = 'hello';")
     assert _live(r["log"]["msgs"]) == [("user", "hello"), ("agent", "<strong>Done</strong>")]
     assert r["busy"] is False
+
+
+def test_enter_while_dictating_sends_nothing():
+    # Dictated sentences are still arriving: the person reviews the text and
+    # presses send once dictation has finished. Nothing goes out by itself.
+    r = _run(["sendMessage"], "sendMessage()", {},
+             setup="document.getElementById('input').value = 'half a sentence'; dictating = true;")
+    assert r["log"]["fetches"] == [] and _live(r["log"]["msgs"]) == []
+    assert r["input"] == "half a sentence"
 
 
 # ── public demo: the queue notice and a full queue ───────────────────────────

@@ -164,6 +164,65 @@
       transition: transform 0.2s ease;
     }
     .switch[aria-checked="true"] .knob { transform: translateX(20px); }
+
+    /* ── Dictation ──────────────────────────────────────────────────────── */
+    /* While dictating, #dictation covers the textarea in the same box: the box
+       keeps its height (locked in JS) and the textarea stays in the layout,
+       invisible, so sentences can land in it as they are recognised. */
+    #input-wrap[data-dictation], #input-wrap.dict-closing { overflow: hidden; }
+    /* With the mic button the box is narrower; on a very narrow screen the
+       placeholder would wrap and give an empty box a scrollbar. */
+    #input::placeholder { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    #input-wrap #input { transition: opacity .25s ease, transform .25s ease, filter .25s ease; }
+    #input-wrap[data-dictation] #input { opacity: 0; transform: scale(.97); filter: blur(3px); pointer-events: none; }
+    #dictation {
+      position: absolute; inset: 0;
+      display: flex; align-items: center; gap: 6px;
+      opacity: 0; visibility: hidden; transform: scaleX(.85);
+      transition: opacity .25s ease, transform .25s cubic-bezier(0.22, 1, 0.36, 1), visibility 0s linear .25s;
+    }
+    #input-wrap[data-dictation] #dictation { opacity: 1; visibility: visible; transform: none; transition-delay: 0s; }
+    .dict-stage { position: relative; flex: 1; min-width: 0; align-self: stretch; }
+    #dictation-wave { position: absolute; inset: 0; width: 100%; height: 100%; transition: opacity .3s ease; }
+    #input-wrap[data-dictation="transcribing"] #dictation-wave { opacity: .2; }
+    #dictation-caption {
+      position: absolute; left: 4px; right: 4px; top: 50%; transform: translateY(-50%);
+      text-align: center; font-size: 12px; color: rgba(226, 232, 240, .6);
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: none;
+      text-shadow: 0 0 6px #1e293b, 0 0 3px #1e293b, 0 0 2px #1e293b;
+      transition: opacity .3s ease;
+    }
+    #input-wrap[data-dictation="transcribing"] #dictation-caption { opacity: 0; }
+    #dictation-shimmer {
+      position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+      font-size: 13px; opacity: 0; transition: opacity .25s ease;
+      background: linear-gradient(90deg, #64748b 0%, #64748b 35%, #e2e8f0 50%, #64748b 65%, #64748b 100%);
+      background-size: 200% 100%; -webkit-background-clip: text; background-clip: text; color: transparent;
+    }
+    #input-wrap[data-dictation="transcribing"] #dictation-shimmer { opacity: 1; animation: dict-shimmer 1.4s linear infinite; }
+    @keyframes dict-shimmer { from { background-position: 100% 0; } to { background-position: -100% 0; } }
+    /* Reduced motion: a plain level meter instead of the moving wave. */
+    #dictation-level { display: none; position: absolute; left: 0; right: 0; bottom: 3px; height: 3px;
+                       border-radius: 2px; background: #334155; overflow: hidden; }
+    #dictation-level span { display: block; height: 100%; width: 0; background: #3b82f6; }
+    #dictation-timer { font-size: 12px; color: #94a3b8; font-variant-numeric: tabular-nums; flex-shrink: 0; }
+    #mic-btn .stop-icon, #mic-btn .spinner { display: none; }
+    #mic-btn[data-state="recording"] .mic-icon { display: none; }
+    #mic-btn[data-state="recording"] .stop-icon { display: block; }
+    #mic-btn[data-state="connecting"] .mic-icon, #mic-btn[data-state="transcribing"] .mic-icon { display: none; }
+    #mic-btn[data-state="connecting"] .spinner, #mic-btn[data-state="transcribing"] .spinner { display: block; }
+    #mic-btn[data-state="recording"] {
+      background: #dc2626; color: #fff;
+      box-shadow: 0 0 0 calc(var(--level, 0) * 5px) rgba(220, 38, 38, .3);
+    }
+    #mic-btn[data-state="recording"]:hover { background: #ef4444; }
+    @media (prefers-reduced-motion: reduce) {
+      #input-wrap #input, #dictation, #dictation-wave, #dictation-caption, #dictation-shimmer { transition: none; }
+      #dictation, #input-wrap[data-dictation] #input { transform: none; filter: none; }
+      #dictation-wave { display: none; }
+      #dictation-level { display: block; }
+      #input-wrap[data-dictation="transcribing"] #dictation-shimmer { animation: none; background: none; color: #94a3b8; }
+    }
   </style>
 </head>
 <body class="h-screen flex flex-col overflow-hidden text-white">
@@ -243,12 +302,42 @@
         <input type="file" id="db-input" accept=".fitnotes" class="hidden">
         <input type="file" id="article-input" accept=".pdf" class="hidden">
 
-        <!-- Textarea -->
-        <textarea id="input"
-          placeholder="Ask your fitness coach..."
-          rows="1"
-          class="flex-1 bg-transparent text-sm text-white placeholder-gray-500 resize-none outline-none py-1 leading-5"
-          style="max-height: 128px; scrollbar-width: thin;"></textarea>
+        <!-- Textarea, and the dictation wave that covers it while the mic is on -->
+        <div id="input-wrap" class="relative flex-1 min-w-0 self-stretch flex items-end">
+          <textarea id="input"
+            placeholder="Ask your fitness coach..."
+            rows="1"
+            class="flex-1 min-w-0 bg-transparent text-sm text-white placeholder-gray-500 resize-none outline-none py-1 leading-5"
+            style="max-height: 128px; scrollbar-width: thin;"></textarea>
+          <div id="dictation" aria-hidden="true">
+            <div class="dict-stage">
+              <canvas id="dictation-wave"></canvas>
+              <div id="dictation-level"><span></span></div>
+              <div id="dictation-shimmer">Transcribing…</div>
+              <div id="dictation-caption"></div>
+            </div>
+            <span id="dictation-timer">0:00</span>
+            <button id="dictation-cancel" type="button" aria-label="Cancel dictation" title="Cancel dictation (Esc)"
+              class="flex-shrink-0 w-6 h-6 rounded-md text-gray-400 hover:text-white hover:bg-slate-700 flex items-center justify-center transition-colors">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                <path d="M18 6 6 18M6 6l12 12"/>
+              </svg>
+            </button>
+          </div>
+        </div>
+
+        <!-- Mic (dictation) button -->
+        <button id="mic-btn" type="button" data-state="idle" aria-pressed="false" aria-label="Start dictation"
+          class="flex-shrink-0 w-8 h-8 rounded-lg text-gray-400 hover:text-white hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed flex items-center justify-center transition-colors"
+          title="Dictate. Audio is transcribed on this server and not stored.">
+          <svg class="mic-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10v1a7 7 0 0014 0v-1M12 18v4M8 22h8"/>
+          </svg>
+          <svg class="stop-icon" width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
+            <rect x="4" y="4" width="16" height="16" rx="3"/>
+          </svg>
+          <span class="spinner"></span>
+        </button>
 
         <!-- Send button -->
         <button id="send-btn"
@@ -259,7 +348,8 @@
           </svg>
         </button>
       </div>
-      <div class="text-center text-xs text-gray-600 mt-2">FitNotes Coach can make mistakes. Verify important information.</div>
+      <!-- Dictation notices (model loading, limits, errors) take this line's place for a while. -->
+      <div id="input-note" role="status" aria-live="polite" class="text-center text-xs text-gray-600 mt-2">FitNotes Coach can make mistakes. Verify important information.</div>
     </div>
   </div>
 
@@ -337,6 +427,8 @@
     </div>
   </div>
 
+<!-- Dictation's browser client (from confab-stt). The server side is src/dictation. -->
+<script src="/vendor/confab-stt.js"></script>
 <script>
 // ── Helpers ──────────────────────────────────────────────────────────────────
 // Same origin as this page — frontend/server.py proxies these to the backend
@@ -557,6 +649,10 @@ function setBusy(b) {
   document.getElementById('input').disabled = b;
   document.getElementById('send-btn').disabled = b;
   document.getElementById('attach-btn').disabled = b;
+  // A turn that starts mid-dictation (Confirm, a retry) finishes the recording
+  // rather than leave a live mic behind a disabled box; its text still lands.
+  if (b && stt && stt.state !== 'idle' && stt.state !== 'transcribing') stt.stop();
+  syncDictationControls();
   if (!b) document.getElementById('input').focus();
 }
 
@@ -982,6 +1078,7 @@ async function sendMessage(forcedText) {
   const input = document.getElementById('input');
   const text = forcedText || input.value.trim();
   if (!text || busy) return;
+  if (!forcedText && dictationActive()) return;   // the dictated text is still arriving
 
   if (!forcedText) input.value = '';
   input.style.height = 'auto';
@@ -1430,9 +1527,12 @@ document.addEventListener('click', (e) => {
 });
 
 // ── Input behaviour ───────────────────────────────────────────────────────────
+function resizeInput(el) {
+  el.style.height = 'auto';
+  el.style.height = Math.min(el.scrollHeight, 128) + 'px';
+}
 document.getElementById('input').addEventListener('input', function() {
-  this.style.height = 'auto';
-  this.style.height = Math.min(this.scrollHeight, 128) + 'px';
+  resizeInput(this);
   updateSlashMenu(this.value);
 });
 document.getElementById('input').addEventListener('keydown', (e) => {
@@ -1451,6 +1551,294 @@ document.getElementById('confirm-no').addEventListener('click', () => sendConfir
 // ── Disambiguation buttons ────────────────────────────────────────────────────
 document.getElementById('disambig-submit').addEventListener('click', submitDisambiguation);
 document.getElementById('disambig-cancel').addEventListener('click', cancelDisambiguation);
+
+// ── Dictation ─────────────────────────────────────────────────────────────────
+// The mic streams to /stt on this server (frontend/server.py, src/dictation),
+// which recognises the speech itself. Each sentence lands in the box at the
+// cursor while the person is still talking. Nothing is ever sent by itself:
+// the person reads the text and presses send.
+const DICTATION_TIP = 'Dictate. Audio is transcribed on this server and not stored.';
+const NOTE_DEFAULT = 'FitNotes Coach can make mistakes. Verify important information.';
+const MORPH_MS = 250, TRANSCRIBING_MIN_MS = 500;
+const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
+let stt = null;              // set by initDictation in a browser that can record
+let sttServerReason = 'Dictation is starting…';   // why the server can't dictate; null once it can
+let dictOpen = false;        // the wave covers the box: from the click until the morph back ends
+let dictCancelled = false;
+let dictBefore = '';         // the box's text when dictation started; cancel puts it back
+let dictInsertAt = 0;        // where the next sentence goes
+let dictBegan = 0, dictClock = null, dictRaf = 0, dictLast = 0, dictTranscribingAt = 0;
+let dictRetryAt = 0, dictRetryText = '';
+let noteTimer = null, noteKind = '';
+let wave = {env: 0, level: 0, bars: [], td: null, fd: null, analyser: null};
+
+function dictationActive() {
+  return dictOpen || (!!stt && stt.state !== 'idle');
+}
+
+function dictationUnavailable() {
+  if (typeof ConfabSTT === 'undefined') return 'Dictation is unavailable: its script could not be loaded.';
+  if (!window.isSecureContext) return 'Dictation needs a secure (https://) page.';
+  if (!stt) return 'Dictation needs a browser that allows microphone access.';
+  if (sttServerReason) return sttServerReason;
+  if (Date.now() < dictRetryAt) return dictRetryText;
+  return null;
+}
+
+// The line under the box: the disclaimer, or a dictation notice for a while.
+// kind: 'info' | 'error' | 'loading'. ms = 0 keeps it until replaced.
+function showNote(text, kind = 'info', ms = 5000) {
+  const el = document.getElementById('input-note');
+  clearTimeout(noteTimer);
+  noteKind = kind;
+  el.textContent = text;
+  el.classList.remove('text-gray-600', 'text-gray-400', 'text-red-300');
+  el.classList.add(kind === 'error' ? 'text-red-300' : 'text-gray-400');
+  if (ms) noteTimer = setTimeout(clearNote, ms);
+}
+function clearNote() {
+  const el = document.getElementById('input-note');
+  clearTimeout(noteTimer);
+  noteKind = '';
+  el.textContent = NOTE_DEFAULT;
+  el.classList.remove('text-gray-400', 'text-red-300');
+  el.classList.add('text-gray-600');
+}
+
+function syncDictationControls() {
+  const mic = document.getElementById('mic-btn');
+  const state = stt ? stt.state : 'idle';
+  const reason = dictationUnavailable();
+  mic.dataset.state = state;
+  mic.disabled = !!reason || state === 'transcribing' || (state === 'idle' && (busy || dictOpen));
+  mic.setAttribute('aria-pressed', state === 'connecting' || state === 'recording' ? 'true' : 'false');
+  mic.setAttribute('aria-label', state === 'recording' ? 'Stop dictation'
+    : state === 'connecting' ? 'Starting dictation' : state === 'transcribing' ? 'Transcribing' : 'Start dictation');
+  mic.title = reason || (state === 'recording' ? 'Stop dictation' : DICTATION_TIP);
+  document.getElementById('send-btn').disabled = busy || dictationActive();
+  document.getElementById('input').readOnly = dictationActive();
+}
+
+// Each sentence goes in where the cursor was when dictation started, with a
+// space on either side only where the neighbouring text needs one.
+function insertDictated(text) {
+  const input = document.getElementById('input');
+  const before = input.value.slice(0, dictInsertAt), after = input.value.slice(dictInsertAt);
+  const piece = (before && !/\s$/.test(before) ? ' ' : '') + text + (after && !/^\s/.test(after) ? ' ' : '');
+  input.value = before + piece + after;
+  dictInsertAt += piece.length;
+  resizeInput(input);
+  document.getElementById('dictation-caption').textContent = text;
+}
+
+function tickDictationClock() {
+  const s = Math.floor((Date.now() - dictBegan) / 1000);
+  document.getElementById('dictation-timer').textContent = `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
+
+function openWave() {
+  const wrap = document.getElementById('input-wrap');
+  wrap.style.height = wrap.offsetHeight + 'px';   // the row keeps its height under the wave
+  dictOpen = true;
+  wave = {env: 0, level: 0, bars: [], td: null, fd: null, analyser: null};
+  document.getElementById('dictation-caption').textContent = '';
+  document.getElementById('dictation-timer').textContent = '0:00';
+  document.getElementById('dictation-level').firstElementChild.style.width = '0';
+  document.getElementById('dictation').removeAttribute('aria-hidden');
+  wrap.dataset.dictation = 'wave';
+  if (!reducedMotion.matches) { dictLast = performance.now(); dictRaf = requestAnimationFrame(drawWave); }
+}
+
+// Back to the textarea, now holding the dictated text. The box grows to fit
+// it in the same motion instead of jumping once the wave is gone.
+function closeWave() {
+  if (!dictOpen) return;
+  const wrap = document.getElementById('input-wrap'), input = document.getElementById('input');
+  const from = wrap.offsetHeight;
+  wrap.classList.add('dict-closing');
+  delete wrap.dataset.dictation;
+  document.getElementById('dictation').setAttribute('aria-hidden', 'true');
+  wrap.style.height = '';
+  resizeInput(input);
+  const to = wrap.offsetHeight;
+  const ms = reducedMotion.matches ? 0 : MORPH_MS;
+  if (ms && to !== from) {
+    wrap.style.height = from + 'px';
+    void wrap.offsetHeight;
+    wrap.style.transition = `height ${ms}ms ease`;
+    wrap.style.height = to + 'px';
+  }
+  setTimeout(() => {
+    wrap.classList.remove('dict-closing');
+    wrap.style.height = '';
+    wrap.style.transition = '';
+    cancelAnimationFrame(dictRaf);
+    dictOpen = false;
+    syncDictationControls();
+    if (!input.disabled) { input.focus(); input.setSelectionRange(dictInsertAt, dictInsertAt); }
+  }, ms);
+}
+
+// The wave: mirrored bars from the centre out, from the analyser's spectrum
+// (shape) and loudness (height). Flat and calm in silence; on the way in it
+// grows from the centre, and after stop it settles flat under the shimmer.
+const WAVE_QUIET = [100, 116, 139], WAVE_LOUD = [96, 165, 250];   // slate-500 → blue-400
+function drawWave(now) {
+  dictRaf = requestAnimationFrame(drawWave);
+  const dt = Math.min(64, now - dictLast); dictLast = now;
+  const canvas = document.getElementById('dictation-wave'), g = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1, w = canvas.clientWidth, h = canvas.clientHeight;
+  if (!w || !h) return;
+  if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
+    canvas.width = Math.round(w * dpr); canvas.height = Math.round(h * dpr);
+  }
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, w, h);
+
+  const an = stt && stt.analyser;
+  if (an !== wave.analyser) {
+    wave.analyser = an;
+    if (an) { wave.td = new Uint8Array(an.fftSize); wave.fd = new Uint8Array(an.frequencyBinCount); }
+  }
+  wave.env = Math.min(1, wave.env + dt / MORPH_MS);
+  let target = 0, lo = 2, hi = 2;
+  if (an) {
+    an.getByteTimeDomainData(wave.td);
+    an.getByteFrequencyData(wave.fd);
+    let sum = 0;
+    for (let i = 0; i < wave.td.length; i++) { const s = (wave.td[i] - 128) / 128; sum += s * s; }
+    target = Math.min(1, Math.max(0, (Math.sqrt(sum / wave.td.length) - 0.01) * 7));
+    const binHz = an.context.sampleRate / an.fftSize;   // speech band, 100 Hz – 4 kHz
+    lo = Math.max(1, Math.round(100 / binHz)); hi = Math.min(wave.fd.length - 1, Math.round(4000 / binHz));
+  }
+  wave.level += (target - wave.level) * (target > wave.level ? 0.5 : 0.12);
+
+  const step = 4, count = Math.max(9, Math.floor(w / step)), mid = (count - 1) / 2;
+  const maxH = h - 6, x0 = (w - count * step) / 2 + 1;
+  for (let i = 0; i < count; i++) {
+    const d = Math.abs(i - mid) / mid;               // 0 at the centre, 1 at the edges
+    if (d > wave.env) { wave.bars[i] = 0; continue; }
+    let v = 0;
+    if (an) {
+      const bin = Math.round(lo * Math.pow(hi / lo, d));
+      v = Math.min(1, Math.max(0, (wave.fd[bin] / 255 - 0.3) / 0.7));
+    }
+    const want = wave.level * (0.3 + 0.7 * v) * (1 - 0.6 * d * d);
+    const cur = wave.bars[i] || 0;
+    wave.bars[i] = cur + (want - cur) * (want > cur ? 0.45 : 0.14);
+    const calm = 0.6 * (0.5 + 0.5 * Math.sin(now / 700 + i * 0.4));   // a slow ripple on the flat line
+    const bh = Math.max(2, 2 + calm + wave.bars[i] * maxH);
+    const k = Math.min(1, wave.bars[i] * 2.5);
+    g.fillStyle = `rgb(${WAVE_QUIET.map((q, j) => Math.round(q + (WAVE_LOUD[j] - q) * k)).join(',')})`;
+    g.beginPath();
+    if (g.roundRect) g.roundRect(x0 + i * step, (h - bh) / 2, 2, bh, 1);
+    else g.rect(x0 + i * step, (h - bh) / 2, 2, bh);
+    g.fill();
+  }
+}
+
+function startDictation() {
+  const input = document.getElementById('input');
+  if (!stt || busy || input.disabled || dictOpen) return;
+  dictBefore = input.value;
+  dictInsertAt = input.selectionStart ?? input.value.length;
+  dictCancelled = false;
+  if (noteKind) clearNote();
+  openWave();
+  stt.start().catch(() => {});   // failures arrive through onerror
+  syncDictationControls();
+}
+
+function cancelDictation() {
+  if (!stt || stt.state === 'idle') return;
+  dictCancelled = true;
+  stt.cancel();
+}
+
+// The server says whether it can dictate (its speech models may not be downloaded).
+async function initDictation() {
+  if (typeof ConfabSTT !== 'undefined' && ConfabSTT.isSupported()) {
+    stt = new ConfabSTT({url: '/stt', analyser: true});
+    wireDictation();
+    try {
+      const s = await fetch(`${API}/stt-status`).then(r => r.json());
+      sttServerReason = s.available ? null : (s.reason || 'Dictation is not available on this server.');
+    } catch {
+      sttServerReason = 'Dictation is unavailable: the server could not be reached.';
+    }
+  }
+  syncDictationControls();
+}
+
+function wireDictation() {
+  stt.onstate = (state, detail) => {
+    const wrap = document.getElementById('input-wrap');
+    if (state === 'recording') {
+      if (!dictBegan) { dictBegan = Date.now(); tickDictationClock(); dictClock = setInterval(tickDictationClock, 500); }
+      // The first recording after a restart waits while the model loads; the
+      // audio is buffered meanwhile, so nothing said is lost.
+      if (detail.loading) showNote('Loading speech model, keep talking…', 'loading', 0);
+      else if (noteKind === 'loading') clearNote();
+    } else if (state === 'transcribing') {
+      clearInterval(dictClock);
+      if (noteKind === 'loading') clearNote();
+      if (wrap.dataset.dictation) wrap.dataset.dictation = 'transcribing';
+      dictTranscribingAt = Date.now();
+    } else if (state === 'idle') {
+      clearInterval(dictClock);
+      dictBegan = 0;
+      document.getElementById('mic-btn').style.setProperty('--level', 0);
+      const finished = !dictCancelled && !detail.error;
+      if (dictCancelled) {
+        const input = document.getElementById('input');
+        input.value = dictBefore;
+        dictInsertAt = Math.min(dictInsertAt, dictBefore.length);
+        dictCancelled = false;
+        showNote('Dictation cancelled.', 'info', 2500);
+      } else if (!detail.error && noteKind === 'loading') {
+        clearNote();
+      }
+      // Text that was ready at once would only flash the shimmer: hold it briefly.
+      const held = finished && wrap.dataset.dictation === 'transcribing' ? TRANSCRIBING_MIN_MS - (Date.now() - dictTranscribingAt) : 0;
+      if (held > 0) setTimeout(closeWave, held); else closeWave();
+    }
+    syncDictationControls();
+  };
+  stt.onsegment = insertDictated;
+  stt.onlevel = level => {
+    document.getElementById('mic-btn').style.setProperty('--level', level.toFixed(2));
+    // sqrt: ordinary speech sits around 0.1–0.4 and would barely move the meter.
+    document.getElementById('dictation-level').firstElementChild.style.width = Math.round(Math.sqrt(level) * 100) + '%';
+  };
+  stt.onlimit = reason => showNote(reason === 'max_duration'
+    ? 'Reached the 10-minute limit, so dictation stopped. Your text is on its way.'
+    : 'The microphone went silent, so dictation stopped. Your text is on its way.', 'info', 6000);
+  stt.ondone = text => { if (!text.trim()) showNote('No speech was recognised.', 'info', 3000); };
+  stt.onerror = e => {
+    // busy: someone else is dictating. rate_limited: the mic waits out
+    // retryAfterSeconds. microphone: permission was blocked.
+    if (e.reason === 'rate_limited' && e.retryAfterSeconds) {
+      dictRetryAt = Date.now() + e.retryAfterSeconds * 1000;
+      dictRetryText = e.message;
+      setTimeout(syncDictationControls, e.retryAfterSeconds * 1000 + 50);
+    }
+    showNote(e.message, 'error', 8000);
+    syncDictationControls();
+  };
+}
+
+initDictation();
+
+document.getElementById('mic-btn').addEventListener('click', () => {
+  if (!stt) return;
+  if (stt.state === 'idle') startDictation();
+  else if (stt.state === 'recording' || stt.state === 'connecting') stt.stop();
+});
+document.getElementById('dictation-cancel').addEventListener('click', cancelDictation);
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && stt && stt.state !== 'idle') { e.preventDefault(); cancelDictation(); }
+});
+syncDictationControls();
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
 waitForReady();

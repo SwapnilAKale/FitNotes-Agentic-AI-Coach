@@ -13,7 +13,7 @@ from pathlib import Path
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import FileResponse, JSONResponse, Response
 
 FRONTEND_DIR = Path(__file__).parent
@@ -29,6 +29,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src import demo_mode  # noqa: E402  (needs REPO_ROOT on sys.path)
+from src.dictation.service import DictationService  # noqa: E402
 
 app = FastAPI()
 
@@ -311,6 +312,44 @@ async def ontology_review(request: Request):
             await asyncio.sleep(0.2)
     cuts = sum(1 for r in rows if r.get("decision") == "cut")
     return JSONResponse(content={"status": "saved", "total": len(rows), "cuts": cuts})
+
+
+# ── Dictation ───────────────────────────────────────────────────────────────
+# The chat's mic button streams to the WebSocket /stt here (src/dictation). The
+# speech model runs in a worker process this server starts on the first
+# recording and stops after 15 idle minutes; the page itself loads the browser
+# client from /vendor/confab-stt.js. Without downloaded models the app still
+# runs and the mic button says why.
+_dictation = DictationService(
+    log=lambda line: print(f"[Dictation] {line}", flush=True),
+    slots=int(os.environ.get("SPEECH_SLOTS") or 1))
+
+
+@app.on_event("startup")
+async def _dictation_note():
+    reason = _dictation.unavailable()
+    if reason:
+        print(f"[Dictation] off: {reason}", flush=True)
+
+
+@app.on_event("shutdown")
+async def _dictation_close():
+    _dictation.close()
+
+
+@app.get("/stt-status")
+async def stt_status():
+    reason = _dictation.unavailable()
+    return JSONResponse(content={"available": reason is None, "reason": reason})
+
+
+@app.websocket("/stt")
+async def stt_socket(ws: WebSocket):
+    # The same visitor address the demo's rate limits use (Caddy's
+    # X-Forwarded-For read through the trusted-proxy rule).
+    ip = demo_mode.client_ip(ws.client.host if ws.client else None,
+                             ws.headers.get("x-forwarded-for"))
+    await _dictation.handle(ws, ip)
 
 
 # ── Reverse proxy to the backend ────────────────────────────────────────────

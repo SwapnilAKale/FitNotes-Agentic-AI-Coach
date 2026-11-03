@@ -12,9 +12,10 @@ visitor ──HTTPS──▶ Caddy (ports 80/443, automatic certificate)
                       │
                       ▼  internal Docker network only
                    app container
-                   ├─ UI + same-origin proxy  :3000
+                   ├─ UI + same-origin proxy  :3000 (also dictation, /stt)
                    ├─ API                     127.0.0.1:8000 (never exposed)
-                   └─ MCP tool server         (child process)
+                   ├─ MCP tool server         (child process)
+                   └─ speech worker           (child process, only while dictation is in use)
                    data volume: workout DB, RAG index, memory, settings,
                                 visitors' conversations
 ```
@@ -47,6 +48,15 @@ The demo runs with `DEMO_MODE=1`:
   reloading the DB are **turned off** (the server answers 403 and the UI says why).
 * Each visitor IP gets a small **question quota** (3 per minute, 30 per day by
   default), so one person can't use up your Gemini quota.
+* **Visitors can dictate.** The mic button next to send streams their voice to
+  the app, which recognises it on this VM (`src/dictation/`). No outside speech
+  service is involved, and audio is held in memory only while it is
+  transcribed and is never written to disk. Only
+  **one person can dictate at a time**: anyone else who presses the mic is
+  told someone else is dictating and to try again in a moment.
+  `SPEECH_SLOTS` raises that, at about 1.2 GB of RAM per extra slot. Each
+  IP can start 6 recordings a minute and 120 a day, and a recording stops by
+  itself after 10 minutes.
 
 ---
 
@@ -97,7 +107,11 @@ instances disabled.
 
 This app needs **one VM with 2 OCPU and 12 GB**, which is the whole allowance.
 It runs comfortably on that: the app container idles at roughly 750 MB of
-RAM, and Caddy at about 20 MB.
+RAM, and Caddy at about 20 MB. Dictation adds nothing while nobody uses it.
+Its speech worker starts on the first recording and uses about **1.2 GB**
+while its model is loaded. That first recording waits a few seconds for the
+model; the audio is kept meanwhile, so nothing said is lost. The worker stops
+after 15 minutes without a recording.
 
 Oracle may also **reclaim idle Always Free VMs** (very low CPU, network and
 memory use over 7 days). A demo that gets the occasional visitor usually
@@ -372,6 +386,7 @@ DEMO_SESSION_MAX_KB=256           # one chat's size; its oldest messages are tri
 DEMO_MAX_QUEUED_TURNS=0           # questions that may wait behind the one being answered (0: none)
 DEMO_TURN_TIMEOUT_SECONDS=300     # stop waiting for a question still unanswered after this
 GEMINI_TIMEOUT_SECONDS=1800       # end one Gemini request Google never answers (any mode)
+SPEECH_SLOTS=1                    # people who can dictate at once; ~1.2 GB RAM each
 ```
 
 **What is shared and what is per visitor.** The synthetic workout database,
@@ -406,6 +421,12 @@ APP_PASSWORD_HASH='$2a$14$....'
 
 Leave `APP_PASSWORD_HASH` unset for an open demo.
 
+The password covers dictation too, like every other request. Dictation
+streams over a WebSocket, and browsers resend the password the visitor already
+entered on it: Chrome, Edge and Firefox do. Safari wasn't tested. If some
+browser doesn't, its mic button shows "Could not reach the dictation service."
+and the rest of the site keeps working.
+
 `.env` is in `.gitignore` and `.dockerignore`, so it's never committed or
 copied into the image.
 
@@ -419,8 +440,10 @@ docker compose up -d --build
 
 The first build takes **10–20 minutes** on 2 ARM cores. It installs CPU-only
 PyTorch, downloads the two embedding/reranking models, and builds the research
-index from `corpus/raw/`. Later builds reuse those cached layers and take a
-minute or two.
+index from `corpus/raw/`. For dictation it also downloads about **480 MB** of
+speech model from the sherpa-onnx and Silero releases on GitHub and checks
+every file's SHA-256 (the image grows by about 0.7 GB). Later builds reuse
+those cached layers and take a minute or two.
 
 Watch it come up:
 
@@ -457,6 +480,16 @@ From the VM itself you can test the app without Caddy:
 ```bash
 docker compose exec app python -c "import urllib.request;print(urllib.request.urlopen('http://127.0.0.1:3000/status').read())"
 ```
+
+and dictation (`{"available":true,...}` means the speech models are in place):
+
+```bash
+docker compose exec app python -c "import urllib.request;print(urllib.request.urlopen('http://127.0.0.1:3000/stt-status').read())"
+```
+
+**The mic button is greyed out?** Hover it for the reason. Dictation's lines
+in `docker compose logs app` start with `[Dictation]`: the model loading and
+unloading, and per recording its length and character count (never the words).
 
 ---
 
@@ -606,7 +639,8 @@ start the volume has no workout DB. Open the site and upload your
 
 **Any VPS** (Hetzner, DigitalOcean, Lightsail, a home server, …) works the
 same way: install Docker, open ports 80/443 in its firewall, then follow steps
-8–12. Recommended minimum: **2 vCPU and 4 GB RAM** (2 GB works with swap).
+8–12. Recommended minimum: **2 vCPU and 4 GB RAM** (2 GB works with swap;
+dictation adds about 1.2 GB while its model is loaded).
 `amd64` and `arm64` are both supported. The Dockerfile installs the CPU build
 of PyTorch on either.
 
@@ -631,6 +665,6 @@ assumes:
   outside requests.
 * Raise the request timeout (`--timeout=900`), because agent turns can take
   minutes.
-* The memory limit should be at least 2 GiB.
+* The memory limit should be at least 2 GiB, plus about 1.2 GiB for dictation.
 
 A small always-on VM (like the Oracle one above) is simpler for this app.

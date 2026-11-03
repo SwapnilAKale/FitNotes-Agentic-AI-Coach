@@ -10,6 +10,9 @@ venv/
 dist/
 .pytest_cache/
 
+# Speech models for dictation (~660 MB): scripts/fetch_speech_models.py
+models/
+
 # Personal workout data — never push
 data/checkpoint.json
 data/memory.json

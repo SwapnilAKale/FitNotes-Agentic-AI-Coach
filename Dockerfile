@@ -57,7 +57,16 @@ COPY scripts/build_corpus.py scripts/build_corpus.py
 RUN CHROMA_DB_PATH=/app/seed/chroma_db python scripts/build_corpus.py --offline \
     && test -f /app/seed/chroma_db/chroma.sqlite3
 
-# 5) The application.
+# 5) Speech models for dictation (~480 MB from the sherpa-onnx and Silero
+#    releases on GitHub), each file checked against its SHA-256 in
+#    src/dictation/models.json. Before the code, so a code change reuses this
+#    cached layer instead of downloading them again.
+COPY src/dictation/models.json src/dictation/models.json
+COPY src/dictation/notices/ src/dictation/notices/
+COPY scripts/fetch_speech_models.py scripts/fetch_speech_models.py
+RUN python scripts/fetch_speech_models.py /app/models/speech
+
+# 6) The application.
 COPY . .
 
 # Run as an unprivileged user. data/ is the named volume's mount point; Docker
@@ -68,7 +77,8 @@ RUN useradd --uid 10001 --create-home --shell /usr/sbin/nologin app \
     && chown -R app:app /app/data /app/ontology /app/seed \
     && chmod +x deploy/entrypoint.sh
 
-ENV HF_HUB_OFFLINE=1 \
+ENV SPEECH_MODELS=/app/models/speech \
+    HF_HUB_OFFLINE=1 \
     TRANSFORMERS_OFFLINE=1 \
     # Container defaults (docker-compose.yml sets them too).
     OPEN_BROWSER=0 \

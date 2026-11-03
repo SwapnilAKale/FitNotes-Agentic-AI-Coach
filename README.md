@@ -23,7 +23,7 @@ what to expect.
 | `Multi-Agent-System` | **current** — LangGraph orchestration, Coordinator / Data Agent / Analysis Agent, muscle ontology, request decomposition |
 
 **Scale:** 36 source modules, 27 MCP tools, a 39-muscle ontology over 175
-curated exercise→muscle edges, and **2,056 tests**.
+curated exercise→muscle edges, and **2,078 tests**.
 
 ---
 
@@ -49,6 +49,11 @@ from this repo's Docker setup on a free Oracle Cloud ARM VM (see
   minute. An answer that is still unfinished after 5 minutes, which normally
   only happens when a Gemini request never comes back, is stopped, and you're
   asked to ask again.
+- **You can talk instead of type.** The mic button next to send turns the
+  input into a live sound wave; sentences appear in the box as you speak, and
+  nothing is sent until you press send. Speech is recognised on the demo's own
+  server and the audio isn't stored. One person can dictate at a time; if
+  someone else is, you're asked to try again in a moment.
 - **Some features are off.** Uploading a database or articles, clearing logs
   and changing settings return a "turned off in the demo" message. Each
   visitor also gets a small number of questions per minute and per day, which
@@ -294,6 +299,17 @@ Export your backup (FitNotes → Menu → Backup → Export Backup) to
 python scripts/build_corpus.py    # ~160 PubMed abstracts + Wikipedia, 2-3 min
 ```
 
+For dictation (the mic button), download the speech models once. That's about
+480 MB, and each file is checked against its SHA-256:
+
+```bash
+python scripts/fetch_speech_models.py    # into models/speech/
+```
+
+Already have them, e.g. from Confab? Set `SPEECH_MODELS=<that folder>` in
+`.env` instead. Without the models the app still runs; the mic button is
+disabled and says why.
+
 ### Running
 
 ```bash
@@ -304,11 +320,13 @@ python cli.py               # CLI, same pipeline
 cd frontend && python server.py   # UI only — no agent, no quota burn
 ```
 
-The 3D ontology viewer is at `http://localhost:3000/graph`.
+The 3D ontology viewer is at `http://localhost:3000/graph`. Dictation needs
+nothing extra at run time: the UI server loads the speech model on the first
+recording and unloads it after 15 idle minutes.
 
 ```bash
 python -m src.data_agent 90 "Lat Pulldown" "Deadlift"   # Data Agent standalone
-python -m pytest                                        # 2,056 tests
+python -m pytest                                        # 2,078 tests
 ```
 
 ---
@@ -329,6 +347,7 @@ python -m pytest                                        # 2,056 tests
 | Database | SQLite (`.fitnotes`), read-only `mode=ro` connections for generated SQL |
 | Web | FastAPI + uvicorn; vanilla HTML/CSS/JS frontend |
 | 3D viewer | three.js, vendored for offline use |
+| Dictation | `src/dictation/`: Parakeet TDT 0.6B v2 + Silero VAD via sherpa-onnx, over a WebSocket on the UI server; audio kept in memory only |
 
 ---
 
@@ -340,6 +359,7 @@ python -m pytest                                        # 2,056 tests
 │   │                          #   analytical, state, persistence
 │   ├── data_agent/            # fetch / process / validate / session_display
 │   ├── shared/                # resolver, memory, rag, sql_executor, sql_sanitize
+│   ├── dictation/             # the mic button: /stt service, speech worker, turns
 │   ├── coordinator.py         # routing, classification, decomposition, pipeline
 │   ├── analysis_agent.py      # analyze() + ground_check()
 │   ├── citations.py           # citation resolution + deterministic answer guards
@@ -352,7 +372,7 @@ python -m pytest                                        # 2,056 tests
 ├── ontology/                  # muscles, exercises, edges, aliases (CSV)
 ├── frontend/                  # index.html (chat), graph.html (3D), body/, vendor/
 ├── docs/                      # routing-rules, data_agent_spec, changelog
-├── tests/                     # 87 files, 2,056 tests
+├── tests/                     # 88 files, 2,078 tests
 ├── evals/  scripts/  corpus/
 ├── server.py                  # FastAPI web server
 └── cli.py                     # async CLI
@@ -382,7 +402,7 @@ package answers them deterministically. There is one read path, not two. The
 ## Testing
 
 ```bash
-python -m pytest                    # 2,056 tests
+python -m pytest                    # 2,078 tests
 python evals/run_evals.py           # SQL correctness + LLM-as-judge
 python evals/stress_test.py         # adversarial suite
 ```
@@ -479,6 +499,13 @@ first approach was tried:
   server) load once, and each visitor's conversation is swapped in around
   their turn and saved back afterwards. Writes are refused at four layers,
   from the server down to the database connection.
+- **Dictation without a speech API.** The mic button's speech is recognised
+  on the demo's own server, in a worker process the UI server starts on the
+  first recording and stops after 15 idle minutes. So the 1.2 GB model costs
+  nothing while nobody dictates, and a crash in native code can't take the
+  chat down. It started as a separate Node.js service and was ported to
+  Python, so the app stays one language started by one command. The port was
+  checked word for word against the original on the same recordings.
 - **Build from scratch, then adopt the framework.** The hand-built ReAct loop
   came first; the LangGraph conversion came after, so the framework's design
   decisions were legible rather than magic. Both are on branches.
@@ -490,6 +517,12 @@ The engineering lessons — stated as transferable principles, each with the bug
 that produced it — are in [`lessons.md`](lessons.md).
 The full session-by-session history is archived in
 [`docs/changelog.md`](docs/changelog.md).
+
+---
+
+## Acknowledgements
+
+- **Speech recognition:** Dictation uses NVIDIA Parakeet TDT 0.6B v2 (CC BY 4.0) and Silero VAD (MIT), run with sherpa-onnx. See [src/dictation/THIRD_PARTY_NOTICES.md](src/dictation/THIRD_PARTY_NOTICES.md).
 
 ---
 
