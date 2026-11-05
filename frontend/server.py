@@ -73,6 +73,20 @@ async def vendor(name: str):
     return FileResponse(str(path), media_type="text/javascript")
 
 
+_CURL_ARM = FRONTEND_DIR / "vendor" / "curl-arm"
+_CURL_ARM_TYPES = {".js": "text/javascript", ".glb": "model/gltf-binary", ".webp": "image/webp"}
+
+
+@app.get("/vendor/curl-arm/{rel:path}")
+async def curl_arm(rel: str):
+    """The pull-to-reload badge's curling arm: its module, model, texture and three.js."""
+    path = (_CURL_ARM / rel).resolve()
+    kind = _CURL_ARM_TYPES.get(path.suffix)
+    if not kind or not path.is_relative_to(_CURL_ARM.resolve()) or not path.is_file():
+        return JSONResponse(status_code=404, content={"detail": "not found"})
+    return FileResponse(str(path), media_type=kind)
+
+
 # ── The figure ────────────────────────────────────────────────────────────────
 # frontend/body/figure.json holds a human figure as chains of rings and knows
 # nothing about this project. Muscle positions are NOT hand-typed any more: each

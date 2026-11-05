@@ -56,8 +56,9 @@ from this repo's Docker setup on a free Oracle Cloud ARM VM (see
   someone else is, you're asked to try again in a moment.
 - **It works like an app on phones and tablets.** The chat opens at the latest
   message, and pulling down from the top reloads the page on both the chat and
-  the 3D viewer: a small lifter curls his dumbbell higher, and strains harder,
-  the further you pull. A half-typed message survives the reload. On the
+  the 3D viewer: a round badge drops in from the top of the screen and a
+  muscular arm inside it curls a dumbbell as you pull, straining harder near
+  the top, while a ring around it fills. A half-typed message survives the reload. On the
   viewer, pinch to zoom and drag to turn the figure.
 - **Some features are off.** Uploading a database or articles, clearing logs
   and changing settings return a "turned off in the demo" message. Each

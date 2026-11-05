@@ -2022,7 +2022,7 @@ syncDictationControls();
 
 // ── Pull to reload (touch phones and tablets) ─────────────────────────────────
 // The chat scrolls inside a page fixed to the screen, so the browser's own
-// pull-to-refresh never fires here; vendor/pull-reload.js draws the lifter.
+// pull-to-refresh never fires here; vendor/pull-reload.js draws the curling arm.
 // A pull starts on the header, or on the messages when they are scrolled to
 // the top. A reload already restores an answer in progress, a pending Confirm
 // or clarification and Resume (waitForReady); a typed but unsent message is
@@ -2033,7 +2033,6 @@ pullToReload({
   zone: t => document.getElementById('app-header').contains(t)
     || (document.getElementById('chat').contains(t) && document.getElementById('chat').scrollTop <= 0),
   allowed: () => !dictationActive() && !document.getElementById('settings-overlay').classList.contains('open'),
-  shift: chatInner,
   beforeReload: () => {
     const input = document.getElementById('input');
     if (input.value.trim()) sessionStorage.setItem(DRAFT_KEY, input.value);

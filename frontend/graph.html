@@ -15,10 +15,9 @@
     --scene:#EEEBE1; --node:#4B5762; --anat:#B6AF9C; --body:#9AA3AA;
     --shadow:0 1px 2px rgba(20,26,33,.10),0 8px 24px -12px rgba(20,26,33,.28);
     --r:3px;
-    /* pull-to-reload card (vendor/pull-reload.js), in the plate's palette */
+    /* pull-to-reload badge (vendor/pull-reload.js), in the plate's palette */
     --ptr-bg:var(--panel); --ptr-border:var(--line); --ptr-shadow:var(--shadow);
-    --ptr-stroke:var(--fg-2); --ptr-face:var(--fg); --ptr-bell:var(--fg-3);
-    --ptr-plate:var(--accent); --ptr-label:var(--fg-3); --ptr-label-on:var(--fg);
+    --ptr-ring:var(--fg-3); --ptr-ring-on:var(--accent);
   }
   :root[data-theme="dark"]{
     --limit:#6E8AA6;
@@ -1232,7 +1231,7 @@ $('#theme').onclick = () => {
   UI.theme = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
   document.documentElement.dataset.theme = UI.theme; saveUI(); readTheme();
 };
-/* Pull to reload (touch phones and tablets): the same lifter as the chat, in
+/* Pull to reload (touch phones and tablets): the same curling arm as the chat, in
    this page's palette. A pull starts on the header, or on the panel below the
    figure, only with the page at its top; the figure itself is for the model
    (one finger moves it). Review decisions are already saved as they are made. */
