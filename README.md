@@ -18,9 +18,9 @@ what to expect.
 
 | Branch | What it is |
 |---|---|
-| `main` | stable baseline |
+| `main` | **current and deployed** — the multi-agent system below, merged in; the live demo runs from this branch |
 | `Single-Agent-System` | the hand-built single agent: web UI, MCP tools, RAG, memory, writes |
-| `Multi-Agent-System` | **current** — LangGraph orchestration, Coordinator / Data Agent / Analysis Agent, muscle ontology, request decomposition |
+| `Multi-Agent-System` | LangGraph orchestration, Coordinator / Data Agent / Analysis Agent, muscle ontology, request decomposition (merged into `main`) |
 
 **Scale:** 36 source modules, 27 MCP tools, a 39-muscle ontology over 175
 curated exercise→muscle edges, and **2,078 tests**.

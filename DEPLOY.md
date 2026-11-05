@@ -320,11 +320,8 @@ git clone https://github.com/SwapnilAKale/FitNotes-Agentic-AI-Coach.git
 cd FitNotes-Agentic-AI-Coach
 ```
 
-```bash
-git checkout Multi-Agent-System
-```
-
-(Use whichever branch holds the Docker files, if it's been merged elsewhere.)
+The clone is on `main`, which is the branch to deploy. It holds the Docker
+files and the current multi-agent system.
 
 ---
 
