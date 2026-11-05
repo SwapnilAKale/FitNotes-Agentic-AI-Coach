@@ -456,5 +456,10 @@ return {
     frame = requestAnimationFrame(tick);
   },
   pause() { playing = false; cancelAnimationFrame(frame); },
+  // How far up the curl the arm is right now: 0 hanging, 1 at the top (on the way up or down).
+  get curl() {
+    if (clipT <= tPeak) return clipT / Math.max(1e-3, tPeak);
+    return 1 - (clipT - tPeak) / Math.max(1e-3, clip.duration - tPeak);
+  },
 };
 }
