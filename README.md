@@ -22,8 +22,8 @@ what to expect.
 | `Single-Agent-System` | the hand-built single agent: web UI, MCP tools, RAG, memory, writes |
 | `Multi-Agent-System` | LangGraph orchestration, Coordinator / Data Agent / Analysis Agent, muscle ontology, request decomposition (merged into `main`) |
 
-**Scale:** 36 source modules, 27 MCP tools, a 39-muscle ontology over 175
-curated exercise→muscle edges, and **2,078 tests**.
+**Scale:** 48 Python modules under `src/`, 32 MCP tools, a 39-muscle ontology
+over 175 curated exercise→muscle edges, and **2,083 tests**.
 
 ---
 
@@ -83,7 +83,12 @@ from this repo's Docker setup on a free Oracle Cloud ARM VM (see
 - **Answers fitness-science questions** from a RAG pipeline over ~160 PubMed
   abstracts and Wikipedia articles, plus any PDFs the user uploads.
 - **Logs, updates and deletes workout data** through stage → confirm → execute →
-  verify, with the write committed by the host, never by the agent.
+  verify, with the write committed by the host, never by the agent. It may add
+  to your training data and manage what it added, but never rewrites what the
+  FitNotes app recorded.
+- **Plans training without dropping the rest.** A generated plan keeps every
+  other muscle group at maintenance unless you say "only X", and never gives one
+  muscle direct work on consecutive days unless you ask for it.
 - **Handles compound messages** — "is my squat progressing, and log bench press
   100x5 today" is split, each part routed to its own lane, and the answers
   merged back in the order asked.
@@ -188,8 +193,28 @@ deliberately the complete check rather than an optimized subset.
 
 Some invariants cannot be enforced by citation at all, because a citation proves
 which field was read, never what the sentence means. Those get deterministic
-post-draft guards — the recency guard, for instance, enforces the positive
-invariant `date == latest_session_date` rather than blocklisting known-bad dates.
+post-draft guards:
+
+- the **recency guard** enforces the positive invariant
+  `date == latest_session_date` rather than blocklisting known-bad dates;
+- the **limiting-claim guard** stops a held muscle (grip on shrugs) being
+  described as trained;
+- the **plan guard** runs only on plan requests. It rejects a plan that trains
+  one muscle on back-to-back days (unless that was asked for), and one that cuts
+  another group below maintenance: planned sets must stay at 80% or more of the
+  current weekly figure for any group trained 2+ sets a week;
+- name and wording guards keep the user's own exercise spellings and don't call
+  sets "sessions".
+
+Guards fire only on what the coach wrote, never on a recap of logged data or on
+something the user explicitly asked for. When one rejects a draft, the retry is
+a fresh answer given the facts as requirements; the model never sees its old
+draft or a correction voiced as the user, and the retry passes the same
+fact-check and guards as a first draft.
+
+Dose is reported as **sets per week** per muscle rather than tonnage, and a
+muscle that was `never_trained` is reported differently from one that is
+`dormant`.
 
 ---
 
@@ -230,9 +255,18 @@ exactly one kind of coaching statement, ordering, and never volume.
 The bridge from user data to the ontology is an **exact alias lookup, never
 fuzzy matching**: a near-miss would silently attribute hundreds of sets to the
 wrong muscle. Unmapped exercises are named and visibly excluded, never dropped.
-When a backup upload introduces new exercises, reconciliation auto-aliases only
-on categorical evidence (normalised-exact, or a sole exact word permutation);
-everything else queues for human review behind an approval gate.
+When a backup upload brings exercises that have been **logged** but not mapped,
+reconciliation auto-aliases only on categorical evidence (normalised-exact, or a
+sole exact word permutation); everything else queues for human review behind an
+approval gate (`scripts/review_pending.py`). Stock FitNotes exercises nobody has
+trained are not queued. Journal entries that aren't training ("Morning") are
+listed once, per user, in `ontology/not_exercises.csv`.
+
+For an uncommon exercise, `review_pending.py --propose` drafts a mapping: Gemini
+maps it from its movement-pattern mates in the graph, then a web search (Tavily)
+**run by code, not offered as a tool the model may skip** checks it. A separate
+read stage sees only the search results, and code compares the two. Nothing
+enters the graph until a human approves it and `--promote` writes it.
 
 ### 3D anatomical viewer
 
@@ -271,9 +305,42 @@ records the host's own verified outcome back into the agent's history, and a
 success-claim gate scoped by a structural fact — *was a write tool actually
 called this turn* — blocks completion claims that no write backs.
 
-Every confirmed write is journaled to a write-ahead log, so uploading a fresh
-FitNotes backup replays agent-written sets onto the new file instead of losing
-them. Replay is user-controllable from the settings panel.
+**The agent may add, never rewrite.** A watermark recorded at upload marks
+everything already in the database as the FitNotes app's. The agent manages what
+it added; "fix my bench set from Tuesday" for a set logged in the app is refused,
+naming FitNotes as the place to change it. Comments are the deliberate
+exception: a note about form is the agent's to write even on an app-logged set.
+
+**Confirmed means written.** The server itself commits every confirmed write
+(workouts, set edits and deletes, comments, goals, body weight), so the agent
+can't forget a confirmation. Quirk and article deletions are confirmed too.
+Raising a panel is recorded as *waiting*, not *cancelled*, so the agent never
+tells the user a write was cancelled that later went through.
+
+**Writes check their own work.** Every write runs through one guard that
+compares the rows actually changed (`conn.total_changes`) against what was
+declared, and checks that the target table's added, removed and modified ids
+are exactly the intended ones while every other table is unchanged. Both checks
+run inside the transaction, so a mismatch rolls back. A delete that matches
+zero rows, which SQLite reports as success, is refused.
+
+**The user is told the truth.** A success-claim gate covers every write verb,
+catches false "it's staged" claims, and surfaces the reason a write was
+blocked. That reason travels as a structural fact, because a model asked to
+relay it in words claimed success outright on two of three refusals.
+
+**Writes survive an upload.** Every confirmed write is journaled to a
+write-ahead log, so uploading a fresh FitNotes backup replays it onto the new
+file instead of losing it: sets, comments, goals and body weight. Replay
+resolves exercises by name (ids renumber across exports), maps each replayed
+row to its new id so a later edit or delete reaches only its own row, and gets
+the same blast-radius check as a live write. A test asserts every journaled
+tool has a replay handler. Replay is user-controllable from the settings panel.
+
+**A reload loses nothing.** Each accepted turn is in the chat history at once;
+a reloaded page shows the pending reply and waits for it, a waiting
+confirmation panel comes back, and a busy request says it wasn't sent and
+keeps what you typed.
 
 ---
 
@@ -296,7 +363,11 @@ Create `.env` in the project root:
 ```
 GEMINI_API_KEY=your_gemini_api_key_here
 HF_HUB_DISABLE_IMPLICIT_TOKEN_WARNING=1
+TAVILY_API_KEY=your_tavily_key_here   # optional: only for review_pending.py --propose
 ```
+
+[`.env.example`](.env.example) lists every other setting, including the
+demo-mode switches the public deployment uses.
 
 Export your backup (FitNotes → Menu → Backup → Export Backup) to
 `data/FitNotes_Backup.fitnotes`, then build the knowledge corpus once:
@@ -332,7 +403,7 @@ recording and unloads it after 15 idle minutes.
 
 ```bash
 python -m src.data_agent 90 "Lat Pulldown" "Deadlift"   # Data Agent standalone
-python -m pytest                                        # 2,078 tests
+python -m pytest                                        # 2,083 tests
 ```
 
 ---
@@ -372,24 +443,28 @@ python -m pytest                                        # 2,078 tests
 │   ├── agent.py               # operational ReAct session + MCP lifecycle
 │   ├── ontology*.py           # ontology load / propose / reconcile
 │   ├── prompt_blocks.py       # prompt text shared by both agents
+│   ├── demo_mode.py  visitor_sessions.py   # public demo: read-only, a private chat per visitor
 │   ├── memory.py  demographics.py  wal.py  settings.py  units.py  checkpoint.py
 │   └── rag.py  llm.py  db.py  schema_prompt.py  text_to_sql.py  stdio_utf8.py
-├── mcp_servers/combined_server.py   # all 27 exposed MCP tools
+├── mcp_servers/combined_server.py   # all 32 exposed MCP tools
 ├── ontology/                  # muscles, exercises, edges, aliases (CSV)
+├── deploy/  Dockerfile  docker-compose.yml   # public demo: Docker + Caddy (DEPLOY.md)
 ├── frontend/                  # index.html (chat), graph.html (3D), body/, vendor/
 ├── docs/                      # routing-rules, data_agent_spec, changelog
-├── tests/                     # 88 files, 2,078 tests
+├── tests/                     # 89 files, 2,083 tests
 ├── evals/  scripts/  corpus/
 ├── server.py                  # FastAPI web server
 └── cli.py                     # async CLI
 ```
 
-## Tools (27 exposed)
+## Tools (32 exposed)
 
 | Group | Tools |
 |---|---|
 | Read | `resolve_exercise_name`, `search_fitness_knowledge`, `list_user_articles`, `delete_user_article` |
-| Write — logging | `log_workout`, `log_bodyweight`, `discard_staged_writes` |
+| Write — logging | `log_workout`, `discard_staged_writes` |
+| Write — body weight | `log_bodyweight`, `execute_staged_bodyweight`, `delete_bodyweight`, `execute_staged_bodyweight_delete` |
+| Write — comments | `set_set_comment`, `execute_staged_set_comment` |
 | Write — goals | `set_goal`, `execute_staged_goal`, `update_goal`, `execute_staged_goal_update`, `delete_goal`, `execute_staged_goal_delete` |
 | Write — corrections | `update_workout_set`, `execute_staged_set_update`, `delete_workout_set`, `execute_staged_set_delete` |
 | Verify | `verify_goal_set`, `verify_set_updated`, `verify_set_deleted` |
@@ -408,7 +483,7 @@ package answers them deterministically. There is one read path, not two. The
 ## Testing
 
 ```bash
-python -m pytest                    # 2,078 tests
+python -m pytest                    # 2,083 tests
 python evals/run_evals.py           # SQL correctness + LLM-as-judge
 python evals/stress_test.py         # adversarial suite
 ```
@@ -434,41 +509,17 @@ The suite is layered deliberately:
 
 ---
 
-## Currently in flight
-
-Work in the working tree, not yet committed as of 2026-08-21:
-
-- **Two-layer write integrity.** Five of six write operations had no read-back —
-  `success: true` meant only "the SQL raised no exception", and a DELETE
-  matching zero rows raises nothing. Layer 1 checks blast radius
-  (`conn.total_changes` must move by exactly the intended row count); Layer 2
-  checks identity (the focus table's added/removed/modified id-sets must equal
-  exactly what was intended, every other table hashed whole and unmoved). Both
-  run *inside* the transaction, so a rejection rolls back.
-- **Ontology-backed answers.** Sets-per-week as the default dose measure rather
-  than volume; `never_trained` vs `dormant` reported as the different facts they
-  are; a `limiting_claim_guard` that stops a held muscle being described as
-  trained; and a `plan_guard` that rejects a generated plan giving one muscle
-  direct work on consecutive days.
-- **Scope-filter intersection fix.** `exercise_names` and `muscle_groups` were
-  ANDed as row filters, so "do my lat pulldowns train my biceps?" was empty by
-  construction — Lat Pulldown is filed under Back. When exercise names are
-  present they *are* the scope; a muscle group in the same sentence is the
-  subject of the question, not a second narrowing.
-- **Chat markdown rendering.** The analysis prompt has always asked for bold,
-  headers and bullets; nothing rendered them, so they reached the user as
-  literal asterisks for the entire life of the app.
-
 ## Known gaps
 
 - **No token streaming** — answers return whole; long answers have no
   progressive render.
-- **Session/memory architecture for web deployment** — memory extraction runs at
-  CLI session end, and a web session never terminates. Needs a message-count
-  trigger plus an explicit end-session control before deployment.
-- **Layer 2 write integrity is not concurrency-safe** — a second writer's
-  unrelated change would look like corruption. Correct under the single-user
-  local assumption; must narrow to the transaction's own scope before multi-user.
+- **Long-term memory on the web** — memory extraction runs at CLI session end,
+  and a web session never terminates (the demo turns extraction off). Needs a
+  message-count trigger plus an explicit end-session control.
+- **Write integrity is not concurrency-safe** — a second writer's unrelated
+  change would look like corruption. Correct today, since one turn runs at a
+  time (and the demo refuses writes); must narrow to the transaction's own
+  scope before real multi-user writes.
 - **`agent_lock` held during a per-minute rate-limit wait** — a concurrent
   request gets a "busy" response for up to ~2×70s. Same single-user assumption.
 - **RAG personalization** — stored demographics never reach the answer context,
@@ -494,6 +545,9 @@ first approach was tried:
   rather than to compute.
 - **A wrong package cannot reach the LLM.** The validator hard-stops on an
   integrity violation before the Analysis Agent is called.
+- **Required steps are code, not tools.** The web search the ontology proposer
+  needs is run by code; offered as a tool, the model skipped it and lost three
+  good answers in one run.
 - **Structural signals gate; prose never does.** A success claim is gated on
   whether a write tool was actually called, not on what the answer says.
   Attempt-time arming is a time bomb that detonates the day the action learns to
@@ -519,8 +573,6 @@ first approach was tried:
 Design references live next to the code: [`docs/routing-rules.md`](docs/routing-rules.md),
 [`docs/data_agent_spec.md`](docs/data_agent_spec.md),
 [`ontology/README.md`](ontology/README.md).
-The engineering lessons — stated as transferable principles, each with the bug
-that produced it — are in [`lessons.md`](lessons.md).
 The full session-by-session history is archived in
 [`docs/changelog.md`](docs/changelog.md).
 
