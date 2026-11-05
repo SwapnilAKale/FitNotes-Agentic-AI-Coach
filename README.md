@@ -12,7 +12,7 @@ framework — and then deliberately converted to LangGraph once the problems tho
 abstractions solve had actually been hit. Both versions are preserved as
 branches, which is the point: the diff between them is the lesson.
 
-**Try it live:** <https://130-210-14-28.sslip.io>. It's a public demo on
+**Try it live:** <https://130-210-0-204.sslip.io/>. It's a public demo on
 synthetic data, with no install or sign-up; see [Live demo](#live-demo) for
 what to expect.
 
@@ -29,7 +29,7 @@ over 175 curated exercise→muscle edges, and **2,083 tests**.
 
 ## Live demo
 
-**<https://130-210-14-28.sslip.io>**
+**<https://130-210-0-204.sslip.io/>**
 
 There's a public demo you can try in the browser with no install. It runs
 from this repo's Docker setup on a free Oracle Cloud ARM VM (see
