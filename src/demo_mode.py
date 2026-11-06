@@ -31,6 +31,8 @@ TRUSTED_PROXY_CIDRS          comma-separated networks whose X-Forwarded-For is
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import ipaddress
 import math
 import os
@@ -115,6 +117,16 @@ def _parse_ip(value: str):
         return ipaddress.ip_address(value)
     except ValueError:
         return None
+
+
+_KEY_SALT = os.urandom(32)
+
+
+def opaque_key(value) -> str:
+    """What the rate limits count by. Their counters live for a day, and they
+    only need to tell addresses apart, so they never hold a real one. The salt
+    is new on every start."""
+    return hmac.new(_KEY_SALT, str(value).encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 def client_ip(peer: str | None, forwarded_for: str | None) -> str:
@@ -234,7 +246,7 @@ def check(method: str, path: str, peer: str | None,
     if what:
         return 403, blocked_body(what), {}
     if key in RATE_LIMITED:
-        wait = limiter().hit(client_ip(peer, forwarded_for))
+        wait = limiter().hit(opaque_key(client_ip(peer, forwarded_for)))
         if wait is not None:
             body = rate_limited_body(wait)
             return 429, body, {"Retry-After": str(body["retry_after_seconds"])}

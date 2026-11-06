@@ -363,7 +363,7 @@ async def stt_socket(ws: WebSocket):
     # X-Forwarded-For read through the trusted-proxy rule).
     ip = demo_mode.client_ip(ws.client.host if ws.client else None,
                              ws.headers.get("x-forwarded-for"))
-    await _dictation.handle(ws, ip)
+    await _dictation.handle(ws, demo_mode.opaque_key(ip))
 
 
 # ── Reverse proxy to the backend ────────────────────────────────────────────
@@ -446,4 +446,4 @@ async def proxy_to_backend(path: str, request: Request):
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=3000)
+    uvicorn.run(app, host="0.0.0.0", port=3000, access_log=False)

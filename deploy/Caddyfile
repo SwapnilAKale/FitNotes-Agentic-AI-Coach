@@ -36,8 +36,4 @@
 		}
 	}
 
-	log {
-		output stdout
-		format console
-	}
 }
